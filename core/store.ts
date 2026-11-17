@@ -232,7 +232,8 @@ async function pb(path: string, init: RequestInit = {}, retry = true): Promise<u
     }
     throw new Error(`Cannot reach PocketBase at ${PB_URL}: ${cause?.code || (error instanceof Error ? error.message : String(error))}`, { cause: error });
   }
-  if (res.status === 401 && retry) return pbAuth().then(() => pb(path, init, false));
+  // An expired superuser token reads as anonymous: superuser-only record endpoints answer 403, not 401. Re-auth on both.
+  if ((res.status === 401 || res.status === 403) && retry) return pbAuth().then(() => pb(path, init, false));
   if (!res.ok) throw new Error(`Storage ${res.status}: ${pbError(await res.text())}`);
   return res.status === 204 ? null : res.json();
 }

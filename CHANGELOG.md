@@ -2,7 +2,10 @@
 
 ## Unreleased
 
+## 0.8.2 (2026-11-17)
+
 - **GitHub works with only the GitHub App.** An install whose only GitHub credential is the App made in onboarding (no saved token, no `GH_TOKEN`, no `gh auth login`; Railway, Render, Docker) now lists, reviews and comments on pull requests as the App, using an installation token for the repository's owner. Before, every GitHub call failed silently and open pull requests never appeared. A saved token, `GH_TOKEN` or a `gh` login still takes precedence.
+- **PocketBase sign-in renews after the token expires.** A long-running server (Railway, Render, Docker) showed `Storage 403: Only superusers can perform this action.` once its superuser token expired: PocketBase answers 403, not 401, to an expired token on record endpoints, so the server never signed in again. It now re-authenticates on 401 and 403.
 
 ## 0.8.1 (2026-11-10)
 
