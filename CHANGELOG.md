@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.8.3 (2026-11-20)
+
+- **Version in the sidebar.** The running release (`v0.8.3`) sits next to the logo.
+- **Posting and automation on by default.** *Post scores on PR*, *Add PR review as a comment*, *Post inline suggestions*, *Auto-review* and *PR comment commands* now start on; turn them off per repository in Repository settings. Repositories with saved review settings keep them.
+
 ## 0.8.2 (2026-11-17)
 
 - **GitHub works with only the GitHub App.** An install whose only GitHub credential is the App made in onboarding (no saved token, no `GH_TOKEN`, no `gh auth login`; Railway, Render, Docker) now lists, reviews and comments on pull requests as the App, using an installation token for the repository's owner. Before, every GitHub call failed silently and open pull requests never appeared. A saved token, `GH_TOKEN` or a `gh` login still takes precedence.
