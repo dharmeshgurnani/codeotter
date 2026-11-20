@@ -11,6 +11,7 @@ import { getRepoAccepted, getRepoLearnings, guideCache, guideFiles, normalizeLea
 import { triageConfig } from "./review.ts";
 import { actionSecret, describeDelivery, forwarderStatus, LOCAL_APP_URL, reposChanged, syncForwarders, webhookUrl } from "./queue.ts";
 import { repoOf } from "./views.ts";
+import { clearTicketCache, jiraBase, LINEAR_API, testJira, testLinear, trackerKeys, trackerSettings } from "./trackers.ts";
 import { accessQueue, allowed, effectiveRole, isRole, onboardedRepo, ROLES, userView } from "./access.ts";
 import type { Access, Role, SessionUser } from "./access.ts";
 import type { Cell, CellObject, Tone } from "./views.ts";
@@ -19,6 +20,7 @@ import type { ProviderDef } from "./providers.ts";
 import type { LocalModel } from "./local-models.ts";
 import type { ReviewSettings } from "./context.ts";
 import { CONFIG_FILE, rulesAsText } from "./repo-rules.ts";
+import type { TrackerSettings } from "./trackers.ts";
 
 // Page JSON drawn by web/src/components/json-form.tsx (Field, Section, Action, Row there).
 export type Option = { value: string | number; label: string; icon?: string };
@@ -194,7 +196,7 @@ async function githubManifest(body: Body, http: CookieWriter): Promise<ActionRes
 // Admin / Git providers and Admin / Auth providers draw the same table: a row per provider with Provider, Server and Status.
 // Only the row's action differs: Test and a gear for the connection there, a sign-in toggle here.
 const PROVIDER_COLUMNS: { key: string; label: string }[] = [{ key: "provider", label: "Provider" }, { key: "server", label: "Server" }, { key: "status", label: "Status" }];
-const PROVIDER_ICONS: Record<string, string> = { github: "https://github.com/github.png?size=64", forgejo: "https://forgejo.org/favicon.svg", gitea: "https://github.com/go-gitea.png?size=64", bitbucket: "/providers/bitbucket.svg", bitbucketdc: "/providers/bitbucket.svg", azure: "/providers/azure-devops.svg", microsoft: "/providers/microsoft.svg" };
+const PROVIDER_ICONS: Record<string, string> = { github: "https://github.com/github.png?size=64", forgejo: "https://forgejo.org/favicon.svg", gitea: "https://github.com/go-gitea.png?size=64", bitbucket: "/providers/bitbucket.svg", bitbucketdc: "/providers/bitbucket.svg", azure: "/providers/azure-devops.svg", microsoft: "/providers/microsoft.svg", jira: "https://github.com/atlassian.png?size=64", linear: "https://github.com/linear.png?size=64" };
 const providerUrl = (id: string) => (id === "github" ? "https://github.com" : FORGES[id].url);
 // `as` overrides what the row shows (the Auth providers page draws Azure DevOps' sign-in as Microsoft Entra ID).
 function providerRow(id: string, status: CellObject, extra: Pick<Row, "actions" | "settings" | "toggle" | "toggleDisabled">, as: { label?: string; url?: string; icon?: string } = {}): Row {
@@ -616,6 +618,99 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
         syncForwarders().catch((e) => console.warn(`[forwarder] ${e.message}`));
       }
       for (const connection of Object.values(FORGE_CONNECTIONS)) await connection.save(body);
+    },
+  },
+  // Jira and Linear: tickets named by a pull request become linked issues of its review. Same table as Git providers.
+  trackers: {
+    title: "Issue trackers",
+    group: "admin",
+    access: "admin",
+    async load() {
+      const { jira = {}, linear = {} } = await trackerSettings();
+      const status = (ready: boolean, keys: string[] | undefined): CellObject => (ready ? (keys?.length ? { text: keys.join(", "), tone: "ok" } : { text: "No keys", tone: "warn" }) : { text: "Not connected", tone: "muted" });
+      const jiraReady = !!(jira.url && jira.token);
+      const rows: Row[] = [
+        {
+          id: "jira",
+          label: "Jira",
+          cells: {
+            provider: { text: "Jira", icon: PROVIDER_ICONS.jira },
+            server: jira.url ? { text: jira.url.replace(/^https?:\/\//, ""), mono: true } : { text: "Not set", tone: "muted" },
+            status: status(jiraReady, jira.projects),
+          },
+          actions: [{ id: "testjira", label: "Test", ...(jiraReady ? {} : { disabled: true }) }],
+          settings: {
+            title: "Jira connection",
+            fields: [
+              { key: "url", label: "Jira URL", type: "text", placeholder: "https://example.atlassian.net" },
+              { key: "email", label: "Account email", type: "text", placeholder: "you@example.com", hint: "Jira Cloud, with an API token. Leave empty for a Data Center personal access token." },
+              { key: "token", label: "API token", type: "password", placeholder: mask(jira.token), hint: jira.token ? "Leave blank to keep the stored token." : "" },
+              { key: "projects", label: "Project keys", type: "text", placeholder: "ABC, OPS" },
+              ...(jiraReady ? ([{ key: "clear", label: "Saved connection", type: "checkbox", text: "Remove it" }] satisfies Field[]) : []),
+            ],
+            values: { url: jira.url || "", email: jira.email || "", token: "", projects: (jira.projects || []).join(", "), ...(jiraReady ? { clear: false } : {}) },
+          },
+        },
+        {
+          id: "linear",
+          label: "Linear",
+          cells: {
+            provider: { text: "Linear", icon: PROVIDER_ICONS.linear },
+            server: { text: new URL(LINEAR_API).host, mono: true },
+            status: status(!!linear.apiKey, linear.teams),
+          },
+          actions: [{ id: "testlinear", label: "Test", ...(linear.apiKey ? {} : { disabled: true }) }],
+          settings: {
+            title: "Linear connection",
+            fields: [
+              { key: "apiKey", label: "API key", type: "password", placeholder: mask(linear.apiKey), hint: linear.apiKey ? "Leave blank to keep the stored key." : "", link: { label: "Get a key", url: "https://linear.app/settings/account/security" } },
+              { key: "teams", label: "Team keys", type: "text", placeholder: "ENG, OPS", hint: "linear.app issue links count without one." },
+              ...(linear.apiKey ? ([{ key: "clear", label: "Saved connection", type: "checkbox", text: "Remove it" }] satisfies Field[]) : []),
+            ],
+            values: { apiKey: "", teams: (linear.teams || []).join(", "), ...(linear.apiKey ? { clear: false } : {}) },
+          },
+        },
+      ];
+      return {
+        sections: [{
+          id: "trackers",
+          title: "Issue trackers",
+          description: "Tickets named in a pull request's title, branch or description are read into its review.",
+          fields: [{ key: "rows", label: "Trackers", type: "table", columns: PROVIDER_COLUMNS }],
+        }],
+        values: { trackers: { rows } },
+      };
+    },
+    actions: {
+      testjira: async () => ({ message: await testJira(await trackerSettings()) }),
+      testlinear: async () => ({ message: await testLinear(await trackerSettings()) }),
+    },
+    async save(body) {
+      // The table posts its rows with the edited one marked; also accepted directly as { jira | linear: { ... } }.
+      const edited = editedRow(body.trackers, (r) => r.id === "jira" || r.id === "linear");
+      if (edited) body = { [String(edited.id)]: rec(rec(edited.settings).values) };
+      const current = await trackerSettings();
+      const next: TrackerSettings = { ...current };
+      if (body.jira) {
+        const v = rec(body.jira);
+        if (v.clear) delete next.jira;
+        else {
+          const url = jiraBase(v.url ?? current.jira?.url);
+          const token = String(v.token || "").trim() || current.jira?.token || "";
+          const email = String(v.email ?? current.jira?.email ?? "").trim();
+          if (/[:\s]/.test(email)) throw new Error("Jira account email must not contain spaces or a colon");
+          // a new server never inherits the token saved for the old one
+          if (url !== (current.jira?.url || "") && !String(v.token || "").trim() && current.jira?.token) throw new Error("Enter the API token for the new Jira URL");
+          next.jira = { url, email, token, projects: trackerKeys(v.projects ?? current.jira?.projects) };
+        }
+      }
+      if (body.linear) {
+        const v = rec(body.linear);
+        if (v.clear) delete next.linear;
+        else next.linear = { apiKey: String(v.apiKey || "").trim() || current.linear?.apiKey || "", teams: trackerKeys(v.teams ?? current.linear?.teams) };
+      }
+      await store.setSetting("issueTrackers", next);
+      clearTicketCache();
     },
   },
   oauth: {

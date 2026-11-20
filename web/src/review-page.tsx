@@ -280,13 +280,13 @@ function buildAiReviewMarkdown(r: Review) {
   if (r.linkedIssues?.length) {
     lines.push(
       `- **Linked Issues (${r.linkedIssues.length})**: ${r.linkedIssues
-        .map((i) => `[#${i.number} ${i.title}](${i.url})${i.state ? ` (${i.state})` : ""}`)
+        .map((i) => `[${i.key || `#${i.number}`} ${i.title}](${i.url})${i.state ? ` (${i.state})` : ""}`)
         .join(" · ")}`,
     );
     for (const iss of r.linkedIssues) {
       const reqText = (iss.body || "").trim().replace(/\s+/g, " ").slice(0, 280);
       if (reqText) {
-        lines.push(`  - **#${iss.number} Requirements**: ${reqText}${(iss.body || "").trim().length > 280 ? "…" : ""}`);
+        lines.push(`  - **${iss.key || `#${iss.number}`} Requirements**: ${reqText}${(iss.body || "").trim().length > 280 ? "…" : ""}`);
       }
     }
   }
@@ -676,14 +676,14 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
           )}
           {(r.linkedIssues ?? []).map((iss) => (
             <a
-              key={`${iss.repo || repo}#${iss.number}`}
+              key={`${iss.repo || repo}#${iss.key || iss.number}`}
               href={iss.url}
               target="_blank"
               rel="noreferrer"
-              title={iss.body ? `#${iss.number} ${iss.title}\n\n${iss.body.slice(0, 300)}` : `#${iss.number} ${iss.title}`}
+              title={`${iss.key || `#${iss.number}`} ${iss.title}${iss.body ? `\n\n${iss.body.slice(0, 300)}` : ""}`}
               className="hover:underline"
             >
-              <Badge tone="info"><span>#{iss.number}</span><span className="max-w-[220px] truncate">{iss.title}</span></Badge>
+              <Badge tone="info"><span>{iss.key || `#${iss.number}`}</span><span className="max-w-[220px] truncate">{iss.title}</span></Badge>
             </a>
           ))}
           <button
@@ -965,12 +965,12 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                 ...(r.linkedIssues?.length && !(r.gates ?? []).some((g) => g.id === "issue_requirements")
                   ? [[
                       "Issue requirements",
-                      <>{check(v.verdict !== "request_changes" && v.scores.quality >= 60)} <span className="text-muted-foreground">({r.linkedIssues.map((i) => `#${i.number}`).join(", ")})</span></>,
+                      <>{check(v.verdict !== "request_changes" && v.scores.quality >= 60)} <span className="text-muted-foreground">({r.linkedIssues.map((i) => i.key || `#${i.number}`).join(", ")})</span></>,
                     ] as React.ReactNode[]]
                   : []),
                 ...(r.gates ?? []).map((g) => [
                   <>{g.label}{g.mode === "block" && <Badge className="ml-1.5">blocking</Badge>}</>,
-                  <>{check(g.pass, g.mode === "block")} <span className="text-muted-foreground">({Math.round(g.yes * 100)}% yes{g.id === "issue_requirements" && r.linkedIssues?.length ? ` · ${r.linkedIssues.map((i) => `#${i.number}`).join(", ")}` : ""})</span></>,
+                  <>{check(g.pass, g.mode === "block")} <span className="text-muted-foreground">({Math.round(g.yes * 100)}% yes{g.id === "issue_requirements" && r.linkedIssues?.length ? ` · ${r.linkedIssues.map((i) => i.key || `#${i.number}`).join(", ")}` : ""})</span></>,
                 ] as React.ReactNode[]),
                 ...(pending?.gates ? [["Merge gates", <InlineLoader key="g" text="Checking policy gates…" />] as React.ReactNode[]] : []),
               ]} />

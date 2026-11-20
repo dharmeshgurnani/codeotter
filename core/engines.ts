@@ -2,7 +2,7 @@
 import { ensureSidecar } from "./local-models.ts";
 import { askModel, askSystemOne } from "./models.ts";
 import { blastRadius, compressDiff, splitHunks } from "./diff.ts";
-import { extractHeadSha, REVIEW_DEFAULTS } from "./context.ts";
+import { extractHeadSha, issueLabel, REVIEW_DEFAULTS } from "./context.ts";
 import { diffFiles, pathInstructionBlock } from "./repo-rules.ts";
 import type { LlmConfig, S1Answers, S1Config, S1Questions } from "./models.ts";
 import type { LocalModel } from "./local-models.ts";
@@ -118,6 +118,7 @@ function s1State(pr: PullRequest, diff: string, c: S1Config, guide: Guide | null
       ? {
           linked_issues: linkedIssues.map((iss) => ({
             number: iss.number,
+            ...(iss.key ? { key: iss.key } : {}),
             repo: iss.repo,
             title: iss.title,
             state: iss.state,
@@ -203,7 +204,7 @@ async function reviewWithCodeReviewer(_pr: PullRequest, diff: string, c: LlmConf
       ? ` Analyzed ${gitHistory.prCommits.length} commit(s) (${gitHistory.prCommits.slice(0, 3).map((x) => x.sha).join(", ")})`
       : "";
   const guideNote = guide?.file ? ` against ${guide.file} guidelines` : "";
-  const issueNote = linkedIssues?.length ? ` Validated against linked issue(s) ${linkedIssues.map((i) => `#${i.number}`).join(", ")}.` : "";
+  const issueNote = linkedIssues?.length ? ` Validated against linked issue(s) ${linkedIssues.map(issueLabel).join(", ")}.` : "";
   const learningNote = learnings?.length ? ` Enforced ${learnings.length} repository team learning(s).` : "";
   const port = await ensureSidecar(c.local as LocalModel); // judge() routes here only for the local CodeReviewer
   const seen = new Set<string>();
@@ -476,7 +477,7 @@ export function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSet
   const outsideBlock = outsideImpact?.formatted ? `\n${outsideImpact.formatted}\n` : "";
   const issueBlock = linkedIssues?.length
     ? `\nLinked Issues & Requirements (MANDATORY: explicitly verify whether the pull request diff fulfills all requirements and acceptance criteria described in these linked issues, and flag any unfulfilled or partially met requirement in findings):\n${linkedIssues
-        .map((iss) => `Issue #${iss.number} (${iss.repo}, ${iss.state}): ${iss.title}${iss.labels?.length ? ` [${iss.labels.join(", ")}]` : ""}\n${(iss.body || "(no body provided)").slice(0, 1200)}`)
+        .map((iss) => `Issue ${issueLabel(iss)} (${iss.repo}, ${iss.state}): ${iss.title}${iss.labels?.length ? ` [${iss.labels.join(", ")}]` : ""}\n${(iss.body || "(no body provided)").slice(0, 1200)}`)
         .join("\n\n")}\n`
     : "";
   const learningsBlock = learnings?.length
@@ -489,7 +490,7 @@ export function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSet
   const pathBlock = pathInstructionBlock(r.pathInstructions, diffFiles(diff));
   return `You are CodeOtter, a strict senior staff code reviewer. Review this pull request using the repository's review guidelines (AGENTS.md / CLAUDE.md), the repository team learnings, the linked issues and acceptance criteria, the git commit history, the outside-diff call graph context, and the code diff. Reply with ONLY a JSON object:
 {"summary":"3-5 sentence architectural walkthrough covering what changed, commit progression, fulfillment of linked issue requirements, adherence to repository guidelines, and outside caller safety","verdict":"approve|comment|request_changes",
-${wantScores ? ` "scores":{"quality":0-100,"correctness_risk":0-100 (100 = very risky),"test_coverage":0-100,"readability":0-100,"pr_hygiene":0-100 (title, description, scope, commit focus),"blast_radius":0-100 (100 = system-wide or critical-path impact)},\n` : ""} "findings":[{"severity":"blocker|major|minor|nit|high|medium|low","file":"path","line":42,"title":"short","detail":"specific line/behaviour and fix (cite AGENTS.md/CLAUDE.md rule, linked issue #number requirement, or commit if relevant)","suggestion":"optional exact replacement code"}],
+${wantScores ? ` "scores":{"quality":0-100,"correctness_risk":0-100 (100 = very risky),"test_coverage":0-100,"readability":0-100,"pr_hygiene":0-100 (title, description, scope, commit focus),"blast_radius":0-100 (100 = system-wide or critical-path impact)},\n` : ""} "findings":[{"severity":"blocker|major|minor|nit|high|medium|low","file":"path","line":42,"title":"short","detail":"specific line/behaviour and fix (cite AGENTS.md/CLAUDE.md rule, linked issue #number or ticket key requirement, or commit if relevant)","suggestion":"optional exact replacement code"}],
  "walkthrough":[{"file":"path","change":"concise summary of change in this file"}]${checks.length ? `,\n "checks":{${checks.map((g) => `"${g.id}":true|false`).join(",")}}` : ""}}
 For each finding, include the integer target \`line\` number in the new file and an optional \`suggestion\` containing the exact replacement code snippet for the target line/block (without markdown backticks) so the fix can be applied in one click. Be concrete; cite exact files and rules. Respect all Repository Team Learnings and never flag dismissed patterns. Max ${r.maxFindings} findings, most severe first.${PROFILE_PROMPT[r.profile] ? ` ${PROFILE_PROMPT[r.profile]}` : ""} Today is ${new Date().toISOString().slice(0, 10)}.
 

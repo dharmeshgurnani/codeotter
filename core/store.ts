@@ -1,5 +1,6 @@
 // Storage: PocketBase when PB_URL is set (started here when its binary is present), else JSON files.
 import { execFileSync, spawn } from "node:child_process";
+import type { TrackerSettings } from "./trackers.ts";
 import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, renameSync } from "node:fs";
@@ -43,6 +44,7 @@ export interface SettingsMap {
   primaryProvider: string;
   onboardingComplete: boolean;
   runtimeDevices: Record<string, { device: string; model: string }>;
+  issueTrackers: TrackerSettings;
   [webhook: `${string}Webhook`]: { secret?: string };
   [origin: `${string}Origin`]: string;
 }
