@@ -4,6 +4,8 @@ import { askModel, askSystemOne } from "./models.ts";
 import { blastRadius, compressDiff, splitHunks } from "./diff.ts";
 import { extractHeadSha, issueLabel, REVIEW_DEFAULTS } from "./context.ts";
 import { diffFiles, pathInstructionBlock } from "./repo-rules.ts";
+import { analyzerPrompt, isAnalyzerId } from "./analyzers.ts";
+import type { AnalyzerId, AnalyzerResult } from "./analyzers.ts";
 import type { LlmConfig, S1Answers, S1Config, S1Questions } from "./models.ts";
 import type { LocalModel } from "./local-models.ts";
 import type { OutsideImpact } from "./diff.ts";
@@ -22,6 +24,7 @@ export interface Finding {
   dismissed?: boolean;
   confidence?: number; // 0..1, from reflection or System One
   hunk?: string; // the diff hunk at the finding, attached when the review is stored (for agent prompts)
+  analyzer?: AnalyzerId; // a static analyzer result the language model confirmed
 }
 export type Verdict = "approve" | "comment" | "request_changes";
 // `mode` marks a repository's custom check (id `check_<n>`); built-in gates have none.
@@ -461,6 +464,7 @@ export function deriveSuggestionFromDetail(raw: unknown, diff = ""): Finding {
     ...(suggestion ? { suggestion: str(suggestion, 2000) } : {}),
     ...(f?.dismissed ? { dismissed: true } : {}),
     ...(Number.isFinite(Number(f?.confidence)) && f?.confidence !== null && f?.confidence !== "" ? { confidence: Math.max(0, Math.min(1, Number(f?.confidence))) } : {}),
+    ...(isAnalyzerId(f?.analyzer) ? { analyzer: f.analyzer } : {}),
   };
 }
 
@@ -470,7 +474,7 @@ const PROFILE_PROMPT: Record<ReviewSettings["profile"], string> = {
   balanced: "",
   assertive: "Profile: assertive. Report every real problem, including low-severity issues and nitpicks (style, naming, readability, missing tests, docs); use the full findings budget when the diff warrants it.",
 };
-export function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: GateDef[] = []): string {
+export function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: GateDef[] = [], analyzers: AnalyzerResult[] = []): string {
   const checksBlock = checks.length
     ? `\nRepository pre-merge checks (answer each from the diff and description in "checks": true = yes, false = no):\n${checks.map((g) => `- ${g.id}: ${g.q}`).join("\n")}\n`
     : "";
@@ -498,7 +502,7 @@ PR #${pr.number}: ${pr.title}
 Author: ${pr.author.login}  Base: ${pr.baseRefName} <- Head: ${pr.headRefName}${pr.headSha ? ` (${pr.headSha.slice(0, 7)})` : ""}  Files: ${pr.changedFiles}  +${pr.additions} -${pr.deletions}
 Description:
 ${(pr.body || "(none)").slice(0, c.contextChars ? Math.min(3000, Math.floor(c.contextChars / 10)) : 3000)}
-${outsideBlock}${incrementalBlock}${issueBlock}${checksBlock}${pathBlock}${learningsBlock}${acceptedBlock}${gitHistory?.formatted ? `\nGit Change History (commits in this PR and recent target branch history):\n${gitHistory.formatted.slice(0, 4000)}\n` : ""}${guide ? `\nRepository Review Guidelines from ${guide.file} (MANDATORY: verify all code changes and commits against these rules and flag any violation in findings):\n${guide.text}\n` : ""}
+${outsideBlock}${incrementalBlock}${issueBlock}${checksBlock}${pathBlock}${learningsBlock}${acceptedBlock}${analyzerPrompt(analyzers)}${gitHistory?.formatted ? `\nGit Change History (commits in this PR and recent target branch history):\n${gitHistory.formatted.slice(0, 4000)}\n` : ""}${guide ? `\nRepository Review Guidelines from ${guide.file} (MANDATORY: verify all code changes and commits against these rules and flag any violation in findings):\n${guide.text}\n` : ""}
 Diff${diff.length > Math.min(r.diffChars, c.contextChars || Infinity) ? " (over budget: highest-priority files first, the rest named at the end)" : ""}:
 ${compressDiff(diff, Math.min(r.diffChars, c.contextChars || Infinity)).diff}`;
 }
@@ -530,11 +534,11 @@ ${compressDiff(diff, Math.min(r.diffChars, c.contextChars || Infinity)).diff}`, 
 }
 // </reflect>
 
-export async function judge(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, onProgress: ((partial: Partial<Judgement>) => void) | null = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: CustomCheck[] = []): Promise<Judgement> {
+export async function judge(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, onProgress: ((partial: Partial<Judgement>) => void) | null = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: CustomCheck[] = [], analyzers: AnalyzerResult[] = []): Promise<Judgement> {
   // CodeReviewer cannot answer checks; it always runs next to System One, which owns them.
   if (c.api === "codereviewer") return reviewWithCodeReviewer(pr, diff, c, guide, gitHistory, onProgress, linkedIssues, learnings, incrementalCtx);
   const checkDefs = customGates(checks);
-  const text = await askModel(prompt(pr, diff, c, r, guide, wantScores, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, accepted, checkDefs), { ...c, temperature: r.temperature });
+  const text = await askModel(prompt(pr, diff, c, r, guide, wantScores, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, accepted, checkDefs, analyzers), { ...c, temperature: r.temperature });
   // Model output: every field is checked or coerced below before it is stored.
   let out: { summary?: unknown; verdict?: unknown; scores?: Record<string, unknown> | null; findings?: unknown; walkthrough?: unknown; checks?: unknown };
   try {
@@ -558,6 +562,8 @@ export async function judge(pr: PullRequest, diff: string, c: LlmConfig, r: Revi
   if (unanswered.length) throw new Error(`${c.provider}/${c.model} did not answer the pre-merge check(s): ${unanswered.join(", ")}`);
   let findings: Finding[] = (Array.isArray(out.findings) ? (out.findings as unknown[]) : []).slice(0, 20).map((f) => deriveSuggestionFromDetail(f, diff));
   if (r.profile === "chill") findings = findings.filter((f) => f.severity === "high" || f.severity === "medium");
+  // an analyzer tag only for a tool that reported on this file
+  findings = findings.map(({ analyzer, ...f }) => (analyzer && analyzers.some((a) => a.analyzer === analyzer && a.file === f.file) ? { ...f, analyzer } : f));
   let reflected = "";
   if (r.reflectMin > 0 && findings.length) {
     onProgress?.({ summary: `Checking ${findings.length} finding(s) against the diff…` });

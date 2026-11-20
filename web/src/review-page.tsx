@@ -817,6 +817,7 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                         {f.line ? (
                           <Badge tone="ok" mono>L{f.line}</Badge>
                         ) : null}
+                        {f.analyzer ? <Badge tone="accent" mono>{f.analyzer}</Badge> : null}
                         {typeof f.confidence === "number" ? (
                           <Badge mono title="Self-check score">{Math.round(f.confidence * 10)}/10</Badge>
                         ) : null}
@@ -975,6 +976,15 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                 ...(pending?.gates ? [["Merge gates", <InlineLoader key="g" text="Checking policy gates…" />] as React.ReactNode[]] : []),
               ]} />
             </details>
+            {r.analyzers?.length ? (
+              <details className="my-2.5"><summary className="cursor-pointer text-sm font-semibold">Static analysis</summary>
+                <Md head={["Analyzer", "Status", "On changed lines"]} rows={r.analyzers.map((a) => [
+                  a.label,
+                  <Badge key={a.id} tone={a.status === "ok" ? "ok" : a.status === "unavailable" ? "muted" : "warn"} title={a.error || `${Math.round(a.ms / 100) / 10} s`}>{a.status === "ok" ? "Ran" : a.status === "timeout" ? "Timed out" : a.status === "unavailable" ? "Not installed" : "Failed"}</Badge>,
+                  a.status === "ok" ? `${a.kept} of ${a.found}` : <span className="text-muted-foreground">{a.error || ""}</span>,
+                ] as React.ReactNode[])} />
+              </details>
+            ) : null}
           </div>
         </div>
 

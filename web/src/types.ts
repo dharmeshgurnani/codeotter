@@ -23,6 +23,7 @@ export type Finding = {
   suggestion?: string;
   dismissed?: boolean;
   confidence?: number;
+  analyzer?: string;
 };
 export type Review = {
   pr: Pr;
@@ -69,6 +70,7 @@ export type Review = {
   commentError?: string;
   // self-contained prompts for coding agents: one per finding (by index, empty when dismissed) and one for all open ones
   agentPrompts?: { all: string; findings: string[] };
+  analyzers?: { id: string; label: string; status: "ok" | "failed" | "timeout" | "unavailable"; found: number; kept: number; ms: number; error?: string }[];
   at: string;
 };
 export type User = { id: string; name: string; email: string; role: string; avatar: string };

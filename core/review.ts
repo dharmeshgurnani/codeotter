@@ -11,6 +11,8 @@ import { formatReviewComment, formatScoresComment } from "./comments.ts";
 import { findingPrompt, hunkAt, promptDetails } from "./fix.ts";
 import { repoOf } from "./views.ts";
 import { filterDiff } from "./repo-rules.ts";
+import { analysisFailed, ANALYZER_IDS, changedLines, redactDeep, runAnalyzers } from "./analyzers.ts";
+import type { Analysis, AnalyzerRun } from "./analyzers.ts";
 import type { BlastRadius, DiffContextStats, OutsideImpact } from "./diff.ts";
 import type { GitHistory, LinkedIssue, PullRequest } from "./context.ts";
 import type { Finding, Gate, IncrementalCommit, IncrementalContext, Judgement, ScoreKey, Scores, Verdict, WalkthroughItem } from "./engines.ts";
@@ -49,6 +51,7 @@ export interface ReviewRecord {
   pending?: ReviewPending;
   commentError?: string;
   commentsPosted?: string[];
+  analyzers?: AnalyzerRun[];
 }
 export interface ActiveReview { state: ReviewRecord; error: string | null; promise: Promise<ReviewRecord> | null; done: boolean; }
 export interface TriageConfig { auto: boolean; stopAt: number; }
@@ -291,7 +294,8 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
       // .codeotter.json on the base branch wins over Repository settings for this review; excluded paths never reach a model
       const { configFile: _file, ...rules } = await fileRules;
       Object.assign(rc, rules);
-      let diff = filterDiff(rawDiff, rc).diff;
+      const filtered = filterDiff(rawDiff, rc).diff;
+      let diff = filtered;
       if (rawDiff.trim() && !diff.trim()) throw new Error("Every changed file is excluded by the path filters");
       if (rc.contextLines > 0) {
         const parsed = parseDiff(diff);
@@ -300,6 +304,12 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
         diff = ext.diff;
         live.dynamicContext = ext.stats;
       }
+      // Static analyzers on the head of the changed files the path filters keep, as evidence for the language model;
+      // never fail the review.
+      const analyzerIds = runLlm && llmReady && c.api !== "codereviewer" ? ANALYZER_IDS.filter((id) => rc[id]) : [];
+      const analysisTask: Promise<Analysis | null> = analyzerIds.length
+        ? headFileTexts(live.pr, [...changedLines(filtered).keys()], 100).then((files) => runAnalyzers(files, filtered, analyzerIds)).catch((e: Error) => analysisFailed(analyzerIds, e.message))
+        : Promise.resolve(null);
 
       const outsideImpact = await sliceOutsideDiffImpact(repoOf(live.pr), diff, (live.pr.files || []).map((f) => f.path));
       live.outsideDiffImpact = outsideImpact;
@@ -421,11 +431,11 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
 
       const needLlmForScores = runScores && !s1.enabled;
       const llmTask = (runLlm || needLlmForScores) && llmReady
-        ? judge(live.pr, diff, c, rc, guide, !s1.enabled, gitHistory, (partial) => {
+        ? analysisTask.then((analysis) => { if (analysis) live.analyzers = analysis.runs; return judge(live.pr, diff, c, rc, guide, !s1.enabled, gitHistory, (partial) => {
             if (runLlm) {
               live.review = { ...live.review, ...partial, scores: live.review.scores };
             }
-          }, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes, s1.enabled ? [] : checks).then(({ blastRadius: llmBlast, checks: llmChecks, ...nav }): Judgement => {
+          }, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes, s1.enabled ? [] : checks, analysis?.results || []).then((j) => redactDeep(j, analysis?.secrets || [])); }).then(({ blastRadius: llmBlast, checks: llmChecks, ...nav }): Judgement => {
             if (llmChecks) {
               live.gates = llmChecks;
               live.pending.gates = false;
@@ -517,6 +527,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
         linkedIssues: live.linkedIssues || [],
         gitHistory: live.gitHistory,
         at: new Date().toISOString(),
+        ...(live.analyzers ? { analyzers: live.analyzers } : !runLlm && cached?.analyzers ? { analyzers: cached.analyzers } : {}),
       };
       const st = publish && checksRun ? checksStatus(finalGates) : null;
       if (st) {
@@ -633,7 +644,7 @@ export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r
       const explanation = String(f.detail || "").split("\n\n@@")[0].trim();
       const bodyLines = [
         marker,
-        `🦦 **CodeOtter [${String(f.severity || "low").toUpperCase()}]** — ${heading} (\`${f.file}:L${targetLine}\`)`,
+        `🦦 **CodeOtter [${String(f.severity || "low").toUpperCase()}]**${f.analyzer ? ` · ${f.analyzer}` : ""} — ${heading} (\`${f.file}:L${targetLine}\`)`,
         ...(explanation ? ["", explanation] : []),
         // Most git servers anchor a review comment on one line, so a multi-line fix is shown, not offered for commit
         // (GitHub and Azure DevOps take a line range).

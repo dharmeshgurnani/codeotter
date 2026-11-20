@@ -38,6 +38,10 @@ export interface ReviewSettings extends RepoRules {
   minSeverity: Severity;
   checks: CustomCheck[];
   agentPrompts: boolean; // a collapsed "Prompt for AI agents" block in posted review and inline comments
+  // static analyzers run on the changed files (core/analyzers.ts)
+  gitleaks: boolean;
+  semgrep: boolean;
+  trivy: boolean;
 }
 // A custom pre-merge check: a yes/no question (yes = pass) asked of the model owning the gates. "block" failures fail the
 // codeotter/checks commit status; "warn" failures only show; "off" is kept but not asked.
@@ -53,7 +57,7 @@ export interface GitHistory { prCommits: GitCommit[]; baseCommits: BaseCommit[];
 export interface LinkedIssue { number: number; key?: string; repo: string; title: string; body: string; state: string; url: string; labels: string[]; }
 export const issueLabel = (i: Pick<LinkedIssue, "number" | "key">): string => i.key || `#${i.number}`;
 
-export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, resolveFixed: true, commands: true, auto: true, agentPrompts: true, profile: "balanced", minSeverity: "nit", checks: [], ...RULE_DEFAULTS };
+export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, resolveFixed: true, commands: true, auto: true, agentPrompts: true, gitleaks: false, semgrep: false, trivy: false, profile: "balanced", minSeverity: "nit", checks: [], ...RULE_DEFAULTS };
 // Review strictness: a profile supplies the defaults for maxFindings and reflectMin (values set explicitly still win)
 // and the tone of the language-model instructions (engines.ts).
 export type ReviewProfile = "chill" | "balanced" | "assertive";
@@ -114,6 +118,9 @@ export const normalizeReview = (v: { [K in keyof ReviewSettings]?: unknown }): R
   ...normalizeRules(v),
   checks: normalizeChecks(v.checks),
   agentPrompts: v.agentPrompts === undefined ? REVIEW_DEFAULTS.agentPrompts : !!v.agentPrompts,
+  gitleaks: !!v.gitleaks,
+  semgrep: !!v.semgrep,
+  trivy: !!v.trivy,
 });
 // Untrusted (settings body, later a repository config file): at most 20 checks, each with instructions.
 export const normalizeChecks = (v: unknown): CustomCheck[] =>
