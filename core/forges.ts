@@ -450,7 +450,7 @@ function gitea(id: string, f: AuthedConfig): Forge {
       if (!open.length) return 0;
       const item = (c: GiteaReviewComment) => {
         const where = `\`${c.path || "comment"}\``;
-        const title = firstLine(String(c.body || "").replace(/<!--[\s\S]*?-->/g, "").replace(/</g, "&lt;").trim()).slice(0, 160);
+        const title = firstLine(String(c.body || "").replace(/</g, "&lt;").replace(/&lt;!--[\s\S]*?-->/g, "").trim()).slice(0, 160);
         return `- ${c.html_url ? `[${where}](${c.html_url})` : where}: ${title}`;
       };
       await api(`${r(repo)}/issues/${n}/comments`, { method: "POST", body: { body: [note, "", ...open.map(item)].join("\n") } });
