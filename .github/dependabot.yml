@@ -1,0 +1,20 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directories: ["/", "/web"]
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 3
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: docker
+    directory: "/"
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 1
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 2
+    groups:
+      actions:
+        patterns: ["*"]
