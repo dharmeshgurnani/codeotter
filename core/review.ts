@@ -6,7 +6,7 @@ import { createPrComment, forgeOf, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, r
 import { askSystemOne, llmConfig, s1Config } from "./models.ts";
 import { acceptedSuggestions, blastRadius, dynamicContextFiles, extendDiffContext, parseDiff, sliceOutsideDiffImpact } from "./diff.ts";
 import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, getRepoAccepted, getRepoLearnings, guideFor, headFileTexts, REVIEW_DEFAULTS, reviewConfig, shaMatch } from "./context.ts";
-import { changeDigest, deriveSuggestionFromDetail, judge, S1_SCORES, scoreWithSystemOne, verifyFindingsWithSystemOne } from "./engines.ts";
+import { changeDigest, confirmFixedFindings, deriveSuggestionFromDetail, judge, S1_SCORES, scoreWithSystemOne, verifyFindingsWithSystemOne } from "./engines.ts";
 import { formatReviewComment, formatScoresComment } from "./comments.ts";
 import { repoOf } from "./views.ts";
 import type { BlastRadius, DiffContextStats, OutsideImpact } from "./diff.ts";
@@ -481,7 +481,18 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
         gitHistory: live.gitHistory,
         at: new Date().toISOString(),
       };
+      // Inline comments a later push fixed: the re-review dropped them, and a model confirms the delta fixes each one.
+      let fixed: Finding[] = [];
+      const dropped = (finalIncremental?.resolvedFindings || []).filter((f) => f.file);
+      if (publish && runLlm && rc.postInlineSuggestions && rc.resolveFixed && incrementalCtx?.deltaDiff && dropped.length) {
+        try {
+          fixed = await confirmFixedFindings(dropped, incrementalCtx.deltaDiff, s1, llmReady ? c : null);
+        } catch (e) {
+          result.commentError = `Checking fixed comments: ${(e as Error).message}`;
+        }
+      }
       await syncPrComments(result, repoOf(live.pr), {
+        resolveFixed: fixed,
         postScores: !!(publish && runScores && rc.postScores && (typed || review?.scores)),
         postReview: !!(publish && runLlm && rc.postReview && review?.summary),
         postInlineSuggestions: !!(publish && runLlm && rc.postInlineSuggestions &&(review?.findings || []).some((f) => !f.dismissed && (f.suggestion || f.line))),
@@ -504,6 +515,47 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
 
   return live;
 }
+
+// <resolve-fixed>
+// What identifies an inline comment CodeOtter posted for a finding: the hidden marker and the bold title, both in its body.
+export function inlineAnchor(f: Finding): { line: number; marker: string; heading: string } {
+  const line = Number(f.line) > 0 ? Math.round(Number(f.line)) : 1;
+  return { line, marker: `<!-- codeotter:suggestion:${f.file}:${line} -->`, heading: `**${f.title || "Suggested fix"}**` };
+}
+// Resolve the inline comments CodeOtter posted for findings a later push fixed. GitHub: the review thread is resolved
+// through GraphQL, or answered when this token may not resolve it; other git servers go through their adapter.
+const THREADS_QUERY = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor}nodes{id isResolved viewerCanResolve viewerCanReply comments(first:1){nodes{body viewerDidAuthor}}}}}}}";
+interface GhThread { id?: unknown; isResolved?: unknown; viewerCanResolve?: unknown; viewerCanReply?: unknown; comments?: { nodes?: ({ body?: unknown; viewerDidAuthor?: unknown } | null)[] } }
+export async function resolveFixedComments(pr: Pick<PullRequest, "url" | "number">, repo: string, fixed: Finding[], sha: string): Promise<number> {
+  const anchors = fixed.filter((f) => f.file).map((f) => inlineAnchor(deriveSuggestionFromDetail(f, "")));
+  if (!anchors.length) return 0;
+  const ours = (body: string) => anchors.some((a) => body.includes(a.marker) && body.includes(a.heading));
+  const note = `✅ Resolved in \`${String(sha).slice(0, 7)}\``;
+  if (isForgeRepo(repo)) return forgeOf(repo).resolveInline(repo, pr.number, ours, note);
+  if (!REPO_RE.test(repo)) throw new Error("Invalid repository");
+  const [owner, name] = repo.split("/");
+  const threads: GhThread[] = [];
+  for (let cursor = "", page = 0; page < 20; page++) {
+    const raw: unknown = JSON.parse(await ghAsync(["api", "graphql", "-f", `query=${THREADS_QUERY}`, "-f", `owner=${owner}`, "-f", `name=${name}`, "-F", `number=${Number(pr.number)}`, ...(cursor ? ["-f", `cursor=${cursor}`] : [])]));
+    const rt = (raw as { data?: { repository?: { pullRequest?: { reviewThreads?: { nodes?: unknown; pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } } } } } } | null)?.data?.repository?.pullRequest?.reviewThreads;
+    if (Array.isArray(rt?.nodes)) threads.push(...(rt.nodes as GhThread[]));
+    if (rt?.pageInfo?.hasNextPage !== true || typeof rt.pageInfo.endCursor !== "string") break;
+    cursor = rt.pageInfo.endCursor;
+  }
+  let done = 0;
+  for (const t of threads) {
+    const first = t?.comments?.nodes?.[0];
+    if (!t || typeof t.id !== "string" || t.isResolved !== false || first?.viewerDidAuthor !== true || typeof first.body !== "string" || !ours(first.body)) continue;
+    if (t.viewerCanResolve === true) {
+      await ghAsync(["api", "graphql", "-f", "query=mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}", "-f", `id=${t.id}`]);
+    } else if (t.viewerCanReply === true) {
+      await ghAsync(["api", "graphql", "-f", "query=mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,body:$body}){comment{id}}}", "-f", `id=${t.id}`, "-f", `body=${note}`]);
+    } else continue;
+    done++;
+  }
+  return done;
+}
+// </resolve-fixed>
 
 export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r.pr), { findingIdx = null }: { findingIdx?: number | string | null } = {}): Promise<InlineResult> {
   if (!r?.pr?.number || !repo || !REPO_RE.test(repo)) throw new Error("Invalid PR or repository");
@@ -528,11 +580,11 @@ export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r
     .map((rawF): InlineComment | null => {
       const f = deriveSuggestionFromDetail(rawF, "");
       if (!f.file) return null;
-      const targetLine = Number(f.line) > 0 ? Math.round(Number(f.line)) : 1;
+      const { line: targetLine, marker, heading } = inlineAnchor(f);
       const explanation = String(f.detail || "").split("\n\n@@")[0].trim();
       const bodyLines = [
-        `<!-- codeotter:suggestion:${f.file}:${targetLine} -->`,
-        `🦦 **CodeOtter [${String(f.severity || "low").toUpperCase()}]** — **${f.title || "Suggested fix"}** (\`${f.file}:L${targetLine}\`)`,
+        marker,
+        `🦦 **CodeOtter [${String(f.severity || "low").toUpperCase()}]** — ${heading} (\`${f.file}:L${targetLine}\`)`,
         ...(explanation ? ["", explanation] : []),
         // Most git servers anchor a review comment on one line, so a multi-line fix is shown, not offered for commit
         // (GitHub and Azure DevOps take a line range).
@@ -642,8 +694,8 @@ export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r
   }
 }
 
-export async function syncPrComments(r: CommentTarget, repo = repoOf(r.pr), { postScores = false, postReview = false, postInlineSuggestions = false, triage = null, extra = [] }: { postScores?: boolean; postReview?: boolean; postInlineSuggestions?: boolean; triage?: TriageResult | null; extra?: [string, string, string][] } = {}): Promise<string[]> {
-  if (!postScores && !postReview && !postInlineSuggestions && !triage && !extra.length) return [];
+export async function syncPrComments(r: CommentTarget, repo = repoOf(r.pr), { postScores = false, postReview = false, postInlineSuggestions = false, resolveFixed = [], triage = null, extra = [] }: { postScores?: boolean; postReview?: boolean; postInlineSuggestions?: boolean; resolveFixed?: Finding[]; triage?: TriageResult | null; extra?: [string, string, string][] } = {}): Promise<string[]> {
+  if (!postScores && !postReview && !postInlineSuggestions && !resolveFixed.length && !triage && !extra.length) return [];
   // on a git server, a marker comment counts only when this token wrote it (where the server can say who that is)
   const commentAuthor = isForgeRepo(repo) ? await forgeOf(repo).me(repo) : null;
   let existingComments: { id?: number | string; body?: unknown; user?: { id?: unknown } | null }[] = [];
@@ -691,6 +743,14 @@ export async function syncPrComments(r: CommentTarget, repo = repoOf(r.pr), { po
       if (inlineRes.posted > 0) posted.push(`inline suggestions (${inlineRes.posted})`);
     } catch (e) {
       r.commentError = [r.commentError, (e as Error).message].filter(Boolean).join("; ");
+    }
+  }
+  if (resolveFixed.length) {
+    try {
+      const n = await resolveFixedComments(r.pr, repo, resolveFixed, String(r.headSha || r.pr.headRefOid || r.pr.headSha || ""));
+      if (n > 0) posted.push(`resolved fixed comments (${n})`);
+    } catch (e) {
+      r.commentError = [r.commentError, `Resolving fixed comments: ${(e as Error).message}`].filter(Boolean).join("; ");
     }
   }
   if (posted.length) r.commentsPosted = posted;

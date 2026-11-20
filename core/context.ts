@@ -26,6 +26,7 @@ export interface ReviewSettings {
   postScores: boolean;
   postReview: boolean;
   postInlineSuggestions: boolean;
+  resolveFixed: boolean; // resolve our inline comments a later push fixed (only while inline suggestions are posted)
   commands: boolean;
   auto: boolean;
 }
@@ -37,7 +38,7 @@ export interface BaseCommit { sha: string; message: string; author: string; }
 export interface GitHistory { prCommits: GitCommit[]; baseCommits: BaseCommit[]; formatted?: string; }
 export interface LinkedIssue { number: number; repo: string; title: string; body: string; state: string; url: string; labels: string[]; }
 
-export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: false, postReview: false, postInlineSuggestions: false, commands: false, auto: false };
+export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: false, postReview: false, postInlineSuggestions: false, resolveFixed: true, commands: false, auto: false };
 // Review settings are per repository (repoSettings[repo].review, from Repository settings). Repositories not yet saved
 // there fall back to the old install-wide "review" setting and the per-repository posting toggles kept in "guides".
 export const reviewConfig = async (repo = ""): Promise<ReviewSettings> => {
@@ -58,6 +59,7 @@ export const normalizeReview = (v: { [K in keyof ReviewSettings]?: unknown }): R
   postScores: !!v.postScores,
   postReview: !!v.postReview,
   postInlineSuggestions: !!v.postInlineSuggestions,
+  resolveFixed: v.resolveFixed === undefined ? REVIEW_DEFAULTS.resolveFixed : !!v.resolveFixed,
   auto: !!v.auto,
   commands: !!v.commands,
 });
