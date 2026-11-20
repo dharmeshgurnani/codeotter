@@ -184,7 +184,7 @@ async function githubManifest(body: Body, http: CookieWriter): Promise<ActionRes
     },
     request_oauth_on_install: true,
     // GitHub refuses a localhost webhook URL; a laptop gets events through the forwarder instead.
-    ...(LOCAL_APP_URL ? {} : { hook_attributes: { url: webhookUrl("github"), active: true }, default_events: ["pull_request", "issue_comment", "installation_repositories"] }),
+    ...(LOCAL_APP_URL ? {} : { hook_attributes: { url: webhookUrl("github"), active: true }, default_events: ["pull_request", "issue_comment", "pull_request_review_comment", "installation_repositories"] }),
   };
   return { submit: { url: `https://github.com/settings/apps/new?state=${state}`, fields: { manifest: JSON.stringify(manifest) } } };
 }
@@ -310,7 +310,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             { key: "postReview", label: "Add PR review as a comment", type: "checkbox", text: "Add a PR comment with the review summary and link to the full report" },
             { key: "postInlineSuggestions", label: "Post inline suggestions", type: "checkbox", text: "Post inline committable suggestion comments on PR diff lines" },
             { key: "auto", label: "Auto-review", type: "checkbox", text: "Review every new or updated pull request and post the result (drafts and PRs labelled codeotter:skip are left alone)" },
-            { key: "commands", label: "PR comment commands", type: "checkbox", text: "Run /review, /describe, /improve, /ask, /docs and /changelog from comments by owners, members and collaborators" },
+            { key: "commands", label: "PR comment commands", type: "checkbox", text: "Run /review, /describe, /improve, /ask, /docs and /changelog from comments by owners, members and collaborators, and answer their replies under CodeOtter's inline comments (\"@codeotter remember <rule>\" saves a team learning)" },
             files.length ? { key: "useGuides", label: "Review guidelines", type: "checkbox", text: `Follow ${files.join(" + ")}` } : { key: "noGuides", label: "Review guidelines", type: "readonly" },
             { key: "learnings", label: "Team learnings", type: "list", hint: "Dismissed findings, kept as rules for this repository." },
             { key: "accepted", label: "Accepted fixes", type: "list" },
@@ -502,7 +502,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
               { key: "webhookUrl", label: "Webhook URL", type: "readonly", ...(app.slug ? { link: { label: "App settings", url: `https://github.com/settings/apps/${app.slug}` } } : {}) },
               { key: "webhookSecret", label: "Webhook secret", type: "password", placeholder: app.webhookSecret ? "Saved" : "", hint: app.webhookSecret ? "Leave blank to keep the stored secret." : "Apps created by Create app carry one. For an existing app, set the URL above and a secret under the app's Webhook settings, then paste the secret here." },
               { key: "webhookStatus", label: "Last delivery", type: "readonly" },
-              { key: "forward", label: "Forward webhooks here", type: "checkbox", text: "gh webhook forward streams each GitHub repository's pull_request and issue_comment events to this process (local development without a public URL; needs gh extension install cli/gh-webhook)" },
+              { key: "forward", label: "Forward webhooks here", type: "checkbox", text: "gh webhook forward streams each GitHub repository's pull_request, issue_comment and pull_request_review_comment events to this process (local development without a public URL; needs gh extension install cli/gh-webhook)" },
               { key: "forwardStatus", label: "Forwarders", type: "readonly", hideWhen: { field: "forward", in: ["false"] } },
             ],
             values: { token: "", ...(githubToken ? { clearToken: false } : {}), webhookUrl: webhookUrl("github"), webhookSecret: "", webhookStatus: describeDelivery("github"), forward, forwardStatus: forwarderStatus() },

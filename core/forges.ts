@@ -93,6 +93,8 @@ export interface BaseCommit { sha: string; message: string; author: string }
 // A commit status, in GitHub's terms (state: success | failure | error | pending).
 export interface CommitStatus { state: string; context: string; description?: string; target_url?: string }
 export interface InlineComment { path: string; line: number; startLine?: number; body: string }
+// One comment of an inline review thread (root first). `line` is the new-file line, negative for an old-file line.
+export interface ThreadComment { id: number | string; body: string; created_at: string; user: { id: number | string; login: string }; bot: boolean; path: string; line: number; hunk: string; author_association?: string }
 export type HookHeaders = Record<string, string | undefined>;
 export interface HookMeta { event: string; delivery: string; signature: string | undefined }
 export interface RoutedHook { repo: string; pr?: PullRequest; comment?: ForgeComment }
@@ -133,6 +135,9 @@ export interface Forge {
   commentsSince(repo: string, since: string): Promise<ForgeComment[]>;
   trusted(repo: string, c: ForgeComment): Promise<boolean>;
   react(repo: string, c: ForgeComment): Promise<unknown> | null;
+  // Inline review threads, each oldest first, and a reply in one. Adapters without thread replies leave them out.
+  reviewThreads?(repo: string, n: number): Promise<ThreadComment[][]>;
+  replyInThread?(repo: string, n: number, root: ThreadComment, body: string): Promise<unknown>;
   ensureHook(repo: string, url: string, secret: string): Promise<boolean>;
   removeHook(repo: string, url: string): Promise<void>;
   secretHeader?: string;
@@ -330,6 +335,8 @@ interface GiteaComment { id: number; body?: string; created_at?: string; html_ur
 interface GiteaContent { encoding?: string; content?: unknown }
 interface GiteaIssue { number?: number; title?: string; body?: string; state?: string; labels?: GiteaLabel[] }
 interface GiteaHook { id?: number; config?: { url?: string } }
+interface GiteaReview { id?: number; state?: string }
+interface GiteaReviewComment { id: number; body?: string; created_at?: string; user?: GiteaUser; path?: string; position?: number; original_position?: number; diff_hunk?: string }
 function gitea(id: string, f: AuthedConfig): Forge {
   f.auth = () => `token ${f.token}`;
   const api = <T = unknown>(path: string, opts: ApiOptions = {}): Promise<T> => {
@@ -434,10 +441,26 @@ function gitea(id: string, f: AuthedConfig): Forge {
       return ["owner", "admin", "write"].includes(String(p?.permission || "").toLowerCase());
     },
     react: (repo, c) => (Number.isSafeInteger(Number(c.id)) ? api(`${r(repo)}/issues/comments/${Number(c.id)}/reactions`, { method: "POST", body: { content: "eyes" } }) : null),
+    // The API has no reply-to link: the server groups a conversation by file and line, and so does this.
+    async reviewThreads(repo, n) {
+      const reviews = (await list<GiteaReview>(`${r(repo)}/pulls/${n}/reviews`)).filter((v) => Number.isSafeInteger(Number(v?.id)) && v.state !== "PENDING");
+      const rows = (await Promise.all(reviews.map((v) => api<GiteaReviewComment[] | null>(`${r(repo)}/pulls/${n}/reviews/${Number(v.id)}/comments`)))).flatMap((x) => (Array.isArray(x) ? x : []));
+      const threads = new Map<string, ThreadComment[]>();
+      for (const c of rows) {
+        const line = Number(c?.position) > 0 ? Number(c.position) : -Number(c?.original_position || 0);
+        if (!c?.path || !line || !Number.isSafeInteger(Number(c.id))) continue;
+        const key = `${c.path}:${line}`;
+        threads.set(key, [...(threads.get(key) || []), { id: c.id, body: c.body || "", created_at: iso(c.created_at), user: { id: c.user?.id ?? "", login: c.user?.login || "" }, bot: false, path: c.path, line, hunk: c.diff_hunk || "" }]);
+      }
+      return [...threads.values()].map((t) => t.sort((a, b) => a.created_at.localeCompare(b.created_at) || Number(a.id) - Number(b.id)));
+    },
+    replyInThread: (repo, n, root, body) => api(`${r(repo)}/pulls/${n}/reviews`, { method: "POST", body: {
+      event: "COMMENT", body: "", comments: [{ path: root.path, new_position: root.line > 0 ? root.line : 0, old_position: root.line < 0 ? -root.line : 0, body }],
+    } }),
     async ensureHook(repo, url, secret) {
       const hooks = await api<GiteaHook[] | null>(`${r(repo)}/hooks`);
       if ((Array.isArray(hooks) ? hooks : []).some((h) => h?.config?.url === url)) return false;
-      await api(`${r(repo)}/hooks`, { method: "POST", body: { type: "gitea", active: true, events: ["pull_request", "issue_comment", "pull_request_comment"], config: { url, content_type: "json", secret } } });
+      await api(`${r(repo)}/hooks`, { method: "POST", body: { type: "gitea", active: true, events: ["pull_request", "issue_comment", "pull_request_comment", "pull_request_review"], config: { url, content_type: "json", secret } } });
       return true;
     },
     async removeHook(repo, url) {

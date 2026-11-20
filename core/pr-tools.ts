@@ -4,12 +4,12 @@ import { store } from "./store.ts";
 import { createPrComment, forgeId, forgeOf, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, readPr, repos } from "./git.ts";
 import { askModel, llmConfig } from "./models.ts";
 import { compressDiff, dynamicContextFiles, extendDiffContext, parseDiff } from "./diff.ts";
-import { guideFor, headFileTexts, reviewConfig } from "./context.ts";
+import { getRepoLearnings, guideFor, headFileTexts, reviewConfig, setRepoLearnings } from "./context.ts";
 import { deriveSuggestionFromDetail, reflectFindings } from "./engines.ts";
 import { postInlineSuggestionsOnPr, resolvePr, score, syncPrComments } from "./review.ts";
 import { CATCH_UP_EVERY, HANDLED_COMMENTS, lastCatchUp, remember, webhookHealthy } from "./queue.ts";
 import { repoOf } from "./views.ts";
-import type { ForgeComment } from "./forges.ts";
+import type { ForgeComment, ThreadComment } from "./forges.ts";
 import type { Guide, PullRequest, ReviewSettings } from "./context.ts";
 import type { Finding } from "./engines.ts";
 import type { LlmConfig } from "./models.ts";
@@ -273,6 +273,100 @@ export async function runCommand(repo: string, c: PrComment, { cmd, arg }: PrCom
   }
 }
 // </pr-commands>
+
+// <thread-replies>
+// Replies under CodeOtter's inline comments. A trusted reply in a thread whose root is a CodeOtter inline comment gets an
+// answer from the language model in the same thread, given the finding, its hunk and the conversation. "@codeotter
+// remember <rule>" records a team learning; a reply the model reads as "intentional / false positive" is offered one.
+// Same switch and trust rule as comment commands. Never answers CodeOtter's own comments (marked) or bots. Queue only.
+const ROOT_MARK = "<!-- codeotter:suggestion:";
+const REPLY_MARK = "<!-- codeotter:reply -->";
+const REMEMBER_RE = /@codeotter\s+remember\b:?\s*([\s\S]+)/i;
+const REPLY_WINDOW = 30 * 60e3; // a thread scan (no comment id) answers only replies this recent
+const isOurs = (c: ThreadComment, meId: string) => c.bot || c.body.includes("<!-- codeotter:") || (!!meId && String(c.user.id) === meId);
+const plain = (s: string, max: number) => String(s || "").replace(/<!--[\s\S]*?(-->|$)/g, "").trim().slice(0, max);
+// GitHub review comments, grouped by thread: in_reply_to_id always names the thread's first comment.
+function githubThreads(raw: unknown): ThreadComment[][] {
+  const threads = new Map<string, ThreadComment[]>();
+  for (const c of (Array.isArray(raw) ? raw.flat() : []) as unknown[]) {
+    if (!isObj(c) || !Number.isSafeInteger(Number(c.id)) || typeof c.path !== "string") continue;
+    const user = isObj(c.user) ? c.user : {};
+    const login = String(user.login || "");
+    const t: ThreadComment = {
+      id: Number(c.id), body: String(c.body || ""), created_at: String(c.created_at || ""), user: { id: Number(user.id) || 0, login },
+      bot: user.type === "Bot" || /\[bot\]$/.test(login), path: c.path, line: Number(c.line ?? c.original_line) || 0, hunk: String(c.diff_hunk || ""),
+      author_association: String(c.author_association || ""),
+    };
+    const key = String(Number(c.in_reply_to_id) || t.id);
+    threads.set(key, [...(threads.get(key) || []), t]);
+  }
+  return [...threads.values()].map((t) => t.sort((a, b) => a.created_at.localeCompare(b.created_at) || Number(a.id) - Number(b.id)));
+}
+async function reviewThreads(repo: string, number: number): Promise<ThreadComment[][]> {
+  if (isForgeRepo(repo)) return forgeOf(repo).reviewThreads?.(repo, number) ?? [];
+  return githubThreads(JSON.parse(await ghAsync("api", "--paginate", "--slurp", `repos/${repo}/pulls/${number}/comments?per_page=100`)));
+}
+function replyInThread(repo: string, number: number, root: ThreadComment, text: string) {
+  const body = `${REPLY_MARK}\n${text}`;
+  if (isForgeRepo(repo)) return forgeOf(repo).replyInThread!(repo, number, root, body);
+  return ghAsync("api", "--method", "POST", `repos/${repo}/pulls/${number}/comments/${Number(root.id)}/replies`, "-f", `body=${body}`);
+}
+// One queued job: a PR's threads, answering the comment `commentId` (GitHub webhook) or any recent unanswered reply.
+export async function answerReplies(repo: string, number: number, commentId = ""): Promise<number> {
+  if (!(await reviewConfig(repo)).commands) return 0;
+  if (isForgeRepo(repo) && !forgeOf(repo).reviewThreads) return 0;
+  const me = isForgeRepo(repo) ? await forgeOf(repo).me(repo).catch(() => null) : null;
+  const meId = me?.id === undefined || me?.id === "" ? "" : String(me.id);
+  let answered = 0;
+  for (const t of await reviewThreads(repo, number)) {
+    const root = t[0], last = t[t.length - 1];
+    if (t.length < 2 || !root.body.includes(ROOT_MARK) || (meId && String(root.user.id) !== meId)) continue;
+    if (isOurs(last, meId)) continue; // answered already, or a bot
+    if (commentId ? String(last.id) !== commentId : !(Date.now() - Date.parse(last.created_at) < REPLY_WINDOW)) continue;
+    if (!remember(HANDLED_COMMENTS, `${repo}#reply:${last.id}`)) continue;
+    const asComment: PrComment = { id: last.id, body: last.body, created_at: last.created_at, prNumber: number, author_association: last.author_association, user: last.user };
+    if (!(await commenterTrusted(repo, asComment).catch(() => false))) continue;
+    await answerThread(repo, number, t);
+    answered++;
+  }
+  return answered;
+}
+async function answerThread(repo: string, number: number, t: ThreadComment[]) {
+  const root = t[0], last = t[t.length - 1];
+  const remembered = plain(last.body, 2000).match(REMEMBER_RE);
+  const rule = remembered ? oneLine(remembered[1], 300).replace(/`/g, "") : "";
+  if (rule) {
+    await setRepoLearnings(repo, [...(await getRepoLearnings(repo)), rule]);
+    return replyInThread(repo, number, root, `🦦 Saved as a team learning for this repository: ${proseOf(rule, 300)}`);
+  }
+  const c = await llmConfig();
+  try {
+    if (!c.model) throw new Error("Replies need a language model: open Admin / Model provider");
+    if (c.api === "codereviewer") throw new Error("CodeReviewer cannot hold a conversation: pick a language model in Admin / Model provider");
+    const history = t.slice(1, -1).slice(-10).map((x) => `${isOurs(x, "") ? "CodeOtter" : x.user.login || "reviewer"}: ${plain(x.body, 1500)}`).join("\n\n");
+    const out = await askJson(c, `You are CodeOtter. A developer replied under one of your inline review comments on pull request #${number}. Answer the latest reply directly and briefly: explain, concede when the reply is right, or hold your point with a concrete reason from the code. Do not repeat your original comment. Reply with ONLY a JSON object:
+{"answer":"markdown","dismissed":false,"learning":""}
+Set "dismissed" to true only when the reply shows the finding is intentional, a false positive or unwanted in this repository; then "learning" is a one-line rule that keeps future reviews from raising it again.
+
+File: ${root.path}${root.line ? ` line ${Math.abs(root.line)}` : ""}
+Diff hunk:
+${root.hunk.slice(0, 4000) || "(not available)"}
+
+Your original comment:
+${plain(root.body, 3000)}
+${history ? `\nEarlier replies (oldest first):\n${history}\n` : ""}
+Latest reply from ${last.user.login || "reviewer"}:
+${plain(last.body, 3000)}`, "a thread reply");
+    const answer = proseOf(out.answer, 4000);
+    if (!answer) throw new Error(`${c.provider}/${c.model} returned no reply`);
+    const learning = out.dismissed === true ? oneLine(proseOf(out.learning, 300), 300).replace(/`/g, "'") : "";
+    await replyInThread(repo, number, root, learning ? `${answer}\n\nTo keep this as a team learning, reply \`@codeotter remember ${learning}\`` : answer);
+  } catch (e) {
+    await Promise.resolve(replyInThread(repo, number, root, `🦦 CodeOtter could not answer: ${oneLine((e as Error).message, 500)}`)).catch(() => {});
+    throw e;
+  }
+}
+// </thread-replies>
 // Every minute: each onboarded repository's comments since the last poll, oldest first. The first poll after enabling
 // looks back five minutes, so older comments never fire.
 let commandPolling = false;

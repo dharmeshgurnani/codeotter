@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Replies on inline comments.** With PR comment commands on (Repository settings), a reply from an owner, member or collaborator (write access on Forgejo/Gitea) under a CodeOtter inline comment gets an answer in the same thread from the language model, given the finding, its diff hunk and the conversation. `@codeotter remember <rule>` saves a team learning; when the model reads a reply as "intentional" or "false positive" it offers the matching `remember` line instead of saving it. CodeOtter never answers its own comments or bots, and replies go through the PR queue. GitHub, Forgejo and Gitea for now. New GitHub Apps subscribe to `pull_request_review_comment` (an existing app: add the event under the app's Permissions & events), `gh webhook forward` forwards it, and new Forgejo/Gitea repository hooks add `pull_request_review`.
 - **TypeScript.** `core/`, `tui/`, `bin/`, `test/` and `web/scripts/` are strict TypeScript (`.ts`), run directly by Node's type stripping, with no build step. Node 22.18 or later is required. `pnpm start` runs `node core/server.ts`, and `codeotter` is `tui/codeotter.ts`. `pnpm typecheck` (strict, no `any`) runs in CI and before `pnpm test`. Malformed API request fields are treated as empty instead of failing with a TypeError. PocketBase migrations stay JavaScript.
 ## 0.7.0 (2026-11-08)
 
