@@ -5,6 +5,7 @@
 ## 0.8.3 (2026-11-20)
 
 - **Version in the sidebar.** The running release (`v0.8.3`) sits next to the logo.
+- **Posting and automation on by default.** *Post scores on PR*, *Add PR review as a comment*, *Post inline suggestions*, *Auto-review* and *PR comment commands* now start on; turn them off per repository in Repository settings. Repositories with saved review settings keep them.
 
 ## 0.8.2 (2026-11-17)
 
