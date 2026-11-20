@@ -11,10 +11,10 @@ import { getRepoAccepted, getRepoLearnings, guideCache, guideFiles, normalizeLea
 import { triageConfig } from "./review.ts";
 import { describeDelivery, forwarderStatus, LOCAL_APP_URL, reposChanged, syncForwarders, webhookUrl } from "./queue.ts";
 import { repoOf } from "./views.ts";
-import { accessQueue, allowed, effectiveRole, isRole, onboardedRepo, ROLES, userView } from "./access.ts";
+import { accessQueue, allowed, effectiveRole, emailDomainAllowed, isEmailDomain, isRole, onboardedRepo, ROLES, SSO_PB, userView } from "./access.ts";
 import type { Access, Role, SessionUser } from "./access.ts";
 import type { Cell, CellObject, Tone } from "./views.ts";
-import type { OAuthProviderConfig } from "./store.ts";
+import type { OAuthProviderConfig, SsoSetting } from "./store.ts";
 import type { ProviderDef } from "./providers.ts";
 import type { LocalModel } from "./local-models.ts";
 import type { ReviewSettings } from "./context.ts";
@@ -79,10 +79,11 @@ const editedRow = (table: unknown, ok: (r: Record<string, unknown>) => boolean) 
 const mask = (secret: string | undefined) => (secret ? `\u2022\u2022\u2022\u2022${secret.slice(-4)}` : "");
 const byProvider = <T>(pick: (x: ProviderDef) => T) => Object.fromEntries(Object.entries(PROVIDERS).map(([k, x]) => [k, pick(x)]));
 // Sign-in providers: GitHub plus every git server PocketBase has an OAuth2 provider for (Azure DevOps signs in through
-// Microsoft Entra ID, so its row is "Microsoft"; Bitbucket Data Center has no sign-in).
+// Microsoft Entra ID, so its row is "Microsoft"; Bitbucket Data Center has no sign-in), plus generic OpenID Connect SSO.
 export const LOGIN_PROVIDERS: Record<string, LoginProvider> = {
   github: { label: "GitHub", pb: "github" },
   ...Object.fromEntries(FORGE_IDS.filter((id) => FORGES[id].pb).map((id) => [id, { label: FORGES[id].signInLabel || FORGES[id].label, pb: FORGES[id].pb || "" }])),
+  sso: { label: "SSO", pb: SSO_PB },
 };
 export const oauthFlows = new Map<string, OAuthFlow>();
 // Microsoft Entra ID sign-in is pinned to one tenant: its users' email addresses are then set by that directory's admins,
@@ -110,6 +111,40 @@ export function oauthProvider(id: string, current: Partial<OAuthProviderConfig> 
   if (!url) throw new Error(`Set the ${spec.label} server under Admin / Git providers first`);
   return { ...base, displayName: spec.label, pkce: true,
     authURL: `${url}/login/oauth/authorize`, tokenURL: `${url}/login/oauth/access_token`, userInfoURL: id === "gitea" ? `${url}/api/v1/user` : `${url}/login/oauth/userinfo` };
+}
+// SSO: any OpenID Connect identity provider (Okta, Entra ID, Google Workspace, Keycloak, Authentik, JumpCloud), set up from
+// its issuer's discovery document. The admin's own server, so plain http is allowed only on this machine.
+const oidcUrl = (value: string, what: string): URL => {
+  let u: URL;
+  try { u = new URL(value); } catch { throw new Error(`${what} is not a URL`); }
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname);
+  if (u.username || u.password || u.hash || !(u.protocol === "https:" || (u.protocol === "http:" && local))) throw new Error(`${what} must be an https URL without credentials`);
+  return u;
+};
+export type OidcEndpoints = { issuer: string; authURL: string; tokenURL: string; userInfoURL: string; jwksURL: string };
+export async function discoverOidc(input: unknown): Promise<OidcEndpoints> {
+  const issuer = String(input || "").trim().replace(/\/\.well-known\/openid-configuration$/, "").replace(/\/+$/, "");
+  if (!issuer) throw new Error("Set the SSO issuer URL");
+  if (oidcUrl(issuer, "Issuer URL").search) throw new Error("Issuer URL must not have a query");
+  const where = `${issuer}/.well-known/openid-configuration`;
+  const res = await fetch(where, { headers: { accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(10000) }).catch((e: Error) => { throw new Error(`OIDC discovery failed at ${where}: ${e.message}`); });
+  if (!res.ok) throw new Error(`OIDC discovery failed at ${where}: ${res.status}`);
+  const d: unknown = await res.json().catch(() => null);
+  if (!isObj(d)) throw new Error(`OIDC discovery failed at ${where}: not JSON`);
+  if (typeof d.issuer !== "string" || d.issuer.replace(/\/+$/, "") !== issuer) throw new Error(`The discovery document names issuer ${String(d.issuer)}, not ${issuer}`);
+  const ep = (k: string) => { const v = d[k]; if (typeof v !== "string" || !v) throw new Error(`The discovery document has no ${k}`); return oidcUrl(v, k).href; };
+  return { issuer: d.issuer, authURL: ep("authorization_endpoint"), tokenURL: ep("token_endpoint"), userInfoURL: ep("userinfo_endpoint"), jwksURL: ep("jwks_uri") };
+}
+// "Allowed email domains" as typed: comma or space separated, an optional leading @.
+export function parseDomains(v: unknown): string[] {
+  const list = [...new Set((Array.isArray(v) ? v : String(v ?? "").split(/[\s,]+/)).map((x) => String(x).trim().toLowerCase().replace(/^@/, "")).filter(Boolean))];
+  for (const d of list) if (!isEmailDomain(d)) throw new Error(`Not an email domain: ${d}`);
+  return list;
+}
+// The PocketBase oidc2 entry: discovered endpoints, and the issuer plus JWKS so PocketBase checks the ID token.
+function ssoProvider(current: Partial<OAuthProviderConfig> | undefined, clientId: string, clientSecret: unknown, displayName: unknown, ep: OidcEndpoints): OAuthProviderConfig {
+  return { ...current, name: SSO_PB, clientId, ...(clientSecret ? { clientSecret: String(clientSecret) } : {}), displayName: String(displayName || "").trim().slice(0, 40) || "SSO", pkce: true,
+    authURL: ep.authURL, tokenURL: ep.tokenURL, userInfoURL: ep.userInfoURL, extra: { ...current?.extra, jwksURL: ep.jwksURL, issuers: [ep.issuer] } };
 }
 export const AZURE_ORG_RE = /^[\w][\w.-]*$/;
 export const FORGE_CONNECTIONS: Record<string, ForgeConnection> = Object.fromEntries(Object.entries(FORGES).map(([id, f]): [string, ForgeConnection] => [id, {
@@ -207,6 +242,26 @@ function providerRow(id: string, status: CellObject, extra: Pick<Row, "actions" 
     },
     ...extra,
   };
+}
+// The SSO row: its server is the issuer; the dialog also holds the email domains, auto-admission and "Require SSO".
+function ssoRow(id: string, current: Partial<OAuthProviderConfig>, on: boolean, sso: SsoSetting): Row {
+  return providerRow(id, on ? { text: "Enabled", tone: "ok" } : { text: "Off", tone: "muted" }, {
+    toggle: on,
+    settings: {
+      title: "Sign in with OpenID Connect (SSO)",
+      fields: [
+        { key: "issuer", label: "Issuer URL", type: "text", placeholder: "https://acme.okta.com", hint: "Read from <issuer>/.well-known/openid-configuration." },
+        { key: "displayName", label: "Display name", type: "text", placeholder: "Okta" },
+        { key: "clientId", label: "Client ID", type: "text" },
+        { key: "clientSecret", label: "Client secret", type: "password", placeholder: current.clientId ? "Saved" : "", hint: current.clientId ? "Leave blank to keep the stored secret." : "" },
+        { key: "domains", label: "Allowed email domains", type: "text", placeholder: "acme.com, acme.io", hint: "Invites match verified emails in these domains only." },
+        { key: "autoAdmit", label: "Auto-admit", type: "checkbox", text: "Admit users of these domains as developer" },
+        { key: "require", label: "Require SSO", type: "checkbox", text: "Hide other sign-in buttons (owners: PR_SCORER_RECOVERY=1)" },
+        { key: "callback", label: "Redirect URI", type: "readonly" },
+      ],
+      values: { issuer: sso.issuer || "", displayName: current.displayName || "", clientId: current.clientId || "", clientSecret: "", domains: (sso.domains || []).join(", "), autoAdmit: !!sso.autoAdmit, require: !!sso.require, callback: `${APP_URL}/auth/callback` },
+    },
+  }, { label: on && current.displayName ? `${current.displayName} (SSO)` : "OpenID Connect (SSO)", url: sso.issuer || "", icon: "sso" });
 }
 export const SETTINGS_PAGES: Record<string, SettingsPage> = {
   repos: {
@@ -594,8 +649,10 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
     async load(): Promise<PageData> {
       if (!PB_URL) return { sections: [{ id: "signin", title: "Sign-in", description: "Sign-in requires PocketBase (PB_URL).", fields: [] }], values: {} };
       const o = await store.getOAuth();
+      const sso: SsoSetting = (await store.getSetting("sso")) || {};
       const rows = Object.entries(LOGIN_PROVIDERS).map(([id, spec]) => {
         const current: Partial<OAuthProviderConfig> = o.providers.find((p) => p.name === spec.pb) || {};
+        if (spec.pb === SSO_PB) return ssoRow(id, current, !!o.enabled && !!current.clientId, sso);
         const tenant = spec.pb === "microsoft" ? entraTenant(current) : "";
         const url = spec.pb === "microsoft" ? `${ENTRA}${tenant ? `/${tenant}` : ""}` : providerUrl(id);
         const on = !!o.enabled && !!current.clientId;
@@ -637,24 +694,38 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
       const edited = editedRow(body.signin, (r) => !!LOGIN_PROVIDERS[String(r.id)]);
       if (edited) {
         const v = rec(rec(edited.settings).values);
-        body = { [edited.id === "github" ? "oauth" : `${edited.id}oauth`]: { enabled: !!edited.toggle, clientId: v.clientId, clientSecret: v.clientSecret, ...("tenant" in v ? { tenant: v.tenant } : {}) } };
+        body = { [edited.id === "github" ? "oauth" : `${edited.id}oauth`]: { ...v, enabled: !!edited.toggle } };
       }
       if (!Object.keys(LOGIN_PROVIDERS).some((id) => body[id === "github" ? "oauth" : `${id}oauth`])) return;
       if (!PB_URL) throw new Error("Sign-in requires PocketBase (PB_URL)");
       const o = await store.getOAuth();
       let providers = [...o.providers];
+      let sso: SsoSetting | null = null;
       for (const [id, spec] of Object.entries(LOGIN_PROVIDERS)) {
         if (!body[id === "github" ? "oauth" : `${id}oauth`]) continue;
         const v = rec(body[id === "github" ? "oauth" : `${id}oauth`]);
         const current = providers.find((p) => p.name === spec.pb);
         providers = providers.filter((p) => p.name !== spec.pb);
-        if (!v.enabled) continue;
+        const before: SsoSetting = spec.pb === SSO_PB ? (await store.getSetting("sso")) || {} : {};
+        if (!v.enabled) {
+          if (spec.pb === SSO_PB) sso = { ...before, require: false };
+          continue;
+        }
         const clientId = String(v.clientId || "").trim();
         if (!clientId) throw new Error(`${spec.label} client ID is required`);
         if (!current && !v.clientSecret) throw new Error(`${spec.label} client secret is required`);
-        providers.push(oauthProvider(id, current, clientId, v.clientSecret, v.tenant ?? entraTenant(current)));
+        if (spec.pb !== SSO_PB) {
+          providers.push(oauthProvider(id, current, clientId, v.clientSecret, v.tenant ?? entraTenant(current)));
+          continue;
+        }
+        // Another issuer's subjects are not this one's: accounts linked to the old one would be reachable by strangers.
+        const ep = await discoverOidc(v.issuer ?? before.issuer);
+        if (before.issuer && before.issuer !== ep.issuer && (await store.hasForgeIdentities(SSO_PB))) throw new Error("Cannot change the SSO issuer while accounts are linked to it");
+        providers.push(ssoProvider(current, clientId, v.clientSecret, v.displayName ?? current?.displayName, ep));
+        sso = { issuer: ep.issuer, domains: parseDomains(v.domains ?? before.domains), autoAdmit: !!(v.autoAdmit ?? before.autoAdmit), require: !!(v.require ?? before.require) };
       }
       await store.setOAuth({ ...o, enabled: providers.length > 0, providers });
+      if (sso) await store.setSetting("sso", sso);
     },
   },
 };
@@ -727,7 +798,7 @@ const accountsPage: SettingsPage & { invite(v: Body): Promise<void> } = {
         {
           id: "invite",
           title: "Invite",
-          description: providers.length ? "Matched on first sign-in by provider and username, or by verified GitHub email." : "No sign-in provider is enabled: Admin / Auth providers.",
+          description: providers.length ? "Matched on first sign-in by provider and username, or by verified GitHub, Microsoft or SSO email." : "No sign-in provider is enabled: Admin / Auth providers.",
           fields: [
             { key: "login", label: "Username or email", type: "text", placeholder: "octocat or name@example.com" },
             { key: "provider", label: "Provider", type: "select", options: providers },
@@ -779,8 +850,9 @@ const accountsPage: SettingsPage & { invite(v: Body): Promise<void> } = {
     if (!role) throw new Error(`Unknown role ${v.role}`);
     const email = login.includes("@");
     if (email ? !INVITE_EMAIL_RE.test(login) : !INVITE_LOGIN_RE.test(login)) throw new Error("Enter a username or an email address");
-    if (spec.pb === "microsoft" && !email) throw new Error("Microsoft invites match by email address");
-    if (email && !["github", "microsoft"].includes(spec.pb)) throw new Error(`${spec.label} invites match by username`);
+    if ((spec.pb === "microsoft" || spec.pb === SSO_PB) && !email) throw new Error(`${spec.label} invites match by email address`);
+    if (email && !["github", "microsoft", SSO_PB].includes(spec.pb)) throw new Error(`${spec.label} invites match by username`);
+    if (spec.pb === SSO_PB && !emailDomainAllowed(login, (await store.getSetting("sso"))?.domains)) throw new Error("SSO invites need an email in an allowed domain (Admin / Auth providers)");
     const invites = ((await store.getSetting("invites")) || []).filter((i) => !(i.pb === spec.pb && i.login === login));
     invites.push({ id: randomBytes(8).toString("hex"), provider, pb: spec.pb, login, role, repos: role === "developer" ? await assignableRepos(v.repos) : [], at: new Date().toISOString() });
     await store.setSetting("invites", invites);

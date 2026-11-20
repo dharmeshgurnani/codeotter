@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { DitherCanvas } from "@/components/dither-canvas";
 import { toast } from "sonner";
-import { Loader2 } from "lucide-react";
+import { KeyRound, Loader2 } from "lucide-react";
 
 // Split login: the left column is the only way in (GitHub), the right column is showcase real estate whose content
 // comes from the server (showcase.json) so sponsors, community and case studies change without a code change.
@@ -54,6 +54,7 @@ export function ProviderMark({ id, signIn = false }: { id: string; signIn?: bool
   if (id === "gitea") return <GiteaMark />;
   if (id === "bitbucket" || id === "bitbucketdc") return <BitbucketMark />;
   if (id === "azure") return signIn ? <MicrosoftMark /> : <AzureDevOpsMark />;
+  if (id === "sso") return <KeyRound className="size-5" aria-hidden="true" />;
   return <GitHubMark />;
 }
 
