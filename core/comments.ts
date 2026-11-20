@@ -1,6 +1,7 @@
 // Pull request comment bodies: scores, review and the blast-radius diagram.
 import { APP_URL } from "./config.ts";
 import { HOTSPOTS } from "./diff.ts";
+import { issueLabel } from "./context.ts";
 import { deriveSuggestionFromDetail, S1_SCORES } from "./engines.ts";
 import { effort, VERDICT } from "./views.ts";
 import type { BlastRadius, ChangedFile, OutsideImpact } from "./diff.ts";
@@ -33,7 +34,7 @@ export function formatScoresComment(r: ScoresCommentInput): string {
     `### 🦦 CodeOtter — Review Scores`,
     ...(shaNote ? ["", shaNote] : []),
     ...(linkedIssues.length
-      ? ["", `**Linked issue(s):** ${linkedIssues.map((i) => `[#${i.number} ${i.title}](${i.url})`).join(" · ")}`]
+      ? ["", `**Linked issue(s):** ${linkedIssues.map((i) => (i.url ? `[${issueLabel(i)} ${i.title}](${i.url})` : `${issueLabel(i)} ${i.title}`)).join(" · ")}`]
       : []),
     "",
     `| Metric | Score | Assessment |`,
@@ -43,7 +44,7 @@ export function formatScoresComment(r: ScoresCommentInput): string {
   const checkRows = [
     ...gates.map((g) => `| ${g.label} | ${g.pass ? "✅ Passed" : "⚠️ Warning"} (${Math.round(g.yes * 100)}% yes) |`),
     ...(linkedIssues.length && !gates.some((g) => g.id === "issue_requirements")
-      ? [`| Issue requirements | ${v.verdict !== "request_changes" && v.scores.quality >= 60 ? "✅ Passed" : "⚠️ Warning"} (${linkedIssues.map((i) => `#${i.number}`).join(", ")}) |`]
+      ? [`| Issue requirements | ${v.verdict !== "request_changes" && v.scores.quality >= 60 ? "✅ Passed" : "⚠️ Warning"} (${linkedIssues.map(issueLabel).join(", ")}) |`]
       : []),
   ];
   if (checkRows.length) {
@@ -210,7 +211,7 @@ export function formatReviewComment(r: ReviewCommentInput): string {
           `#### Linked Issues & Requirements`,
           ...linkedIssues.map((i) => {
             const req = (i.body || "").trim().replace(/\s+/g, " ").slice(0, 220);
-            return `- [#${i.number} ${i.title}](${i.url})${i.state ? ` (${i.state})` : ""}${req ? ` — ${req}${(i.body || "").trim().length > 220 ? "…" : ""}` : ""}`;
+            return `- ${i.url ? `[${issueLabel(i)} ${i.title}](${i.url})` : `${issueLabel(i)} ${i.title}`}${i.state ? ` (${i.state})` : ""}${req ? ` — ${req}${(i.body || "").trim().length > 220 ? "…" : ""}` : ""}`;
           }),
         ]
       : []),

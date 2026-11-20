@@ -5,6 +5,7 @@ import { OWNER_RE, REPO, REPO_RE, ROOT } from "./config.ts";
 import { store } from "./store.ts";
 import { forgeId, forgeOf, ghAsync, isForgeRepo } from "./git.ts";
 import { capMap } from "./pr-tools.ts";
+import { linkedTickets } from "./trackers.ts";
 import { repoOf } from "./views.ts";
 import type { ChangedFile } from "./diff.ts";
 import type { PrCommit as ForgePrCommit, PullRequest as ForgePullRequest } from "./forges.ts";
@@ -35,7 +36,9 @@ type LegacyPosting = { postScores?: boolean; postReview?: boolean; postInlineSug
 export interface GitCommit { sha: string; fullSha?: string; message: string; body?: string; author?: string; date?: string; }
 export interface BaseCommit { sha: string; message: string; author: string; }
 export interface GitHistory { prCommits: GitCommit[]; baseCommits: BaseCommit[]; formatted?: string; }
-export interface LinkedIssue { number: number; repo: string; title: string; body: string; state: string; url: string; labels: string[]; }
+// A linked issue; Jira and Linear tickets (core/trackers.ts) carry their key ("ABC-123") and repo "jira" / "linear".
+export interface LinkedIssue { number: number; key?: string; repo: string; title: string; body: string; state: string; url: string; labels: string[]; }
+export const issueLabel = (i: Pick<LinkedIssue, "number" | "key">): string => i.key || `#${i.number}`;
 
 export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: false, postReview: false, postInlineSuggestions: false, commands: false, auto: false };
 // Review settings are per repository (repoSettings[repo].review, from Repository settings). Repositories not yet saved
@@ -238,7 +241,12 @@ function parseLinkedIssueRefs(baseRepo: string, pr: Partial<Pick<PullRequest, "n
   return out.slice(0, 3);
 }
 
+// Forge issues ("Closes #123") and Jira / Linear tickets named in the title, branch or description.
 export async function fetchLinkedIssues(baseRepo: string, pr: Partial<Pick<PullRequest, "number" | "title" | "body" | "headRefName">> | null | undefined): Promise<LinkedIssue[]> {
+  const [issues, tickets] = await Promise.all([fetchForgeIssues(baseRepo, pr), linkedTickets(pr).catch(() => [])]);
+  return [...issues, ...tickets];
+}
+async function fetchForgeIssues(baseRepo: string, pr: Partial<Pick<PullRequest, "number" | "title" | "body" | "headRefName">> | null | undefined): Promise<LinkedIssue[]> {
   const refs = parseLinkedIssueRefs(baseRepo, pr);
   if (!refs.length) return [];
   const list = await Promise.all(

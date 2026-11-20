@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Jira and Linear tickets as review context.** A pull request's title, branch and description are scanned for ticket keys: Jira keys of the configured projects, Linear keys of the configured teams and `linear.app` issue links (so `UTF-8` or `SHA-256` never match). Each ticket's title, description and acceptance criteria (Jira: the field named Acceptance Criteria; Linear: the description's Acceptance criteria section) join the linked issues, so they reach the review prompt, the System One `issue_requirements` gate, the PR comment and the review-page badges, shown by key (`ABC-123`). Jira Cloud uses REST v3 with an account email and API token (descriptions converted from ADF); Jira Data Center uses REST v2 with a personal access token. Linear uses its GraphQL API with an API key. Connect them under Settings → System → **Issue trackers** (Provider · Server · Status table, Test per row); tokens are sent only to the configured Jira address and `api.linear.app`, redirects are not followed, and fetched tickets are cached for five minutes.
 - **TypeScript.** `core/`, `tui/`, `bin/`, `test/` and `web/scripts/` are strict TypeScript (`.ts`), run directly by Node's type stripping, with no build step. Node 22.18 or later is required. `pnpm start` runs `node core/server.ts`, and `codeotter` is `tui/codeotter.ts`. `pnpm typecheck` (strict, no `any`) runs in CI and before `pnpm test`. Malformed API request fields are treated as empty instead of failing with a TypeError. PocketBase migrations stay JavaScript.
 ## 0.7.0 (2026-11-08)
 
