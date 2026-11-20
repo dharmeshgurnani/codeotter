@@ -36,6 +36,7 @@ function load({ forgePermission = "write", forgeStatus = 0, toolFails = false } 
     prUrlFor: (repo: string, n: number) => (repo.startsWith("forgejo~") ? `https://git.example/${repo.slice(8)}/pulls/${n}` : `https://github.com/${repo}/pull/${n}`),
     oneLine: (x: unknown, max: number) => String(x).replace(/\s+/g, " ").slice(0, max),
     ghAsync: async (...a: string[]) => { calls.push(["gh", ...a]); return "[]"; },
+    ghAsApp: async (_repo: string, ...a: string[]) => { calls.push(["gh", ...a]); return "[]"; },
     score: async (url: string, force: boolean, repo: string) => { calls.push(["score", url, force, repo]); return { pr: { url } }; },
     syncPrComments: async (r: { pr: { url: string } }, repo: string, opts: unknown) => { calls.push(["sync", r.pr.url, repo, opts]); return []; },
     runPrTool: async (url: string, id: string, opts: unknown) => { calls.push(["tool", url, id, opts]); if (toolFails) throw new Error("model said no"); return {}; },

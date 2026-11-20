@@ -1,7 +1,7 @@
 // PR tools (describe, improve, ask, docs, changelog) and comment commands.
 import { APP_URL, IS_SERVER } from "./config.ts";
 import { store } from "./store.ts";
-import { createPrComment, forgeId, forgeOf, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, readPr, repos } from "./git.ts";
+import { createPrComment, forgeId, forgeOf, ghAsApp, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, readPr, repos } from "./git.ts";
 import { askModel, llmConfig } from "./models.ts";
 import { compressDiff, dynamicContextFiles, extendDiffContext, parseDiff } from "./diff.ts";
 import { guideFor, headFileTexts, reviewConfig } from "./context.ts";
@@ -69,7 +69,7 @@ const DESCRIBE_RE = /<!-- codeotter:describe -->[\s\S]*?<!-- \/codeotter:describ
 async function updatePrBody(pr: PullRequest, body: string) {
   const { repo, number } = parsePrUrl(pr.url)!; // a PR read back from its own URL
   if (isForgeRepo(repo)) return forgeOf(repo).setBody(repo, number, body);
-  return ghAsync("api", "--method", "PATCH", `repos/${repo}/pulls/${number}`, "-f", `body=${body}`);
+  return ghAsApp(repo, "api", "--method", "PATCH", `repos/${repo}/pulls/${number}`, "-f", `body=${body}`);
 }
 export const PR_TOOLS: Record<string, PrTool> = {
   describe: {
@@ -259,7 +259,7 @@ export async function runCommand(repo: string, c: PrComment, { cmd, arg }: PrCom
   const prUrl = prUrlFor(repo, number);
   const id = Number(c.id);
   if (isForgeRepo(repo)) await Promise.resolve().then(() => forgeOf(repo).react(repo, c as ForgeComment)).catch(() => {});
-  else if (Number.isSafeInteger(id) && id > 0) await ghAsync("api", "--method", "POST", `repos/${repo}/issues/comments/${id}/reactions`, "-f", "content=eyes").catch(() => {});
+  else if (Number.isSafeInteger(id) && id > 0) await ghAsApp(repo, "api", "--method", "POST", `repos/${repo}/issues/comments/${id}/reactions`, "-f", "content=eyes").catch(() => {});
   try {
     if (cmd === "review") {
       await syncPrComments(await score(prUrl, true, repo), repo, { postScores: true, postReview: true });

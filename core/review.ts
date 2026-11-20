@@ -2,7 +2,7 @@
 import { APP_URL, REPO_RE } from "./config.ts";
 import { PROVIDERS } from "./providers.ts";
 import { store } from "./store.ts";
-import { createPrComment, forgeOf, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, readPr, repos, validPrUrl } from "./git.ts";
+import { createPrComment, forgeOf, ghAsApp, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, readPr, repos, validPrUrl } from "./git.ts";
 import { askSystemOne, llmConfig, s1Config } from "./models.ts";
 import { acceptedSuggestions, blastRadius, dynamicContextFiles, extendDiffContext, parseDiff, sliceOutsideDiffImpact } from "./diff.ts";
 import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, getRepoAccepted, getRepoLearnings, effectiveRules, guideFor, headFileTexts, postable, REVIEW_DEFAULTS, reviewConfig, shaMatch } from "./context.ts";
@@ -74,7 +74,7 @@ async function postCommitStatus(repo: string, sha: string, context: string, stat
   if (!SHA_RE.test(sha || "")) return;
   const fields = { state, context, description: description.slice(0, 140), target_url: `${APP_URL}/review?pr=${encodeURIComponent(url)}` };
   if (isForgeRepo(repo)) return forgeOf(repo).status(repo, sha, fields, parsePrUrl(url)?.number);
-  return ghAsync(["api", "--method", "POST", `repos/${repo}/statuses/${sha}`, ...Object.entries(fields).flatMap(([k, v]) => ["-f", `${k}=${v}`])]);
+  return ghAsApp(repo, ["api", "--method", "POST", `repos/${repo}/statuses/${sha}`, ...Object.entries(fields).flatMap(([k, v]) => ["-f", `${k}=${v}`])]);
 }
 function formatTriageComment(t: TriageResult): string {
   const level = S1_SCORES.correctness_risk[Math.min(4, Math.round(t.risk / 25))];
@@ -641,7 +641,7 @@ export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r
 
   try {
     const args = buildReviewArgs(rawHeadSha.length >= 7);
-    await ghAsync(args);
+    await ghAsApp(repo, args);
     return {
       posted: comments.length,
       mode: "inline_review",
@@ -651,7 +651,7 @@ export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r
     try {
       if (rawHeadSha) {
         const argsNoSha = buildReviewArgs(false);
-        await ghAsync(argsNoSha);
+        await ghAsApp(repo, argsNoSha);
         return {
           posted: comments.length,
           mode: "inline_review",
@@ -676,7 +676,7 @@ export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r
           : []),
       ]),
     ].join("\n");
-    await ghAsync("pr", "comment", r.pr.url, "--body", fallbackBody);
+    await ghAsApp(repo, "pr", "comment", r.pr.url, "--body", fallbackBody);
     return {
       posted: comments.length,
       mode: "pr_comment_fallback",
@@ -704,7 +704,9 @@ export async function syncPrComments(r: CommentTarget, repo = repoOf(r.pr), { po
         await forgeOf(repo).editComment(repo, r.pr.number, existing.id, body);
         return `${label} (updated)`;
       }
-      await ghAsync(["api", "--method", "PATCH", `repos/${repo}/issues/comments/${existing.id}`, "-f", `body=${body}`]);
+      // a marker comment the operator posted before the app existed: the bot may not edit it, the operator can
+      const patch = ["api", "--method", "PATCH", `repos/${repo}/issues/comments/${existing.id}`, "-f", `body=${body}`];
+      await ghAsApp(repo, patch).catch(() => ghAsync(patch));
       return `${label} (updated)`;
     }
     await createPrComment(r.pr.url, repo, r.pr.number, body);

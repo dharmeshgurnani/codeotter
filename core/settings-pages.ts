@@ -5,7 +5,7 @@ import { APP_URL, FORGE_API, FORGE_IDS, forgeOrigin, FORGES, REPO_RE } from "./c
 import { contextNote, listModels, LOCAL, LOCAL_LLM, LOCAL_S1, modelCache, modelIcon, modelPath, modelReady, providerIcon, PROVIDERS, runtimeAssets, runtimeBin, RUNTIMES, S1_PROVIDERS } from "./providers.ts";
 import { downloadModel, downloads, ensureRuntime, findPython, localStatus, sidecars, stopSidecar, venvPython } from "./local-models.ts";
 import { PB_URL, store } from "./store.ts";
-import { applyGithubToken, cleanRepo, forgeApi, forgeId, forgeOf, ghAsync, isForgeRepo, nativeRepo, repoLabel, repos, repositoryChoices } from "./git.ts";
+import { applyGithubToken, appPostingActive, cleanRepo, forgeApi, forgeId, forgeOf, ghAsync, isForgeRepo, nativeRepo, repoLabel, repos, repositoryChoices } from "./git.ts";
 import { askModel, askSystemOne, llmConfig, s1Config } from "./models.ts";
 import { getRepoAccepted, getRepoLearnings, guideCache, guideFiles, normalizeLearningList, repoConfigFile, REVIEW_DEFAULTS, reviewConfig, storedReview } from "./context.ts";
 import { triageConfig } from "./review.ts";
@@ -528,6 +528,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             fields: [
               { key: "token", label: "Access token", type: "password", placeholder: mask(githubToken), hint: githubToken ? "Leave blank to keep the stored token." : "Without one, the gh CLI's own login (or GH_TOKEN) is used." },
               ...(githubToken ? ([{ key: "clearToken", label: "Saved token", type: "checkbox", text: "Remove it and use the gh CLI's own login (or GH_TOKEN)" }] satisfies Field[]) : []),
+              { key: "postAs", label: "Posts as", type: "readonly" },
               { key: "webhookUrl", label: "Webhook URL", type: "readonly", ...(app.slug ? { link: { label: "App settings", url: `https://github.com/settings/apps/${app.slug}` } } : {}) },
               { key: "webhookSecret", label: "Webhook secret", type: "password", placeholder: app.webhookSecret ? "Saved" : "", hint: app.webhookSecret ? "Leave blank to keep the stored secret." : "Apps created by Create app carry one. For an existing app, set the URL above and a secret under the app's Webhook settings, then paste the secret here." },
               { key: "webhookStatus", label: "Last delivery", type: "readonly" },
@@ -535,7 +536,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
               { key: "forward", label: "Forward webhooks here", type: "checkbox", text: "gh webhook forward streams each GitHub repository's pull_request and issue_comment events to this process (local development without a public URL; needs gh extension install cli/gh-webhook)" },
               { key: "forwardStatus", label: "Forwarders", type: "readonly", hideWhen: { field: "forward", in: ["false"] } },
             ],
-            values: { token: "", ...(githubToken ? { clearToken: false } : {}), webhookUrl: webhookUrl("github"), webhookSecret: "", webhookStatus: describeDelivery("github"), actionSecret: await actionSecret(), forward, forwardStatus: forwarderStatus() },
+            values: { token: "", ...(githubToken ? { clearToken: false } : {}), postAs: appPostingActive(app) ? `${app.slug || `GitHub App ${app.id}`}[bot] where installed, else ${githubToken ? "the saved token" : "the gh login"}` : githubToken ? "The saved token" : "The gh login", webhookUrl: webhookUrl("github"), webhookSecret: "", webhookStatus: describeDelivery("github"), actionSecret: await actionSecret(), forward, forwardStatus: forwarderStatus() },
           },
         }),
         ...Object.entries(FORGES).map(([id, f]) => providerRow(id, f.token ? { text: "Token saved", tone: "ok" } : { text: "No token", tone: "muted" }, {

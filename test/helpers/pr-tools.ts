@@ -30,7 +30,7 @@ export function loadTools({ answer, body = "Author text.", reflectMin = 0, files
     isForgeRepo: () => false,
     parsePrUrl: (u: string) => ({ repo: "acme/shop", number: Number(u.split("/").pop()) }),
     forgeApi: async () => { throw new Error("forge not expected"); },
-    ghAsync: async (...args: string[]) => { calls.bodies.push(String(args.at(-1)).replace(/^body=/, "")); return "{}"; },
+    ghAsApp: async (_repo: string, ...args: string[]) => { calls.bodies.push(String(args.at(-1)).replace(/^body=/, "")); return "{}"; },
     syncPrComments: async (_r: unknown, repo: string, { extra }: { extra: Extra[] }) => { calls.comments.push({ repo, extra }); return extra.map((e) => e[2]); },
     deriveSuggestionFromDetail: (f: Detail) => ({ ...f, ...((f.startLine ?? Infinity) < f.line ? {} : { startLine: undefined }) }),
     postInlineSuggestionsOnPr: async (r: InlineCall["r"], repo: string) => { calls.inline.push({ r, repo }); return { posted: r.review.findings.length, mode: "inline_review" }; },

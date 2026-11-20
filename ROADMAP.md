@@ -19,7 +19,7 @@
 | [x] | Accepted fixes: suggestions authors applied are remembered per repository and guide later reviews (PR-Agent-inspired) | 2026-10-04 |
 | [x] | PR comment commands: /review, /describe, /improve, /ask, /docs, /changelog (PR-Agent-inspired) | 2026-10-04 |
 | [x] | PR events and comment commands via webhooks (GitHub App manifest with `hook_attributes`, Forgejo/Gitea repository hooks), one review queue with retries, catch-up poll, failed-delivery redelivery after restart, `gh webhook forward` for localhost | 2026-11-01 |
-| [ ] | Post comments, reviews and statuses as the GitHub App bot (installation tokens) instead of the operator's `gh` login | |
+| [x] | Post comments, reviews and statuses as the GitHub App bot (installation tokens) instead of the operator's `gh` login | 2026-11-20 |
 | [x] | Docs and Changelog tools (PR-Agent-inspired) | 2026-10-04 |
 | [x] | Improve: ranked, self-checked code suggestions posted as multi-line committable suggestions (PR-Agent-inspired) | 2026-10-04 |
 | [x] | Ask: free-form questions about a PR (PR-Agent-inspired) | 2026-10-04 |
