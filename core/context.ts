@@ -28,7 +28,12 @@ export interface ReviewSettings {
   postInlineSuggestions: boolean;
   commands: boolean;
   auto: boolean;
+  checks: CustomCheck[];
 }
+// A custom pre-merge check: a yes/no question (yes = pass) asked of the model owning the gates. "block" failures fail the
+// codeotter/checks commit status; "warn" failures only show; "off" is kept but not asked.
+export type CheckMode = "off" | "warn" | "block";
+export interface CustomCheck { name: string; instructions: string; mode: CheckMode; }
 export interface Guide { file: string; text: string; }
 // Per-repository posting toggles older installs kept in "guides" / "repoSettings" before repoSettings[repo].review.
 type LegacyPosting = { postScores?: boolean; postReview?: boolean; postInlineSuggestions?: boolean };
@@ -37,7 +42,7 @@ export interface BaseCommit { sha: string; message: string; author: string; }
 export interface GitHistory { prCommits: GitCommit[]; baseCommits: BaseCommit[]; formatted?: string; }
 export interface LinkedIssue { number: number; repo: string; title: string; body: string; state: string; url: string; labels: string[]; }
 
-export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: false, postReview: false, postInlineSuggestions: false, commands: false, auto: false };
+export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: false, postReview: false, postInlineSuggestions: false, commands: false, auto: false, checks: [] };
 // Review settings are per repository (repoSettings[repo].review, from Repository settings). Repositories not yet saved
 // there fall back to the old install-wide "review" setting and the per-repository posting toggles kept in "guides".
 export const reviewConfig = async (repo = ""): Promise<ReviewSettings> => {
@@ -60,7 +65,22 @@ export const normalizeReview = (v: { [K in keyof ReviewSettings]?: unknown }): R
   postInlineSuggestions: !!v.postInlineSuggestions,
   auto: !!v.auto,
   commands: !!v.commands,
+  checks: normalizeChecks(v.checks),
 });
+// Untrusted (settings body, later a repository config file): at most 20 checks, each with instructions.
+export const normalizeChecks = (v: unknown): CustomCheck[] =>
+  (Array.isArray(v) ? (v as unknown[]) : [])
+    .map((x): CustomCheck | null => {
+      if (!x || typeof x !== "object") return null;
+      const o = x as Record<string, unknown>;
+      const instructions = String(o.instructions ?? "").replace(/\s+/g, " ").trim().slice(0, 500);
+      if (!instructions) return null;
+      const mode: CheckMode = o.mode === "off" || o.mode === "block" ? o.mode : "warn";
+      return { name: String(o.name ?? "").replace(/\s+/g, " ").trim().slice(0, 80), instructions, mode };
+    })
+    .filter((x): x is CustomCheck => !!x)
+    .slice(0, 20)
+    .map((x, i) => ({ ...x, name: x.name || `Check ${i + 1}` }));
 
 // Repository review guides: AGENTS.md and/or CLAUDE.md at the repo root (both are used when both exist, since one is
 // often a stub pointing at the other). Detection is cached for 10 minutes; whether guides are used is a per-repository

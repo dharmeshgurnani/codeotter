@@ -21,12 +21,13 @@ import type { ReviewSettings } from "./context.ts";
 
 // Page JSON drawn by web/src/components/json-form.tsx (Field, Section, Action, Row there).
 export type Option = { value: string | number; label: string; icon?: string };
-export type FieldType = "text" | "password" | "select" | "multiselect" | "combo" | "picker" | "number" | "range" | "checkbox" | "readonly" | "list" | "table";
+export type FieldType = "text" | "password" | "select" | "multiselect" | "combo" | "picker" | "number" | "range" | "checkbox" | "readonly" | "list" | "table" | "rows";
 export type Field = {
   key: string;
   label: string;
   type: FieldType;
   columns?: { key: string; label: string }[];
+  fields?: Field[]; // rows: sub-fields of each repeatable row
   hint?: string;
   text?: string;
   placeholder?: string;
@@ -311,6 +312,17 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             { key: "postInlineSuggestions", label: "Post inline suggestions", type: "checkbox", text: "Post inline committable suggestion comments on PR diff lines" },
             { key: "auto", label: "Auto-review", type: "checkbox", text: "Review every new or updated pull request and post the result (drafts and PRs labelled codeotter:skip are left alone)" },
             { key: "commands", label: "PR comment commands", type: "checkbox", text: "Run /review, /describe, /improve, /ask, /docs and /changelog from comments by owners, members and collaborators" },
+            {
+              key: "checks",
+              label: "Pre-merge checks",
+              type: "rows",
+              fields: [
+                { key: "name", label: "Name", type: "text", placeholder: "Changelog" },
+                { key: "instructions", label: "Question (yes passes)", type: "text", placeholder: "Does a change to a public API come with a CHANGELOG entry?" },
+                { key: "mode", label: "Mode", type: "select", options: [{ value: "warn", label: "Warn" }, { value: "block", label: "Block" }, { value: "off", label: "Off" }] },
+              ],
+              hint: "A failed Block check fails the codeotter/checks commit status; Warn failures pass it with a note.",
+            },
             files.length ? { key: "useGuides", label: "Review guidelines", type: "checkbox", text: `Follow ${files.join(" + ")}` } : { key: "noGuides", label: "Review guidelines", type: "readonly" },
             { key: "learnings", label: "Team learnings", type: "list", hint: "Dismissed findings, kept as rules for this repository." },
             { key: "accepted", label: "Accepted fixes", type: "list" },

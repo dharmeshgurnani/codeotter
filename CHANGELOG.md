@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Custom pre-merge checks.** Repository settings take a list of checks: a name, a yes/no question (yes passes) and a mode (off, warn, block). System One asks them as extra gates next to the built-in ones (chunked for local runtimes); without System One the language model answers them in its review. Results show with the gates on the review page and in the posted scores and review comments, and set a `codeotter/checks` commit status: failure when a block check fails, success (warnings named) otherwise. Settings forms gain a `rows` field (a table of repeatable rows with sub-fields). Stored as `repoSettings[repo].review.checks`.
 - **TypeScript.** `core/`, `tui/`, `bin/`, `test/` and `web/scripts/` are strict TypeScript (`.ts`), run directly by Node's type stripping, with no build step. Node 22.18 or later is required. `pnpm start` runs `node core/server.ts`, and `codeotter` is `tui/codeotter.ts`. `pnpm typecheck` (strict, no `any`) runs in CI and before `pnpm test`. Malformed API request fields are treated as empty instead of failing with a TypeError. PocketBase migrations stay JavaScript.
 ## 0.7.0 (2026-11-08)
 

@@ -57,7 +57,7 @@ export type Review = {
     prCommits?: { sha: string; message: string; author?: string }[];
     baseCommits?: { sha: string; message: string; author?: string }[];
   };
-  gates?: { id: string; label: string; yes: number; pass: boolean }[];
+  gates?: { id: string; label: string; yes: number; pass: boolean; mode?: "warn" | "block" }[];
   engines?: { llm: string | null; s1: string | null };
   pending?: {
     scores?: boolean;
