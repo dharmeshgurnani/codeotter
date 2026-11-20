@@ -6,6 +6,8 @@ RUN npm i -g pnpm@10.20.0
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY web .
+# vite.config.ts reads the release version from the root package.json
+COPY package.json /app/package.json
 RUN pnpm build
 
 # Production dependencies are pure JavaScript: the terminal UI's and the backend's HTTP server (Hono).

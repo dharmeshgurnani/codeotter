@@ -223,6 +223,7 @@ export function AppSidebar({ repositoriesLoaded = true, repos, route, openCounts
         <button type="button" aria-label="Code Otter home" onClick={() => go("/")} className="flex h-8 items-center gap-2 rounded-md px-2 text-sm font-semibold tracking-tight text-sidebar-foreground hover:bg-sidebar-accent group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0">
           <img src="/codeotter-icon.svg" alt="" className="size-6 rounded-sm shrink-0" />
           <span className="truncate group-data-[collapsible=icon]:hidden">Code Otter</span>
+          <Badge mono title="CodeOtter version" className="group-data-[collapsible=icon]:hidden">v{import.meta.env.VITE_VERSION}</Badge>
         </button>
         <OrgSwitcher repos={repos} orgs={orgs} active={org} setActive={setOrg} canAddRepo={canAddRepo} go={go} />
       </SidebarHeader>
