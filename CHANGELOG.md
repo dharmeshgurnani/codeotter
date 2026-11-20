@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Post as the GitHub App bot.** With a GitHub App and its private key stored (Create app saves both), comments, inline reviews, triage commit statuses, PR description updates and command reactions go out as `<app>[bot]` through an installation access token: an RS256 app JWT is exchanged per repository owner (`GET /repos/{owner}/{repo}/installation`, `POST /app/installations/{id}/access_tokens`) and the token cached until five minutes before it expires. Repositories the app is not installed on, and instances without an app, keep posting as the operator's saved token or `gh` login. Reads are unchanged. The GitHub gear under Settings → System → Git providers shows who posts.
 - **TypeScript.** `core/`, `tui/`, `bin/`, `test/` and `web/scripts/` are strict TypeScript (`.ts`), run directly by Node's type stripping, with no build step. Node 22.18 or later is required. `pnpm start` runs `node core/server.ts`, and `codeotter` is `tui/codeotter.ts`. `pnpm typecheck` (strict, no `any`) runs in CI and before `pnpm test`. Malformed API request fields are treated as empty instead of failing with a TypeError. PocketBase migrations stay JavaScript.
 ## 0.7.0 (2026-11-08)
 
