@@ -2,6 +2,7 @@
 
 | Status | Feature | Date |
 | :---: | :--- | :--- |
+| [x] | Review strictness profile per repository (chill / balanced / assertive: findings budget, self-check threshold, model instructions) and a minimum severity for posted comments | 2026-11-20 |
 | [x] | Backend in one module per subsystem; HTTP on Hono with one route module per area and route-level access middleware | 2026-11-07 |
 | [x] | Bitbucket Cloud, Bitbucket Data Center and Azure DevOps repositories (reviews, inline comments, statuses, PR tools, comment commands, webhooks / service hooks) alongside GitHub, Forgejo and Gitea; sign-in with Bitbucket and Microsoft Entra ID. Stub-tested; not yet run against live servers | 2026-11-07 |
 | [x] | Developer role, per-account repository access and invites (uninvited sign-ins refused) | 2026-10-13 |

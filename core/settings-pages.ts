@@ -7,7 +7,7 @@ import { downloadModel, downloads, ensureRuntime, findPython, localStatus, sidec
 import { PB_URL, store } from "./store.ts";
 import { applyGithubToken, cleanRepo, forgeApi, forgeId, forgeOf, ghAsync, isForgeRepo, nativeRepo, repoLabel, repos, repositoryChoices } from "./git.ts";
 import { askModel, askSystemOne, llmConfig, s1Config } from "./models.ts";
-import { getRepoAccepted, getRepoLearnings, guideCache, guideFiles, normalizeLearningList, normalizeReview, REVIEW_DEFAULTS, reviewConfig } from "./context.ts";
+import { getRepoAccepted, getRepoLearnings, guideCache, guideFiles, normalizeLearningList, REVIEW_DEFAULTS, reviewConfig, storedReview } from "./context.ts";
 import { triageConfig } from "./review.ts";
 import { describeDelivery, forwarderStatus, LOCAL_APP_URL, reposChanged, syncForwarders, webhookUrl } from "./queue.ts";
 import { repoOf } from "./views.ts";
@@ -301,6 +301,8 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
           title: "Review",
           description: "How much the model reads, how many findings it returns, and what gets posted as PR comments.",
           fields: [
+            { key: "profile", label: "Profile", type: "select", options: [{ value: "chill", label: "Chill: high and medium only" }, { value: "balanced", label: "Balanced" }, { value: "assertive", label: "Assertive: nitpicks included" }] },
+            { key: "minSeverity", label: "Minimum severity to post", type: "select", options: (["nit", "low", "medium", "high"] as const).map((v) => ({ value: v, label: v[0].toUpperCase() + v.slice(1) })) },
             { key: "maxFindings", label: "Max findings", type: "range", min: 3, max: 12, step: 1 },
             { key: "diffChars", label: "Diff sent to the model", type: "select", options: [30000, 60000, 90000, 150000, 300000].map((v) => ({ value: v, label: `${v / 1000}k characters` })), hint: "Larger diffs cost more and may exceed the model's context." },
             { key: "contextLines", label: "Context above a change", type: "select", options: [0, 8, 16, 32].map((v) => ({ value: v, label: v ? `Up to ${v} lines, to the enclosing declaration` : "Off: git's 3 lines" })) },
@@ -348,7 +350,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
       };
       const prev = rs0?.[repo] || {};
       const reviewKeys = Object.keys(REVIEW_DEFAULTS).filter((k) => k in v);
-      const next = { ...prev, ...(reviewKeys.length ? { review: normalizeReview({ ...current, ...Object.fromEntries(reviewKeys.map((k) => [k, v[k]])) }) } : {}) };
+      const next = { ...prev, ...(reviewKeys.length ? { review: storedReview(current, Object.fromEntries(reviewKeys.map((k) => [k, v[k]]))) } : {}) };
       const g = { ...(guides0?.[repo] || {}), ...("useGuides" in v ? { use: !!v.useGuides } : {}) };
       if ("learnings" in v) { next.learnings = pruned(await getRepoLearnings(repo), v.loadedLearnings, v.learnings); g.learnings = next.learnings; }
       if ("accepted" in v) next.accepted = pruned(await getRepoAccepted(repo), v.loadedAccepted, v.accepted);

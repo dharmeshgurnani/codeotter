@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Review profile and minimum severity.** Repository settings add **Profile** (Chill: high and medium findings only, 5 findings, self-check at 7; Balanced: unchanged, the default; Assertive: nitpicks included, 12 findings, self-check at 3) and **Minimum severity to post** (Nit / Low / Medium / High). The profile sets the default Max findings and Self-check and the model's instructions; a Max findings or Self-check value moved off the profile's default is kept as set. The posted review summary and inline suggestions carry only findings at or above the minimum severity; the review page shows all of them.
 - **TypeScript.** `core/`, `tui/`, `bin/`, `test/` and `web/scripts/` are strict TypeScript (`.ts`), run directly by Node's type stripping, with no build step. Node 22.18 or later is required. `pnpm start` runs `node core/server.ts`, and `codeotter` is `tui/codeotter.ts`. `pnpm typecheck` (strict, no `any`) runs in CI and before `pnpm test`. Malformed API request fields are treated as empty instead of failing with a TypeError. PocketBase migrations stay JavaScript.
 ## 0.7.0 (2026-11-08)
 

@@ -5,7 +5,7 @@ import { store } from "./store.ts";
 import { createPrComment, forgeOf, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, readPr, repos, validPrUrl } from "./git.ts";
 import { askSystemOne, llmConfig, s1Config } from "./models.ts";
 import { acceptedSuggestions, blastRadius, dynamicContextFiles, extendDiffContext, parseDiff, sliceOutsideDiffImpact } from "./diff.ts";
-import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, getRepoAccepted, getRepoLearnings, guideFor, headFileTexts, REVIEW_DEFAULTS, reviewConfig, shaMatch } from "./context.ts";
+import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, getRepoAccepted, getRepoLearnings, guideFor, headFileTexts, postable, REVIEW_DEFAULTS, reviewConfig, shaMatch } from "./context.ts";
 import { changeDigest, deriveSuggestionFromDetail, judge, S1_SCORES, scoreWithSystemOne, verifyFindingsWithSystemOne } from "./engines.ts";
 import { formatReviewComment, formatScoresComment } from "./comments.ts";
 import { repoOf } from "./views.ts";
@@ -668,6 +668,9 @@ export async function syncPrComments(r: CommentTarget, repo = repoOf(r.pr), { po
     return label;
   };
 
+  // Posted output carries only findings at or above the repository's minimum severity; the stored review keeps all.
+  const minSeverity = postReview || postInlineSuggestions ? (await reviewConfig(repo)).minSeverity : "nit";
+  const out: CommentTarget = minSeverity !== "nit" && Array.isArray(r.review?.findings) ? { ...r, review: { ...r.review, findings: postable(r.review.findings, minSeverity) } } : r;
   const posted: string[] = [];
   if (triage) posted.push(await upsert("<!-- codeotter:triage -->", formatTriageComment(triage), "triage"));
   for (const [marker, body, label] of extra) posted.push(await upsert(marker, body, label));
@@ -680,14 +683,14 @@ export async function syncPrComments(r: CommentTarget, repo = repoOf(r.pr), { po
   }
   if (postReview) {
     try {
-      posted.push(await upsert("<!-- codeotter:review -->", formatReviewComment(r as ReviewRecord), "review")); // likewise postReview
+      posted.push(await upsert("<!-- codeotter:review -->", formatReviewComment(out as ReviewRecord), "review")); // likewise postReview
     } catch (e) {
       r.commentError = [r.commentError, (e as Error).message].filter(Boolean).join("; ");
     }
   }
   if (postInlineSuggestions) {
     try {
-      const inlineRes = await postInlineSuggestionsOnPr(r, repo);
+      const inlineRes = await postInlineSuggestionsOnPr(out, repo);
       if (inlineRes.posted > 0) posted.push(`inline suggestions (${inlineRes.posted})`);
     } catch (e) {
       r.commentError = [r.commentError, (e as Error).message].filter(Boolean).join("; ");
