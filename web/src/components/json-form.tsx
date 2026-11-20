@@ -24,7 +24,7 @@ export type Row = { id: string; label: string; cells: Record<string, Cell>; acti
 export type Field = {
   key: string;
   label: string;
-  type: "text" | "password" | "select" | "multiselect" | "combo" | "picker" | "number" | "range" | "checkbox" | "readonly" | "list" | "table";
+  type: "text" | "password" | "select" | "multiselect" | "combo" | "picker" | "number" | "range" | "checkbox" | "readonly" | "list" | "table" | "textarea"; // textarea: one item per line
   columns?: { key: string; label: string }[]; // table
   hint?: string;
   text?: string; // inline label for a checkbox
@@ -378,6 +378,8 @@ const Control = ({ f, vals, onChange, onSaveList, id, scope = "", onItemAction, 
         <span className="block py-2 text-sm text-muted-foreground">None available.</span>
       );
     }
+    case "textarea":
+      return <textarea id={id} rows={Math.min(8, Math.max(2, String(v ?? "").split("\n").length + 1))} spellCheck={false} className={`${cls} rounded-md border border-input bg-transparent px-3 py-2 font-mono text-sm shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50`} value={String(v ?? "")} placeholder={f.placeholder} onChange={(e) => onChange(e.target.value)} />;
     case "checkbox":
       return (
         <label className="flex items-start gap-2.5 py-2 text-sm">

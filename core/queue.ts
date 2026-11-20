@@ -5,7 +5,8 @@ import { secretMatches } from "./forges.ts";
 import { APP_URL, FORGE_API, FORGES, IS_SERVER, PORT, REPO_RE } from "./config.ts";
 import { store } from "./store.ts";
 import { createGitHubAppJwt, forgeId, forgeOf, forgetGithubRepos, ghEnv, isForgeRepo, nativeRepo, normalizeForgePr, openPrs, repos } from "./git.ts";
-import { reviewConfig } from "./context.ts";
+import { effectiveRules, reviewConfig } from "./context.ts";
+import { skipReason } from "./repo-rules.ts";
 import { score, SHA_RE, syncPrComments, triageConfig, triagePr } from "./review.ts";
 import { commenterTrusted, commentPrNumber, oneLine, parseCommand, runCommand } from "./pr-tools.ts";
 import { repoOf } from "./views.ts";
@@ -15,7 +16,7 @@ import type { WebhookDelivery } from "./store.ts";
 import type { PrComment } from "./pr-tools.ts";
 
 // A pull request as the queue sees it: openPrs() rows, a forge adapter's normalized PR, or normalizeGitHubPr().
-export interface QueuedPr { url: string; number?: number; headRefOid: string; isDraft?: boolean; labels?: ({ name?: string } | null)[] }
+export interface QueuedPr { url: string; number?: number; headRefOid: string; isDraft?: boolean; labels?: ({ name?: string } | null)[]; title?: string; author?: { login?: string }; baseRefName?: string }
 // The parts of a GitHub webhook payload routeWebhook() reads. Untrusted: every field is checked before use.
 interface GitHubPullPayload {
   number: number; title?: string; body?: string; html_url: string; user?: { login?: string }; updated_at?: string;
@@ -35,7 +36,6 @@ const PR_QUEUE = new Map<string, { repo: string; p: QueuedPr }>(); // url -> { r
 let prDraining = false;
 const MAX_REVIEW_TRIES = 3;
 const RETRY_AFTER = 10 * 60e3;
-const skipReview = (p: QueuedPr) => !!p.isDraft || (p.labels || []).some((l) => (l?.name || l) === "codeotter:skip");
 function enqueuePr(repo: string, p: QueuedPr | null | undefined) {
   if (!p?.url || !SHA_RE.test(p.headRefOid || "")) return false;
   PR_QUEUE.set(p.url, { repo, p });
@@ -59,7 +59,9 @@ async function handlePr(repo: string, p: QueuedPr) {
   const [tc, rc] = await Promise.all([triageConfig(), reviewConfig(repo)]);
   const done = (await store.getSetting("triageResults")) || {};
   if (tc.auto && done[p.url]?.headSha !== p.headRefOid) await triagePr(p.url, repo).catch((e: Error) => console.warn(`[triage] ${p.url}: ${e.message}`));
-  if (!rc.auto || skipReview(p)) return;
+  if (!rc.auto) return;
+  // skip rules: Repository settings, overridden by .codeotter.json on the base branch (repo-rules.ts)
+  if (skipReason(p, await effectiveRules(repo, rc, p))) return;
   const reviewed = (await store.getSetting("autoReviewed")) || {};
   if (reviewed[p.url] === p.headRefOid) return;
   const failed = (await store.getSetting("autoReviewFailed")) || {};

@@ -7,7 +7,7 @@ import { downloadModel, downloads, ensureRuntime, findPython, localStatus, sidec
 import { PB_URL, store } from "./store.ts";
 import { applyGithubToken, cleanRepo, forgeApi, forgeId, forgeOf, ghAsync, isForgeRepo, nativeRepo, repoLabel, repos, repositoryChoices } from "./git.ts";
 import { askModel, askSystemOne, llmConfig, s1Config } from "./models.ts";
-import { getRepoAccepted, getRepoLearnings, guideCache, guideFiles, normalizeLearningList, REVIEW_DEFAULTS, reviewConfig, storedReview } from "./context.ts";
+import { getRepoAccepted, getRepoLearnings, guideCache, guideFiles, normalizeLearningList, repoConfigFile, REVIEW_DEFAULTS, reviewConfig, storedReview } from "./context.ts";
 import { triageConfig } from "./review.ts";
 import { actionSecret, describeDelivery, forwarderStatus, LOCAL_APP_URL, reposChanged, syncForwarders, webhookUrl } from "./queue.ts";
 import { repoOf } from "./views.ts";
@@ -18,10 +18,11 @@ import type { OAuthProviderConfig } from "./store.ts";
 import type { ProviderDef } from "./providers.ts";
 import type { LocalModel } from "./local-models.ts";
 import type { ReviewSettings } from "./context.ts";
+import { CONFIG_FILE, rulesAsText } from "./repo-rules.ts";
 
 // Page JSON drawn by web/src/components/json-form.tsx (Field, Section, Action, Row there).
 export type Option = { value: string | number; label: string; icon?: string };
-export type FieldType = "text" | "password" | "select" | "multiselect" | "combo" | "picker" | "number" | "range" | "checkbox" | "readonly" | "list" | "table";
+export type FieldType = "text" | "password" | "select" | "multiselect" | "combo" | "picker" | "number" | "range" | "checkbox" | "readonly" | "list" | "table" | "textarea";
 export type Field = {
   key: string;
   label: string;
@@ -294,7 +295,8 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
     access: "admin",
     async load({ org = "", repo = "" } = {}) {
       await onboardedRepo(repo, org);
-      const [rc, files, guides, learnings, accepted] = await Promise.all([reviewConfig(repo), guideFiles(repo), store.getSetting("guides"), getRepoLearnings(repo), getRepoAccepted(repo)]);
+      const [rc, files, guides, learnings, accepted, configFile] = await Promise.all([reviewConfig(repo), guideFiles(repo), store.getSetting("guides"), getRepoLearnings(repo), getRepoAccepted(repo),
+        repoConfigFile(repo).then((f) => (f ? `${CONFIG_FILE} on the default branch sets ${Object.keys(f).join(", ") || "nothing"}; those keys override the fields below` : `No ${CONFIG_FILE} at the root`), (e: Error) => e.message)]);
       // One section, one Save: review settings, guidelines and learnings are all this repository's.
       const sections: Section[] = [
         {
@@ -312,7 +314,17 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             { key: "postScores", label: "Post scores on PR", type: "checkbox", text: "Add a PR comment with all System One scores after review" },
             { key: "postReview", label: "Add PR review as a comment", type: "checkbox", text: "Add a PR comment with the review summary and link to the full report" },
             { key: "postInlineSuggestions", label: "Post inline suggestions", type: "checkbox", text: "Post inline committable suggestion comments on PR diff lines" },
-            { key: "auto", label: "Auto-review", type: "checkbox", text: "Review every new or updated pull request and post the result (drafts and PRs labelled codeotter:skip are left alone)" },
+            { key: "auto", label: "Auto-review", type: "checkbox", text: "Review every new or updated pull request and post the result (PRs labelled codeotter:skip are left alone)" },
+            { key: "configFile", label: "Repository config", type: "readonly" },
+            { key: "reviewDrafts", label: "Draft pull requests", type: "checkbox", text: "Auto-review drafts" },
+            { key: "skipAuthors", label: "Skip authors", type: "textarea", placeholder: "dependabot[bot]\nrenovate[bot]", hint: "One login per line, * wildcard." },
+            { key: "skipLabels", label: "Skip labels", type: "textarea", placeholder: "no-review" },
+            { key: "skipTitleKeywords", label: "Skip title keywords", type: "textarea", placeholder: "WIP\n[skip review]" },
+            { key: "skipBaseBranches", label: "Skip base branches", type: "textarea", placeholder: "gh-pages\nrelease/*" },
+            { key: "onlyBaseBranches", label: "Only base branches", type: "textarea", placeholder: "main", hint: "Empty: every base branch." },
+            { key: "pathInclude", label: "Include paths", type: "textarea", placeholder: "src/**", hint: "Globs, one per line. Empty: every file." },
+            { key: "pathExclude", label: "Exclude paths", type: "textarea", placeholder: "**/*.lock\ndist/\n*.min.js" },
+            { key: "pathInstructions", label: "Path instructions", type: "textarea", placeholder: "src/api/**: Every handler checks the session.\n**/*.sql: Migrations must be reversible.", hint: "glob: instructions, one per line. Sent to the language model when a matching file changes." },
             { key: "commands", label: "PR comment commands", type: "checkbox", text: "Run /review, /describe, /improve, /ask, /docs and /changelog from comments by owners, members and collaborators" },
             files.length ? { key: "useGuides", label: "Review guidelines", type: "checkbox", text: `Follow ${files.join(" + ")}` } : { key: "noGuides", label: "Review guidelines", type: "readonly" },
             { key: "learnings", label: "Team learnings", type: "list", hint: "Dismissed findings, kept as rules for this repository." },
@@ -326,6 +338,8 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
         values: {
           repo: {
             ...Object.fromEntries((Object.keys(REVIEW_DEFAULTS) as (keyof ReviewSettings)[]).map((k) => [k, rc[k]])),
+            ...rulesAsText(rc),
+            configFile,
             ...(files.length ? { useGuides: guides?.[repo]?.use ?? true } : { noGuides: "No AGENTS.md or CLAUDE.md at the root" }),
             learnings,
             accepted,
