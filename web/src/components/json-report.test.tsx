@@ -43,4 +43,12 @@ describe("JsonReport", () => {
     render(<JsonReport sections={[{ id: "t", kind: "table", title: "Nothing", columns: ["A"], rows: [], empty: "No rows yet" }]} go={() => {}} />);
     expect(screen.getByText("No rows yet")).toBeInTheDocument();
   });
+
+  it("draws a bars section as one SVG bar per item", () => {
+    render(<JsonReport sections={[{ id: "v", kind: "bars", title: "Review volume", items: [{ label: "1 Nov", value: 2 }, { label: "2 Nov", value: 0 }, { label: "3 Nov", value: 5 }] }]} go={() => {}} />);
+    const chart = screen.getByRole("img", { name: "1 Nov: 2, 2 Nov: 0, 3 Nov: 5" });
+    expect(chart.querySelectorAll("rect")).toHaveLength(3);
+    expect(screen.getByText("Review volume")).toBeInTheDocument();
+    expect(screen.getByText("1 Nov")).toBeInTheDocument();
+  });
 });

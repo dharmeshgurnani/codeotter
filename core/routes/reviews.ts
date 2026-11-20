@@ -16,6 +16,7 @@ import { PR_TOOLS, runPrTool } from "../pr-tools.ts";
 import { reviewPrompts } from "../fix.ts";
 import type { ReviewRecord } from "../review.ts";
 import { homeData, renderScore, repoOf } from "../views.ts";
+import { analyticsData, periodOf, recordOutcome } from "../analytics.ts";
 import { settingsPages } from "../settings-pages.ts";
 import { assertRepo, checkRepoScope, requestOrg, seesAll, visibleRepos } from "../access.ts";
 import { gate, jsonBody } from "./middleware.ts";
@@ -53,6 +54,9 @@ reviews.get("/home", review, async (c) => {
   return c.json(await homeData(org, c.get("viewer")));
 });
 
+// ?org= and ?days= (7, 30 or 90): the Analytics report, scoped like Home.
+reviews.get("/analytics", review, async (c) => c.json(await analyticsData(requestOrg(c.req.query("org")), periodOf(c.req.query("days")), c.get("viewer"))));
+
 reviews.post("/learnings", review, async (c) => {
   const g = c.get("viewer");
   const body = await jsonBody(c);
@@ -78,6 +82,7 @@ reviews.post("/learnings", review, async (c) => {
     .slice(0, 300);
   const prev = await getRepoLearnings(repo);
   const learnings = await setRepoLearnings(repo, [...prev, ruleText]);
+  if (prUrl && validPrUrl(prUrl)) await recordOutcome("dismissed", prUrl, repo);
   let updatedReview = null;
   if (prUrl && validPrUrl(prUrl)) {
     const stored = await store.get(prUrl).catch(() => null);
@@ -169,6 +174,7 @@ reviews.post("/review-suggestions", review, async (c) => {
   const resInfo = await postInlineSuggestionsOnPr(target, repo, {
     findingIdx: body.findingIdx !== undefined && body.findingIdx !== null ? Number(body.findingIdx) : null,
   });
+  if (resInfo.posted > 0) await recordOutcome("posted", prUrl, repo, resInfo.posted);
   if (stored && resInfo.posted > 0) {
     const tag = resInfo.comments[0]
       ? `inline suggestion (${resInfo.comments[0].path}:L${resInfo.comments[0].line})`

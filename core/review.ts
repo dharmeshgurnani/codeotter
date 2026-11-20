@@ -3,7 +3,8 @@ import { APP_URL, REPO_RE } from "./config.ts";
 import { PROVIDERS } from "./providers.ts";
 import { store } from "./store.ts";
 import { createPrComment, forgeOf, ghAsApp, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, readPr, repos, validPrUrl } from "./git.ts";
-import { askSystemOne, llmConfig, s1Config } from "./models.ts";
+import { askSystemOne, llmConfig, metered, newUsage, s1Config } from "./models.ts";
+import { estimateCost, recordEvent, reviewEvent } from "./analytics.ts";
 import { acceptedSuggestions, blastRadius, dynamicContextFiles, extendDiffContext, parseDiff, sliceOutsideDiffImpact } from "./diff.ts";
 import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, getRepoAccepted, getRepoLearnings, effectiveRules, guideFor, headFileTexts, postable, REVIEW_DEFAULTS, reviewConfig, shaMatch } from "./context.ts";
 import { changeDigest, confirmFixedFindings, deriveSuggestionFromDetail, judge, S1_SCORES, scoreWithSystemOne, verifyFindingsWithSystemOne } from "./engines.ts";
@@ -279,7 +280,10 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
   const entry: ActiveReview = { state: live, error: null, promise: null, done: false };
   activeReviews.set(pr.url, entry);
 
-  entry.promise = (async () => {
+  // Analytics: wall time and the language model's token usage of this run (models.ts counts the calls made inside).
+  const started = Date.now();
+  const usage = newUsage();
+  entry.promise = metered(usage, async () => {
     try {
       // Refresh PR metadata in background if we started from cached.pr
       if (cached?.pr) live.pr = JSON.parse(await readPr(urlGuess, spec));
@@ -554,6 +558,13 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
         postInlineSuggestions: !!(publish && runLlm && rc.postInlineSuggestions &&(review?.findings || []).some((f) => !f.dismissed && (f.suggestion || f.line))),
       });
       await store.put(result);
+      const llmRan = llmReady && (runLlm || needLlmForScores);
+      const posted = Number((result.commentsPosted || []).map((s) => /^inline suggestions \((\d+)\)$/.exec(s)?.[1]).find(Boolean) || 0);
+      await recordEvent(reviewEvent(result, repoOf(live.pr), Date.now() - started, usage, estimateCost(
+        llmRan ? { provider: c.provider, model: c.model, local: !!c.local } : null,
+        runScores && s1.enabled ? { provider: s1.provider, model: s1.model, local: !!s1.local } : null,
+        usage,
+      ), posted));
       entry.state = result;
       entry.done = true;
       setTimeout(() => { if (activeReviews.get(live.pr.url) === entry) activeReviews.delete(live.pr.url); }, 30000).unref?.();
@@ -566,7 +577,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
       setTimeout(() => { if (activeReviews.get(live.pr.url) === entry) activeReviews.delete(live.pr.url); }, 120000).unref?.();
       throw e;
     }
-  })();
+  });
   // Async polling reads entry.error on the next request; keep background failures handled.
   entry.promise.catch(() => {});
 

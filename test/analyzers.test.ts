@@ -165,7 +165,7 @@ test("static analyzers", async (ctx) => {
     try {
       const pr = { url: "https://github.com/acme/shop/pull/1", number: 1, title: "t", author: { login: "a" }, baseRefName: "main", headRefName: "h", changedFiles: 1, additions: 2, deletions: 1, files: [{ path: "src/config.ts", additions: 2, deletions: 1 }] };
       const llm = { provider: "custom", baseUrl: "https://llm.example.test/v1", apiKey: "k", model: "m", source: "settings" as const };
-      const j = await E.judge(pr, diff, llm, { ...(await import("../core/context.ts")).REVIEW_DEFAULTS, reflectMin: 0 }, null, false, null, null, [], [], null, null, [], res.results);
+      const j = await E.judge(pr, diff, llm, { ...(await import("../core/context.ts")).REVIEW_DEFAULTS, reflectMin: 0 }, null, false, null, null, [], [], null, null, [], [], res.results);
       assert(sent.includes("Analyzer results") && sent.includes("aws-access-token"));
       assert.equal(j.findings[0].analyzer, "gitleaks");
       assert.equal(j.findings[1].analyzer, undefined, "tag only where the tool reported");

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ChevronRight, CircleArrowUp, ChevronsUpDown, FolderGit2, Users, House, LogIn, LogOut, Plus, Settings2 } from "lucide-react";
+import { ChartColumn, ChevronRight, CircleArrowUp, ChevronsUpDown, FolderGit2, Users, House, LogIn, LogOut, Plus, Settings2 } from "lucide-react";
 import {
   Sidebar,
   SidebarContent,
@@ -234,6 +234,12 @@ export function AppSidebar({ repositoriesLoaded = true, repos, route, openCounts
               <SidebarMenuButton tooltip="Home" isActive={route === "/"} onClick={() => go("/")}>
                 <House />
                 <span>Home</span>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+            <SidebarMenuItem>
+              <SidebarMenuButton tooltip="Analytics" isActive={route === "/analytics"} onClick={() => go("/analytics")}>
+                <ChartColumn />
+                <span>Analytics</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>

@@ -3,13 +3,14 @@ import { execFileSync, spawn } from "node:child_process";
 import type { TrackerSettings } from "./trackers.ts";
 import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, renameSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { CODEOTTER_HOME, IS_SERVER } from "./config.ts";
 import { repoOf } from "./views.ts";
 import type { Role } from "./access.ts";
 import type { ReviewRecord } from "./review.ts";
 import type { ReviewSettings } from "./context.ts";
+import type { AnalyticsEvent } from "./analytics.ts";
 
 // Settings: one JSON value per key. The types are what this app writes; a missing key reads as null. Keys not listed
 // here (dynamic ones such as a forge id) read as unknown and the caller narrows.
@@ -67,6 +68,9 @@ export interface BaseStore {
   setSetting<K extends string>(key: K, value: SettingValue<K>): Promise<void>;
   all(): Promise<ReviewRecord[]>;
   reviews(): Promise<ReviewRecord[]>;
+  // Analytics events (core/analytics.ts), appended; `since` is an ISO time, events at or after it come back newest first.
+  addEvent(e: AnalyticsEvent): Promise<void>;
+  events(since: string): Promise<AnalyticsEvent[]>;
 }
 export interface PbStore extends BaseStore {
   getOAuth(): Promise<OAuthConfig>;
@@ -106,8 +110,13 @@ const pbBinAvailable = findPocketBase();
 export const PB_URL = process.env.PB_URL || (pbBinAvailable ? "http://127.0.0.1:8090" : "");
 export const SCORES = join(CODEOTTER_HOME, "scores");
 const CONFIG = join(CODEOTTER_HOME, "config.json");
+const ANALYTICS = join(CODEOTTER_HOME, "analytics.jsonl");
 // <file-store>
 const isObj = (x: unknown): x is Record<string, unknown> => !!x && typeof x === "object" && !Array.isArray(x);
+// Stored events are this app's own JSON; the shape check only skips foreign or damaged rows.
+const isEvent = (x: unknown): x is AnalyticsEvent => isObj(x) && typeof x.kind === "string" && typeof x.repo === "string" && typeof x.at === "string";
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+const isoSince = (since: string) => { if (!ISO_RE.test(since)) throw new Error("Invalid time"); return since; };
 const readConfig = (): Record<string, unknown> => (existsSync(CONFIG) ? JSON.parse(readFileSync(CONFIG, "utf8")) : {});
 // Write to a sibling file and rename: a crash mid-write never leaves half a JSON document behind.
 const writeJsonAtomic = (file: string, value: unknown) => { const tmp = `${file}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify(value, null, 2)); renameSync(tmp, file); };
@@ -136,6 +145,16 @@ const fileStore: BaseStore = {
       .sort((a, b) => b.at.localeCompare(a.at)),
   reviews() {
     return this.all();
+  },
+  // One JSON line per event: appends never rewrite earlier events.
+  addEvent: async (e) => { mkdirSync(CODEOTTER_HOME, { recursive: true }); appendFileSync(ANALYTICS, `${JSON.stringify(e)}\n`); },
+  events: async (since) => {
+    isoSince(since);
+    if (!existsSync(ANALYTICS)) return [];
+    return readFileSync(ANALYTICS, "utf8").split("\n").flatMap((line) => {
+      if (!line.trim()) return [];
+      try { const e: unknown = JSON.parse(line); return isEvent(e) && e.at >= since ? [e] : []; } catch { return []; }
+    }).sort((a, b) => b.at.localeCompare(a.at));
   },
 };
 // </file-store>
@@ -289,6 +308,18 @@ const pbStore: PbStore = {
   },
   reviews() {
     return this.all();
+  },
+  addEvent: async (e) => { await pb("collections/analytics/records", { method: "POST", body: JSON.stringify({ kind: e.kind, repo: e.repo, url: e.url, at: e.at, data: e }) }); },
+  // PocketBase keeps dates as "YYYY-MM-DD HH:MM:SS.sssZ"; the filter compares in that form.
+  async events(since) {
+    const filter = encodeURIComponent(`at>="${isoSince(since).replace("T", " ")}"`);
+    const out: AnalyticsEvent[] = [];
+    for (let page = 1; page <= 100; page++) {
+      const r = await pb(`collections/analytics/records?perPage=500&page=${page}&sort=-at&filter=${filter}`);
+      out.push(...pbItems(r).map((i) => i.data).filter(isEvent));
+      if (page >= (Number(isObj(r) && r.totalPages) || 1)) break;
+    }
+    return out;
   },
   getOAuth: async () => {
     const c = await pb("collections/users");

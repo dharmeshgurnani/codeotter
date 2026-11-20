@@ -1,4 +1,5 @@
 // Model calls: System One (POST /v1/systemone) and language models (Anthropic Messages or OpenAI chat).
+import { AsyncLocalStorage } from "node:async_hooks";
 import { ENV_DEFAULTS, LOCAL, modelReady, PROVIDERS, S1_PROVIDERS } from "./providers.ts";
 import { ensureSidecar } from "./local-models.ts";
 import { store } from "./store.ts";
@@ -94,6 +95,25 @@ export async function llmConfig(): Promise<LlmConfig> {
   };
 }
 
+// Token usage of the language model calls made inside metered(): input and output tokens as the provider reports them,
+// and the provider's own cost in USD when it sends one (OpenRouter). A provider that reports nothing adds only a call.
+export interface Usage { calls: number; input: number; output: number; cost: number | null }
+const meter = new AsyncLocalStorage<Usage>();
+export const newUsage = (): Usage => ({ calls: 0, input: 0, output: 0, cost: null });
+export const metered = <T>(usage: Usage, fn: () => Promise<T>): Promise<T> => meter.run(usage, fn);
+const tokens = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.round(v) : 0);
+// `u` is the response's usage object: untrusted, read field by field.
+function addUsage(u: unknown, inKeys: string[], outKey: string) {
+  const m = meter.getStore();
+  if (!m) return;
+  m.calls++;
+  if (!u || typeof u !== "object") return;
+  const o = u as Record<string, unknown>;
+  m.input += inKeys.reduce((n, k) => n + tokens(o[k]), 0);
+  m.output += tokens(o[outKey]);
+  if (typeof o.cost === "number" && Number.isFinite(o.cost) && o.cost >= 0) m.cost = (m.cost || 0) + o.cost;
+}
+
 // One prompt in, text out. Anthropic uses the Messages API; everyone else is OpenAI chat/completions.
 // <ask-model>
 export async function askModel(prompt: string, c: LlmConfig): Promise<string> {
@@ -116,7 +136,8 @@ export async function askModel(prompt: string, c: LlmConfig): Promise<string> {
       signal: withAbort(c.signal, 600000),
     });
     if (!res.ok) throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 300)}`);
-    const msg = (await res.json()) as { stop_reason?: string; stop_details?: { category?: string }; content?: unknown };
+    const msg = (await res.json()) as { stop_reason?: string; stop_details?: { category?: string }; content?: unknown; usage?: unknown };
+    addUsage(msg.usage, ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"], "output_tokens");
     if (msg.stop_reason === "refusal") throw new Error(`Anthropic declined the request (${msg.stop_details?.category || "refusal"})`);
     if (msg.stop_reason === "max_tokens") throw new Error("Anthropic response was cut off at max_tokens: the review is incomplete");
     if (!Array.isArray(msg.content)) throw new Error(`Anthropic returned no content: ${JSON.stringify(msg).slice(0, 300)}`);
@@ -134,7 +155,8 @@ export async function askModel(prompt: string, c: LlmConfig): Promise<string> {
   });
   if (!res.ok) throw new Error(`LLM ${res.status}: ${(await res.text()).slice(0, 300)}`);
   // Proxies and some local servers answer 200 with {error} or an empty choices list; show that instead of a TypeError.
-  const body = (await res.json().catch(() => null)) as { choices?: { message?: { content?: unknown } }[]; error?: { message?: string } | string } | null;
+  const body = (await res.json().catch(() => null)) as { choices?: { message?: { content?: unknown } }[]; error?: { message?: string } | string; usage?: unknown } | null;
+  addUsage(body?.usage, ["prompt_tokens"], "completion_tokens");
   const text = body?.choices?.[0]?.message?.content;
   if (typeof text !== "string") throw new Error(`LLM returned no text: ${(body?.error && typeof body.error === "object" ? body.error.message : undefined) || body?.error || JSON.stringify(body ?? "").slice(0, 300)}`);
   return text.replace(/<think>[\s\S]*?<\/think>/g, "");
