@@ -102,6 +102,14 @@ test("repository rules", async (ctx) => {
     const none = await effectiveRules("gitea~acme/other", ui, { baseRefName: "main" });
     assert.deepEqual(none.pathExclude, ["dist/"]);
     assert.equal(none.configFile, null);
+    assert.equal(none.checks, undefined);
+    // custom pre-merge checks in the file replace Repository settings' (normalised like the settings page's)
+    clearRepoConfigCache();
+    files = { "acme/shop@main:.codeotter.json": JSON.stringify({ checks: [{ name: "Changelog", instructions: "Has a CHANGELOG line?", mode: "block" }, { instructions: "" }, { instructions: "Tests?", mode: "bogus" }] }) };
+    const withChecks = await effectiveRules("gitea~acme/shop", ui, { baseRefName: "main" });
+    assert.deepEqual(withChecks.checks, [{ name: "Changelog", instructions: "Has a CHANGELOG line?", mode: "block" }, { name: "Check 2", instructions: "Tests?", mode: "warn" }]);
+    assert.deepEqual(withChecks.configFile, ["checks"]);
+    assert.deepEqual(withChecks.pathExclude, ["dist/"]);
     ctx.diagnostic("config merge");
 
     // fork safety: a fork PR's head carries a .codeotter.json that would turn every rule off; only the base is read

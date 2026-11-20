@@ -24,8 +24,9 @@ export type Row = { id: string; label: string; cells: Record<string, Cell>; acti
 export type Field = {
   key: string;
   label: string;
-  type: "text" | "password" | "select" | "multiselect" | "combo" | "picker" | "number" | "range" | "checkbox" | "readonly" | "list" | "table" | "textarea"; // textarea: one item per line
+  type: "text" | "password" | "select" | "multiselect" | "combo" | "picker" | "number" | "range" | "checkbox" | "readonly" | "list" | "table" | "textarea" | "rows"; // textarea: one item per line
   columns?: { key: string; label: string }[]; // table
+  fields?: Field[]; // rows: the sub-fields of each row; the value is a list of objects keyed by sub-field
   hint?: string;
   text?: string; // inline label for a checkbox
   placeholder?: string;
@@ -235,7 +236,7 @@ function Range({ id, f, value, onChange }: { id?: string; f: Field; value: numbe
   return <input ref={ref} id={id} type="range" className="flex-1 accent-brand" min={f.min} max={f.max} step={f.step} value={value} onChange={(e) => onChange(Number(e.target.value))} />;
 }
 
-const Control = ({ f, vals, onChange, onSaveList, id, scope = "", onItemAction, busy = "" }: { f: Field; vals: Record<string, unknown>; onChange: (v: unknown) => void; onSaveList?: (v: unknown) => void; id?: string; scope?: string; onItemAction?: (itemId: string, actionId: string) => void; busy?: string }) => {
+const Control = ({ f, vals, onChange, onSaveList, id, scope = "", onItemAction, busy = "", label }: { f: Field; vals: Record<string, unknown>; onChange: (v: unknown) => void; onSaveList?: (v: unknown) => void; id?: string; scope?: string; onItemAction?: (itemId: string, actionId: string) => void; busy?: string; label?: string }) => {
   const v = vals[f.key];
   const cls = "w-full max-w-[520px]";
   switch (f.type) {
@@ -332,7 +333,7 @@ const Control = ({ f, vals, onChange, onSaveList, id, scope = "", onItemAction, 
         );
       }
       return (
-        <select id={id} className={`${cls} h-9 rounded-md border border-input bg-transparent px-3 text-sm`} value={String(v ?? "")} onChange={(e) => onChange(typeof baseOpts[0]?.value === "number" ? Number(e.target.value) : e.target.value)}>
+        <select id={id} aria-label={label} className={`${cls} h-9 rounded-md border border-input bg-transparent px-3 text-sm`} value={String(v ?? "")} onChange={(e) => onChange(typeof baseOpts[0]?.value === "number" ? Number(e.target.value) : e.target.value)}>
           {opts.map((o) => <option key={String(o.value)} value={String(o.value)}>{o.label}</option>)}
         </select>
       );
@@ -345,6 +346,27 @@ const Control = ({ f, vals, onChange, onSaveList, id, scope = "", onItemAction, 
           <Input id={id} className={cls} list={listId} value={String(v ?? "")} placeholder={f.placeholder} onChange={(e) => onChange(e.target.value)} />
           <datalist id={listId}>{opts.map((o) => <option key={o} value={o} />)}</datalist>
         </>
+      );
+    }
+    case "rows": {
+      // Repeatable objects: one table row per item, a control per sub-field, a remove button, and Add at the foot.
+      const sub = f.fields ?? [];
+      const items = Array.isArray(v) ? (v as Record<string, unknown>[]) : [];
+      const blank = () => Object.fromEntries(sub.map((s) => [s.key, s.options?.[0]?.value ?? ""]));
+      const set = (i: number, key: string, val: unknown) => onChange(items.map((x, j) => (j === i ? { ...x, [key]: val } : x)));
+      return (
+        <div className="space-y-2">
+          <DataTable
+            columns={sub.map((s) => ({ key: s.key, label: s.label }))}
+            empty="None yet."
+            rows={items.map((item, i) => ({
+              id: String(i),
+              cells: Object.fromEntries(sub.map((s) => [s.key, <Control f={s} vals={item} id={`${id}-${i}-${s.key}`} scope={scope} label={`${s.label} ${i + 1}`} onChange={(x) => set(i, s.key, x)} />])),
+              actions: <button type="button" aria-label={`Remove ${f.label} ${i + 1}`} className="shrink-0 rounded-md p-1 text-muted-foreground hover:bg-neutral-100 hover:text-red-700" onClick={() => onChange(items.filter((_, j) => j !== i))}><X className="size-4" /></button>,
+            }))}
+          />
+          <Button size="sm" variant="outline" onClick={() => onChange([...items, blank()])}><Plus />Add</Button>
+        </div>
       );
     }
     case "table":
@@ -388,7 +410,7 @@ const Control = ({ f, vals, onChange, onSaveList, id, scope = "", onItemAction, 
         </label>
       );
     default:
-      return <Input id={id} className={cls} type={f.type} autoComplete="off" value={String(v ?? "")} placeholder={f.placeholder} onChange={(e) => onChange(e.target.value)} />;
+      return <Input id={id} aria-label={label} className={cls} type={f.type} autoComplete="off" value={String(v ?? "")} placeholder={f.placeholder} onChange={(e) => onChange(e.target.value)} />;
   }
 };
 
@@ -423,7 +445,7 @@ export function JsonForm({
                   const link = f.link ?? f.linkBy?.map[String(vals[f.linkBy.field])];
                   const info = f.infoBy?.map[String(vals[f.infoBy.field])];
                   const control = <Control f={f} vals={vals} id={`f-${s.id}-${f.key}`} scope={s.id} onChange={(v) => onChange(s.id, applyChange(s, vals, f.key, v))} onSaveList={(v) => onAction(s.id, "save", undefined, applyChange(s, vals, f.key, v))} onItemAction={(itemId, actionId) => onAction(s.id, actionId, itemId)} busy={busy} />;
-                  if (f.type === "table") return <div key={f.key} className="p-3">{control}{f.hint && <span className="mt-1 block text-xs text-muted-foreground">{f.hint}</span>}</div>;
+                  if (f.type === "table" || f.type === "rows") return <div key={f.key} className="p-3">{f.type === "rows" && <span className="mb-2 block text-sm font-medium text-neutral-800">{f.label}</span>}{control}{f.hint && <span className="mt-1 block text-xs text-muted-foreground">{f.hint}</span>}</div>;
                   return (
                     <div key={f.key} className="grid grid-cols-1 gap-1.5 px-4 py-3 sm:grid-cols-[200px_1fr] sm:gap-4">
                       <label className="sm:pt-2 text-sm font-medium text-neutral-800" htmlFor={f.type === "checkbox" || f.type === "readonly" || f.type === "list" ? undefined : `f-${s.id}-${f.key}`}>{f.label}{info && <span className="ml-1.5"><InfoTip text={info} /></span>}</label>

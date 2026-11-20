@@ -547,7 +547,8 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
     const k = w.file.split("/").slice(0, 3).join("/");
     cohorts.set(k, [...(cohorts.get(k) ?? []), w]);
   }
-  const check = (ok: boolean) => (ok ? "✅ Passed" : "⚠️ Warning");
+  // A failed custom "block" check fails; any other failed check warns.
+  const check = (ok: boolean, block = false) => <Badge tone={ok ? "ok" : block ? "bad" : "warn"}>{ok ? "Passed" : block ? "Failed" : "Warning"}</Badge>;
   const isScoreLoading = (key: string) => !!(pending?.scores && pending?.readyScores?.[key] === undefined);
   const prCommits = r.gitHistory?.prCommits ?? [];
   const bodyText = (p.body || "").trim();
@@ -949,8 +950,8 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                     ] as React.ReactNode[]]
                   : []),
                 ...(r.gates ?? []).map((g) => [
-                  g.label,
-                  <>{check(g.pass)} <span className="text-muted-foreground">({Math.round(g.yes * 100)}% yes{g.id === "issue_requirements" && r.linkedIssues?.length ? ` · ${r.linkedIssues.map((i) => `#${i.number}`).join(", ")}` : ""})</span></>,
+                  <>{g.label}{g.mode === "block" && <Badge className="ml-1.5">blocking</Badge>}</>,
+                  <>{check(g.pass, g.mode === "block")} <span className="text-muted-foreground">({Math.round(g.yes * 100)}% yes{g.id === "issue_requirements" && r.linkedIssues?.length ? ` · ${r.linkedIssues.map((i) => `#${i.number}`).join(", ")}` : ""})</span></>,
                 ] as React.ReactNode[]),
                 ...(pending?.gates ? [["Merge gates", <InlineLoader key="g" text="Checking policy gates…" />] as React.ReactNode[]] : []),
               ]} />

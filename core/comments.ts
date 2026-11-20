@@ -2,7 +2,7 @@
 import { APP_URL } from "./config.ts";
 import { HOTSPOTS } from "./diff.ts";
 import { deriveSuggestionFromDetail, S1_SCORES } from "./engines.ts";
-import { effort, VERDICT } from "./views.ts";
+import { effort, gateStatus, VERDICT } from "./views.ts";
 import type { BlastRadius, ChangedFile, OutsideImpact } from "./diff.ts";
 import type { ScoreKey } from "./engines.ts";
 import type { ReviewBody, ReviewRecord } from "./review.ts";
@@ -10,6 +10,9 @@ import type { ReviewBody, ReviewRecord } from "./review.ts";
 export type ScoresCommentInput = Pick<ReviewRecord, "pr" | "blast" | "review"> & Partial<Pick<ReviewRecord, "gates" | "linkedIssues" | "headSha" | "incremental">>;
 type MermaidInput = { pr: ReviewRecord["pr"]; blast?: Partial<BlastRadius>; review?: Partial<ReviewBody>; outsideDiffImpact?: OutsideImpact };
 export type ReviewCommentInput = ScoresCommentInput & MermaidInput;
+
+// A label in a markdown table cell: custom check names are user text, so no pipes, tags, backticks or line breaks.
+const mdCell = (s: string): string => String(s).replace(/[|<>`\s]+/g, " ").trim();
 
 export function formatScoresComment(r: ScoresCommentInput): string {
   const { pr, blast, review: v, gates = [], linkedIssues = [], headSha, incremental } = r;
@@ -41,7 +44,7 @@ export function formatScoresComment(r: ScoresCommentInput): string {
     ...rows.map(([label, score, desc]) => `| **${label}** | **${score}** / 100 | ${desc} |`),
   ];
   const checkRows = [
-    ...gates.map((g) => `| ${g.label} | ${g.pass ? "✅ Passed" : "⚠️ Warning"} (${Math.round(g.yes * 100)}% yes) |`),
+    ...gates.map((g) => `| ${mdCell(g.label)}${g.mode === "block" ? " (blocking)" : ""} | ${gateStatus(g)} (${Math.round(g.yes * 100)}% yes) |`),
     ...(linkedIssues.length && !gates.some((g) => g.id === "issue_requirements")
       ? [`| Issue requirements | ${v.verdict !== "request_changes" && v.scores.quality >= 60 ? "✅ Passed" : "⚠️ Warning"} (${linkedIssues.map((i) => `#${i.number}`).join(", ")}) |`]
       : []),
@@ -187,7 +190,8 @@ function buildBlastMermaid(r: MermaidInput): string {
 }
 
 export function formatReviewComment(r: ReviewCommentInput): string {
-  const { pr, blast, review: v, linkedIssues = [], headSha, incremental } = r;
+  const { pr, blast, review: v, gates = [], linkedIssues = [], headSha, incremental } = r;
+  const custom = gates.filter((g) => g.mode);
   const appLink = `${APP_URL}/review?pr=${encodeURIComponent(pr.url)}`;
   const [vl] = VERDICT[v.verdict] || ["Commented"];
   const e = effort(blast);
@@ -213,6 +217,9 @@ export function formatReviewComment(r: ReviewCommentInput): string {
             return `- [#${i.number} ${i.title}](${i.url})${i.state ? ` (${i.state})` : ""}${req ? ` — ${req}${(i.body || "").trim().length > 220 ? "…" : ""}` : ""}`;
           }),
         ]
+      : []),
+    ...(custom.length
+      ? ["", "#### Pre-merge checks", "| Check | Status |", "| :--- | :--- |", ...custom.map((g) => `| ${mdCell(g.label)}${g.mode === "block" ? " (blocking)" : ""} | ${gateStatus(g)} |`)]
       : []),
     "",
     `#### Summary`,

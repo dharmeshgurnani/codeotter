@@ -1,7 +1,8 @@
 // Repository rules: path filters, path instructions and auto-review skip rules. Set per repository in Repository settings
 // (repoSettings[repo].review, read through reviewConfig) and overridden by a `.codeotter.json` at the repository root.
 //
-// `.codeotter.json` (JSON, every key optional; a key present in the file wins over the Repository settings value):
+// `.codeotter.json` (JSON, every key optional; a key present in the file wins over the Repository settings value;
+// "checks", custom pre-merge checks as [{ "name", "instructions", "mode": "off" | "warn" | "block" }], is read by context.ts):
 // {
 //   "pathInclude":       string[]   globs; when set, only matching files reach the models
 //   "pathExclude":       string[]   globs; matching files are dropped from the diff sent to the models

@@ -68,9 +68,11 @@ const TRIAGE_CONTEXT = "codeotter/triage";
 export const SHA_RE = /^[0-9a-f]{7,40}$/i;
 export const triageConfig = async (): Promise<TriageConfig> => ({ auto: false, stopAt: 75, ...((await store.getSetting("triage")) || {}) });
 const triageRuns = new Map<string, Promise<TriageResult>>();
-async function postTriageStatus(repo: string, sha: string, state: "pending" | "success" | "failure" | "error", description: string, url: string): Promise<unknown> {
+type StatusState = "pending" | "success" | "failure" | "error";
+const postTriageStatus = (repo: string, sha: string, state: StatusState, description: string, url: string): Promise<unknown> => postCommitStatus(repo, sha, TRIAGE_CONTEXT, state, description, url);
+async function postCommitStatus(repo: string, sha: string, context: string, state: StatusState, description: string, url: string): Promise<unknown> {
   if (!SHA_RE.test(sha || "")) return;
-  const fields = { state, context: TRIAGE_CONTEXT, description: description.slice(0, 140), target_url: `${APP_URL}/review?pr=${encodeURIComponent(url)}` };
+  const fields = { state, context, description: description.slice(0, 140), target_url: `${APP_URL}/review?pr=${encodeURIComponent(url)}` };
   if (isForgeRepo(repo)) return forgeOf(repo).status(repo, sha, fields, parsePrUrl(url)?.number);
   return ghAsync(["api", "--method", "POST", `repos/${repo}/statuses/${sha}`, ...Object.entries(fields).flatMap(([k, v]) => ["-f", `${k}=${v}`])]);
 }
@@ -133,6 +135,20 @@ export async function triagePr(ref: string, repoHint = ""): Promise<TriageResult
   })().finally(() => triageRuns.delete(urlGuess));
   triageRuns.set(urlGuess, run);
   return run;
+}
+
+// Custom pre-merge checks publish one commit status, codeotter/checks: failure when a "block" check fails, success otherwise
+// (warn-only failures are named in the description). No custom check answered, no status.
+const CHECKS_CONTEXT = "codeotter/checks";
+export function checksStatus(gates: Gate[]): { state: "success" | "failure"; description: string } | null {
+  const custom = gates.filter((g) => g.mode);
+  if (!custom.length) return null;
+  const names = (list: Gate[]) => list.map((g) => g.label).join(", ");
+  const blocked = custom.filter((g) => !g.pass && g.mode === "block");
+  const warned = custom.filter((g) => !g.pass && g.mode === "warn");
+  if (blocked.length) return { state: "failure", description: `Failed: ${names(blocked)}${warned.length ? `; warning: ${names(warned)}` : ""}` };
+  if (warned.length) return { state: "success", description: `${custom.length - warned.length}/${custom.length} passed; warning: ${names(warned)}` };
+  return { state: "success", description: `All ${custom.length} check${custom.length === 1 ? "" : "s"} passed` };
 }
 
 export const activeReviews = new Map<string, ActiveReview>();
@@ -207,9 +223,16 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
 
   const runScores = !part || part === "scores" || !cached || !hasValidScores(cached.review?.scores);
   const runLlm = !part || part === "llm" || !cached || !cached.review?.summary;
-
   // Use cached PR metadata immediately on Re-review if available, or fetch non-blockingly via ghAsync
   const pr: PullRequest = cached?.pr || JSON.parse(await readPr(urlGuess, spec));
+  // .codeotter.json on the base branch (cached): its "checks" replace Repository settings' before the run starts; a
+  // broken file fails the review below, where the rest of the file applies.
+  const fileRules = effectiveRules(repoOf(pr), rc, pr);
+  const early = await fileRules.catch(() => null);
+  if (early?.checks) rc.checks = early.checks;
+  // Custom checks are gates: System One answers them with the scores, else the language model in its review.
+  const checks = customCount(rc.checks) ? rc.checks : [];
+  const checksRun = !!checks.length && (s1.enabled ? runScores : !!llmReady && (runLlm || runScores));
   const initialHeadSha = extractHeadSha(pr, cached?.gitHistory) || cached?.headSha || "";
   if (initialHeadSha) pr.headSha = initialHeadSha;
   const initialLearnings = await getRepoLearnings(repoOf(pr));
@@ -245,7 +268,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
     pending: {
       scores: runScores,
       readyScores: !runScores && hasValidScores(prevReview.scores) ? { ...prevReview.scores, blast_radius: blast.score } : {},
-      gates: runScores && !!s1.enabled,
+      gates: (runScores && !!s1.enabled) || (checksRun && !s1.enabled),
       narrative: runLlm && !!llmReady,
     },
   };
@@ -256,6 +279,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
     try {
       // Refresh PR metadata in background if we started from cached.pr
       if (cached?.pr) live.pr = JSON.parse(await readPr(urlGuess, spec));
+      if (publish && checksRun) await postCommitStatus(repoOf(live.pr), live.pr.headRefOid || "", CHECKS_CONTEXT, "pending", `Running ${customCount(checks)} check(s)`, live.pr.url).catch((e) => console.warn(`[checks] ${(e as Error).message}`));
       const [rawDiff, guide, learnings] = await Promise.all([
         readPr(urlGuess, spec, true),
         Promise.resolve().then(() => guideFor(repoOf(live.pr), isForgeRepo(repoOf(live.pr)) ? live.pr.headRefOid : live.pr.headRefName, live.pr.headRepo || repoOf(live.pr))),
@@ -264,7 +288,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
       live.guide = guide?.file || null;
       live.learnings = learnings;
       // .codeotter.json on the base branch wins over Repository settings for this review; excluded paths never reach a model
-      const { configFile: _file, ...rules } = await effectiveRules(repoOf(live.pr), rc, live.pr);
+      const { configFile: _file, ...rules } = await fileRules;
       Object.assign(rc, rules);
       let diff = filterDiff(rawDiff, rc).diff;
       if (rawDiff.trim() && !diff.trim()) throw new Error("Every changed file is excluded by the path filters");
@@ -391,7 +415,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
               live.pending.scores = false;
               live.pending.gates = false;
             }
-          }, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes)
+          }, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes, checks)
         : Promise.resolve(null);
 
       const needLlmForScores = runScores && !s1.enabled;
@@ -400,7 +424,11 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
             if (runLlm) {
               live.review = { ...live.review, ...partial, scores: live.review.scores };
             }
-          }, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes).then(({ blastRadius: llmBlast, ...nav }): Judgement => {
+          }, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes, s1.enabled ? [] : checks).then(({ blastRadius: llmBlast, checks: llmChecks, ...nav }): Judgement => {
+            if (llmChecks) {
+              live.gates = llmChecks;
+              live.pending.gates = false;
+            }
             const scores = (!runScores || s1.enabled)
               ? (hasValidScores(live.review.scores) ? live.review.scores : initialScores)
               : nav.scores;
@@ -487,6 +515,14 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
         gitHistory: live.gitHistory,
         at: new Date().toISOString(),
       };
+      const st = publish && checksRun ? checksStatus(finalGates) : null;
+      if (st) {
+        try {
+          await postCommitStatus(repoOf(live.pr), live.pr.headRefOid || "", CHECKS_CONTEXT, st.state, st.description, live.pr.url);
+        } catch (e) {
+          result.commentError = `Commit status ${CHECKS_CONTEXT}: ${(e as Error).message}`;
+        }
+      }
       await syncPrComments(result, repoOf(live.pr), {
         postScores: !!(publish && runScores && rc.postScores && (typed || review?.scores)),
         postReview: !!(publish && runLlm && rc.postReview && review?.summary),
@@ -500,6 +536,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
     } catch (e) {
       entry.error = (e as Error).message;
       entry.done = true;
+      if (publish && checksRun) await postCommitStatus(repoOf(live.pr), live.pr.headRefOid || "", CHECKS_CONTEXT, "error", `Checks not run: ${entry.error}`, live.pr.url).catch(() => {});
       // The next poll reports the error; without a poller the entry (and its live state) would stay in memory for good.
       setTimeout(() => { if (activeReviews.get(live.pr.url) === entry) activeReviews.delete(live.pr.url); }, 120000).unref?.();
       throw e;
@@ -705,6 +742,8 @@ export async function syncPrComments(r: CommentTarget, repo = repoOf(r.pr), { po
   if (posted.length) r.commentsPosted = posted;
   return posted;
 }
+
+const customCount = (checks: { mode: string }[]): number => checks.filter((ch) => ch.mode !== "off").length;
 
 export async function score(ref: string, force: boolean, repo?: string): Promise<ReviewRecord> {
   const initial = await startOrPollReview(ref, force, repo);

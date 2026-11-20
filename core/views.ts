@@ -7,7 +7,7 @@ import { deriveSuggestionFromDetail } from "./engines.ts";
 import { seesAll, visibleRepos } from "./access.ts";
 import type { Viewer } from "./access.ts";
 import type { ReviewRecord } from "./review.ts";
-import type { Finding } from "./engines.ts";
+import type { Finding, Gate } from "./engines.ts";
 
 // Report JSON drawn by web/src/components/json-report.tsx; cells are web/src/components/data-table.tsx's Cell.
 export type Tone = "ok" | "muted" | "warn" | "bad" | "info" | "accent";
@@ -29,6 +29,8 @@ export const effort = (b: Pick<Blast, "score" | "lines">) => {
   return { n, label: ["Trivial", "Simple", "Moderate", "Complex", "Critical"][n - 1], mins: Math.max(5, Math.round(b.lines / 8 / 5) * 5) };
 };
 const KIND: Record<string, [string, string, string]> = { high: ["⚠️", "Potential issue", "Major"], medium: ["⚠️", "Potential issue", "Minor"], low: ["🛠️", "Refactor suggestion", ""], nit: ["🧹", "Nitpick", ""] };
+// A gate's status text: a failed custom "block" check fails; any other failed gate warns.
+export const gateStatus = (g: Pick<Gate, "pass" | "mode">): string => (g.pass ? "✅ Passed" : g.mode === "block" ? "❌ Failed" : "⚠️ Warning");
 export const VERDICT: Record<string, [string, string]> = { approve: ["Approved", "ok"], comment: ["Commented", "warn"], request_changes: ["Changes requested", "bad"] };
 const tone = (v: number, invert?: boolean | number) => ((invert ? 100 - v : v) >= 70 ? "ok" : (invert ? 100 - v : v) >= 40 ? "warn" : "bad");
 
@@ -157,7 +159,7 @@ export function renderScore(r: ReviewRecord) {
         ${(r.gates || []).length ? "" : `<tr><td>Title check</td><td>${v.scores.pr_hygiene >= 60 ? "✅ Passed" : "⚠️ Warning"}</td></tr>
         <tr><td>Description check</td><td>${(pr.body || "").length > 80 ? "✅ Passed" : "⚠️ Warning"}</td></tr>`}
         <tr><td>Tests touched</td><td>${blast.testFiles ? "✅ Passed" : "⚠️ Warning"}</td></tr>
-        ${(r.gates || []).map((g) => `<tr><td>${esc(g.label)}</td><td>${g.pass ? "✅ Passed" : "⚠️ Warning"} <span class="mut">(${Math.round(g.yes * 100)}% yes)</span></td></tr>`).join("")}</table></details>
+        ${(r.gates || []).map((g) => `<tr><td>${esc(g.label)}</td><td>${gateStatus(g)} <span class="mut">(${Math.round(g.yes * 100)}% yes)</span></td></tr>`).join("")}</table></details>
       <div class="ft"><span>Reviewed ${esc(when)}</span></div>
     </div></div>
 

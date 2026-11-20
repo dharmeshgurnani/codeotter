@@ -34,7 +34,12 @@ export interface ReviewSettings extends RepoRules {
   auto: boolean;
   profile: ReviewProfile;
   minSeverity: Severity;
+  checks: CustomCheck[];
 }
+// A custom pre-merge check: a yes/no question (yes = pass) asked of the model owning the gates. "block" failures fail the
+// codeotter/checks commit status; "warn" failures only show; "off" is kept but not asked.
+export type CheckMode = "off" | "warn" | "block";
+export interface CustomCheck { name: string; instructions: string; mode: CheckMode; }
 export interface Guide { file: string; text: string; }
 // Per-repository posting toggles older installs kept in "guides" / "repoSettings" before repoSettings[repo].review.
 type LegacyPosting = { postScores?: boolean; postReview?: boolean; postInlineSuggestions?: boolean };
@@ -43,7 +48,7 @@ export interface BaseCommit { sha: string; message: string; author: string; }
 export interface GitHistory { prCommits: GitCommit[]; baseCommits: BaseCommit[]; formatted?: string; }
 export interface LinkedIssue { number: number; repo: string; title: string; body: string; state: string; url: string; labels: string[]; }
 
-export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, commands: true, auto: true, profile: "balanced", minSeverity: "nit", ...RULE_DEFAULTS };
+export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, commands: true, auto: true, profile: "balanced", minSeverity: "nit", checks: [], ...RULE_DEFAULTS };
 // Review strictness: a profile supplies the defaults for maxFindings and reflectMin (values set explicitly still win)
 // and the tone of the language-model instructions (engines.ts).
 export type ReviewProfile = "chill" | "balanced" | "assertive";
@@ -101,7 +106,22 @@ export const normalizeReview = (v: { [K in keyof ReviewSettings]?: unknown }): R
   profile: isProfile(v.profile) ? v.profile : REVIEW_DEFAULTS.profile,
   minSeverity: isSeverity(v.minSeverity) ? v.minSeverity : REVIEW_DEFAULTS.minSeverity,
   ...normalizeRules(v),
+  checks: normalizeChecks(v.checks),
 });
+// Untrusted (settings body, later a repository config file): at most 20 checks, each with instructions.
+export const normalizeChecks = (v: unknown): CustomCheck[] =>
+  (Array.isArray(v) ? (v as unknown[]) : [])
+    .map((x): CustomCheck | null => {
+      if (!x || typeof x !== "object") return null;
+      const o = x as Record<string, unknown>;
+      const instructions = String(o.instructions ?? "").replace(/\s+/g, " ").trim().slice(0, 500);
+      if (!instructions) return null;
+      const mode: CheckMode = o.mode === "off" || o.mode === "block" ? o.mode : "warn";
+      return { name: String(o.name ?? "").replace(/\s+/g, " ").trim().slice(0, 80), instructions, mode };
+    })
+    .filter((x): x is CustomCheck => !!x)
+    .slice(0, 20)
+    .map((x, i) => ({ ...x, name: x.name || `Check ${i + 1}` }));
 
 // Repository review guides: AGENTS.md and/or CLAUDE.md at the repo root (both are used when both exist, since one is
 // often a stub pointing at the other). Detection is cached for 10 minutes; whether guides are used is a per-repository
@@ -154,11 +174,13 @@ export async function guideFor(repo: string, ref = "", contentRepo = repo): Prom
 }
 
 // `.codeotter.json` (schema in repo-rules.ts), read like the guides but only from the base repository at the base branch.
-const configCache = new Map<string, { rules: Partial<RepoRules> | null; at: number }>();
+// The file may also carry "checks" (custom pre-merge checks, CustomCheck[]), normalised by normalizeChecks.
+export type RepoConfig = Partial<RepoRules> & { checks?: CustomCheck[] };
+const configCache = new Map<string, { rules: RepoConfig | null; at: number }>();
 export const clearRepoConfigCache = () => configCache.clear();
 // The base repository's `.codeotter.json` at `baseRef` (the default branch when empty), cached for ten minutes.
 // Takes the base repository only: the head (a fork's or a branch's copy) is never read.
-export async function repoConfigFile(repo: string, baseRef = ""): Promise<Partial<RepoRules> | null> {
+export async function repoConfigFile(repo: string, baseRef = ""): Promise<RepoConfig | null> {
   if (!REPO_RE.test(repo)) throw new Error("Invalid repository");
   const key = `${repo}@${baseRef}`;
   const hit = configCache.get(key);
@@ -166,15 +188,21 @@ export async function repoConfigFile(repo: string, baseRef = ""): Promise<Partia
   let text: string | null;
   if (isForgeRepo(repo)) text = await forgeOf(repo).file(repo, CONFIG_FILE, baseRef);
   else text = await ghAsync("api", `repos/${repo}/contents/${CONFIG_FILE}${baseRef ? `?ref=${encodeURIComponent(baseRef)}` : ""}`, "-H", "Accept: application/vnd.github.raw").catch(() => null);
-  const rules = text === null || !text.trim() ? null : parseRepoConfig(text.slice(0, 65536));
+  const rules = text === null || !text.trim() ? null : parseConfigFile(text.slice(0, 65536));
   if (configCache.size > 500) configCache.clear();
   configCache.set(key, { rules, at: Date.now() });
   return rules;
 }
+const parseConfigFile = (text: string): RepoConfig => {
+  const rules: RepoConfig = parseRepoConfig(text); // throws on invalid JSON or a non-object
+  const raw = JSON.parse(text) as Record<string, unknown>;
+  if ("checks" in raw) rules.checks = normalizeChecks(raw.checks);
+  return rules;
+};
 // Repository settings with the file's keys over them. `pr` names the base branch; its head is not used.
-export async function effectiveRules(repo: string, ui: Partial<RepoRules>, pr: { baseRefName?: string } = {}): Promise<RepoRules & { configFile: string[] | null }> {
+export async function effectiveRules(repo: string, ui: Partial<RepoRules>, pr: { baseRefName?: string } = {}): Promise<RepoRules & { checks?: CustomCheck[]; configFile: string[] | null }> {
   const file = await repoConfigFile(repo, pr.baseRefName || "");
-  return { ...normalizeRules({ ...ui, ...(file || {}) }), configFile: file ? Object.keys(file) : null };
+  return { ...normalizeRules({ ...ui, ...(file || {}) }), ...(file?.checks ? { checks: file.checks } : {}), configFile: file ? Object.keys(file) : null };
 }
 
 export function normalizeLearningList(list: unknown): string[] {
