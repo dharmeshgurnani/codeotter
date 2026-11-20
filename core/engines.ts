@@ -404,7 +404,13 @@ export function deriveSuggestionFromDetail(raw: unknown, diff = ""): Finding {
   };
 }
 
-function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = []): string {
+// Strictness instructions per review profile (Repository settings); balanced is the long-standing behaviour.
+const PROFILE_PROMPT: Record<ReviewSettings["profile"], string> = {
+  chill: "Profile: chill. Report only high and medium severity problems: defects, security issues, data loss, broken contracts. No nitpicks, style, naming or low-severity findings; when unsure, leave it out. Fewer findings is better.",
+  balanced: "",
+  assertive: "Profile: assertive. Report every real problem, including low-severity issues and nitpicks (style, naming, readability, missing tests, docs); use the full findings budget when the diff warrants it.",
+};
+export function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = []): string {
   const outsideBlock = outsideImpact?.formatted ? `\n${outsideImpact.formatted}\n` : "";
   const issueBlock = linkedIssues?.length
     ? `\nLinked Issues & Requirements (MANDATORY: explicitly verify whether the pull request diff fulfills all requirements and acceptance criteria described in these linked issues, and flag any unfulfilled or partially met requirement in findings):\n${linkedIssues
@@ -422,7 +428,7 @@ function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings =
 {"summary":"3-5 sentence architectural walkthrough covering what changed, commit progression, fulfillment of linked issue requirements, adherence to repository guidelines, and outside caller safety","verdict":"approve|comment|request_changes",
 ${wantScores ? ` "scores":{"quality":0-100,"correctness_risk":0-100 (100 = very risky),"test_coverage":0-100,"readability":0-100,"pr_hygiene":0-100 (title, description, scope, commit focus),"blast_radius":0-100 (100 = system-wide or critical-path impact)},\n` : ""} "findings":[{"severity":"blocker|major|minor|nit|high|medium|low","file":"path","line":42,"title":"short","detail":"specific line/behaviour and fix (cite AGENTS.md/CLAUDE.md rule, linked issue #number requirement, or commit if relevant)","suggestion":"optional exact replacement code"}],
  "walkthrough":[{"file":"path","change":"concise summary of change in this file"}]}
-For each finding, include the integer target \`line\` number in the new file and an optional \`suggestion\` containing the exact replacement code snippet for the target line/block (without markdown backticks) so the fix can be applied in one click. Be concrete; cite exact files and rules. Respect all Repository Team Learnings and never flag dismissed patterns. Max ${r.maxFindings} findings, most severe first. Today is ${new Date().toISOString().slice(0, 10)}.
+For each finding, include the integer target \`line\` number in the new file and an optional \`suggestion\` containing the exact replacement code snippet for the target line/block (without markdown backticks) so the fix can be applied in one click. Be concrete; cite exact files and rules. Respect all Repository Team Learnings and never flag dismissed patterns. Max ${r.maxFindings} findings, most severe first.${PROFILE_PROMPT[r.profile] ? ` ${PROFILE_PROMPT[r.profile]}` : ""} Today is ${new Date().toISOString().slice(0, 10)}.
 
 PR #${pr.number}: ${pr.title}
 Author: ${pr.author.login}  Base: ${pr.baseRefName} <- Head: ${pr.headRefName}${pr.headSha ? ` (${pr.headSha.slice(0, 7)})` : ""}  Files: ${pr.changedFiles}  +${pr.additions} -${pr.deletions}
@@ -478,6 +484,7 @@ export async function judge(pr: PullRequest, diff: string, c: LlmConfig, r: Revi
     if (missing.length) throw new Error(`${c.provider}/${c.model} returned no usable scores for: ${missing.join(", ")}`);
   }
   let findings: Finding[] = (Array.isArray(out.findings) ? (out.findings as unknown[]) : []).slice(0, 20).map((f) => deriveSuggestionFromDetail(f, diff));
+  if (r.profile === "chill") findings = findings.filter((f) => f.severity === "high" || f.severity === "medium");
   let reflected = "";
   if (r.reflectMin > 0 && findings.length) {
     onProgress?.({ summary: `Checking ${findings.length} finding(s) against the diff…` });

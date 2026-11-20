@@ -9,6 +9,7 @@ import { repoOf } from "./views.ts";
 import type { ChangedFile } from "./diff.ts";
 import type { PrCommit as ForgePrCommit, PullRequest as ForgePullRequest } from "./forges.ts";
 import type { GuideSetting, RepoSetting } from "./store.ts";
+import type { Severity } from "./engines.ts";
 
 // A pull request in gh's JSON shape (`gh pr view --json`); the forge adapters normalise theirs to the same fields.
 export type PrCommit = Partial<Omit<ForgePrCommit, "authors">> & { authors?: { login?: string; name?: string }[] };
@@ -28,6 +29,8 @@ export interface ReviewSettings {
   postInlineSuggestions: boolean;
   commands: boolean;
   auto: boolean;
+  profile: ReviewProfile;
+  minSeverity: Severity;
 }
 export interface Guide { file: string; text: string; }
 // Per-repository posting toggles older installs kept in "guides" / "repoSettings" before repoSettings[repo].review.
@@ -37,17 +40,49 @@ export interface BaseCommit { sha: string; message: string; author: string; }
 export interface GitHistory { prCommits: GitCommit[]; baseCommits: BaseCommit[]; formatted?: string; }
 export interface LinkedIssue { number: number; repo: string; title: string; body: string; state: string; url: string; labels: string[]; }
 
-export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, commands: true, auto: true };
+export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, commands: true, auto: true, profile: "balanced", minSeverity: "nit" };
+// Review strictness: a profile supplies the defaults for maxFindings and reflectMin (values set explicitly still win)
+// and the tone of the language-model instructions (engines.ts).
+export type ReviewProfile = "chill" | "balanced" | "assertive";
+export const PROFILES: Record<ReviewProfile, Pick<ReviewSettings, "maxFindings" | "reflectMin">> = {
+  chill: { maxFindings: 5, reflectMin: 7 },
+  balanced: { maxFindings: REVIEW_DEFAULTS.maxFindings, reflectMin: REVIEW_DEFAULTS.reflectMin },
+  assertive: { maxFindings: 12, reflectMin: 3 },
+};
+const PROFILE_KEYS = ["maxFindings", "reflectMin"] as const;
+const isProfile = (v: unknown): v is ReviewProfile => typeof v === "string" && Object.hasOwn(PROFILES, v);
+const SEVERITY_ORDER: readonly Severity[] = ["nit", "low", "medium", "high"];
+const isSeverity = (v: unknown): v is Severity => SEVERITY_ORDER.includes(v as Severity);
+// Findings at or above the minimum severity: what gets posted to the pull request (the review page shows all).
+export const postable = <F extends { severity?: unknown }>(findings: F[], min: Severity = "nit"): F[] =>
+  findings.filter((f) => SEVERITY_ORDER.indexOf(isSeverity(f.severity) ? f.severity : "low") >= SEVERITY_ORDER.indexOf(min));
+// Effective settings: defaults, then the profile's defaults, then whatever was set explicitly.
+export const resolveReview = (set: Partial<ReviewSettings>): ReviewSettings => {
+  const profile = isProfile(set.profile) ? set.profile : REVIEW_DEFAULTS.profile;
+  return { ...REVIEW_DEFAULTS, ...PROFILES[profile], ...set, profile };
+};
+// What a Repository settings save stores. maxFindings / reflectMin are kept only when they differ from both the profile
+// the page was loaded with and the profile being saved: an untouched value follows the profile, a moved one is explicit.
+export const storedReview = (current: ReviewSettings, sent: { [K in keyof ReviewSettings]?: unknown }): Partial<ReviewSettings> => {
+  const next: Partial<ReviewSettings> = normalizeReview({ ...current, ...sent });
+  for (const k of PROFILE_KEYS) {
+    if (next[k] === PROFILES[current.profile][k] || next[k] === PROFILES[next.profile!][k]) delete next[k];
+  }
+  return next;
+};
 // Review settings are per repository (repoSettings[repo].review, from Repository settings). Repositories not yet saved
 // there fall back to the old install-wide "review" setting and the per-repository posting toggles kept in "guides".
 export const reviewConfig = async (repo = ""): Promise<ReviewSettings> => {
   const [global, guides, rs] = await Promise.all([store.getSetting("review"), repo ? store.getSetting("guides") : null, repo ? store.getSetting("repoSettings") : null]);
-  const base = { ...REVIEW_DEFAULTS, ...(global || {}) };
-  if (!repo) return base;
+  if (!repo) return resolveReview(global || {});
   const g: GuideSetting & LegacyPosting = guides?.[repo] || {};
   const r: RepoSetting & LegacyPosting = rs?.[repo] || {};
   const legacy = Object.fromEntries((["postScores", "postReview", "postInlineSuggestions"] as const).map((k) => [k, g[k] ?? r[k]]).filter(([, v]) => v !== undefined)) as Partial<ReviewSettings>;
-  return { ...base, ...legacy, ...(r.review || {}) };
+  // A repository saved on Repository settings stores only explicit maxFindings / reflectMin: the old install-wide
+  // values must not pin them over its profile.
+  const inherited: Partial<ReviewSettings> = { ...(global || {}) };
+  if (r.review) for (const k of PROFILE_KEYS) delete inherited[k];
+  return resolveReview({ ...inherited, ...legacy, ...r.review });
 };
 export const normalizeReview = (v: { [K in keyof ReviewSettings]?: unknown }): ReviewSettings => ({
   maxFindings: Math.min(12, Math.max(3, Number(v.maxFindings) || REVIEW_DEFAULTS.maxFindings)),
@@ -60,6 +95,8 @@ export const normalizeReview = (v: { [K in keyof ReviewSettings]?: unknown }): R
   postInlineSuggestions: !!v.postInlineSuggestions,
   auto: !!v.auto,
   commands: !!v.commands,
+  profile: isProfile(v.profile) ? v.profile : REVIEW_DEFAULTS.profile,
+  minSeverity: isSeverity(v.minSeverity) ? v.minSeverity : REVIEW_DEFAULTS.minSeverity,
 });
 
 // Repository review guides: AGENTS.md and/or CLAUDE.md at the repo root (both are used when both exist, since one is

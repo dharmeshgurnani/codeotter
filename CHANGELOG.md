@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Review profile and minimum severity.** Repository settings add **Profile** (Chill: high and medium findings only, 5 findings, self-check at 7; Balanced: unchanged, the default; Assertive: nitpicks included, 12 findings, self-check at 3) and **Minimum severity to post** (Nit / Low / Medium / High). The profile sets the default Max findings and Self-check and the model's instructions; a Max findings or Self-check value moved off the profile's default is kept as set. The posted review summary and inline suggestions carry only findings at or above the minimum severity; the review page shows all of them.
+
 ## 0.8.3 (2026-11-20)
 
 - **Version in the sidebar.** The running release (`v0.8.3`) sits next to the logo.
