@@ -67,6 +67,8 @@ export type Review = {
   };
   commentsPosted?: string[];
   commentError?: string;
+  // self-contained prompts for coding agents: one per finding (by index, empty when dismissed) and one for all open ones
+  agentPrompts?: { all: string; findings: string[] };
   at: string;
 };
 export type User = { id: string; name: string; email: string; role: string; avatar: string };

@@ -36,6 +36,7 @@ export interface ReviewSettings extends RepoRules {
   profile: ReviewProfile;
   minSeverity: Severity;
   checks: CustomCheck[];
+  agentPrompts: boolean; // a collapsed "Prompt for AI agents" block in posted review and inline comments
 }
 // A custom pre-merge check: a yes/no question (yes = pass) asked of the model owning the gates. "block" failures fail the
 // codeotter/checks commit status; "warn" failures only show; "off" is kept but not asked.
@@ -49,7 +50,7 @@ export interface BaseCommit { sha: string; message: string; author: string; }
 export interface GitHistory { prCommits: GitCommit[]; baseCommits: BaseCommit[]; formatted?: string; }
 export interface LinkedIssue { number: number; repo: string; title: string; body: string; state: string; url: string; labels: string[]; }
 
-export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, resolveFixed: true, commands: true, auto: true, profile: "balanced", minSeverity: "nit", checks: [], ...RULE_DEFAULTS };
+export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, resolveFixed: true, commands: true, auto: true, agentPrompts: true, profile: "balanced", minSeverity: "nit", checks: [], ...RULE_DEFAULTS };
 // Review strictness: a profile supplies the defaults for maxFindings and reflectMin (values set explicitly still win)
 // and the tone of the language-model instructions (engines.ts).
 export type ReviewProfile = "chill" | "balanced" | "assertive";
@@ -109,6 +110,7 @@ export const normalizeReview = (v: { [K in keyof ReviewSettings]?: unknown }): R
   minSeverity: isSeverity(v.minSeverity) ? v.minSeverity : REVIEW_DEFAULTS.minSeverity,
   ...normalizeRules(v),
   checks: normalizeChecks(v.checks),
+  agentPrompts: v.agentPrompts === undefined ? REVIEW_DEFAULTS.agentPrompts : !!v.agentPrompts,
 });
 // Untrusted (settings body, later a repository config file): at most 20 checks, each with instructions.
 export const normalizeChecks = (v: unknown): CustomCheck[] =>

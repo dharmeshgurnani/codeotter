@@ -315,6 +315,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             { key: "postScores", label: "Post scores on PR", type: "checkbox", text: "Add a PR comment with all System One scores after review" },
             { key: "postReview", label: "Add PR review as a comment", type: "checkbox", text: "Add a PR comment with the review summary and link to the full report" },
             { key: "postInlineSuggestions", label: "Post inline suggestions", type: "checkbox", text: "Post inline committable suggestion comments on PR diff lines" },
+            { key: "agentPrompts", label: "Prompt for AI agents", type: "checkbox", text: "Add a collapsed fix prompt for coding agents to posted review and inline comments" },
             { key: "resolveFixed", label: "Resolve fixed comments", type: "checkbox", text: "Resolve CodeOtter's inline comments that a later push fixed" },
             { key: "auto", label: "Auto-review", type: "checkbox", text: "Review every new or updated pull request and post the result (PRs labelled codeotter:skip are left alone)" },
             { key: "configFile", label: "Repository config", type: "readonly" },
@@ -327,7 +328,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             { key: "pathInclude", label: "Include paths", type: "textarea", placeholder: "src/**", hint: "Globs, one per line. Empty: every file." },
             { key: "pathExclude", label: "Exclude paths", type: "textarea", placeholder: "**/*.lock\ndist/\n*.min.js" },
             { key: "pathInstructions", label: "Path instructions", type: "textarea", placeholder: "src/api/**: Every handler checks the session.\n**/*.sql: Migrations must be reversible.", hint: "glob: instructions, one per line. Sent to the language model when a matching file changes." },
-            { key: "commands", label: "PR comment commands", type: "checkbox", text: "Run /review, /describe, /improve, /ask, /docs and /changelog from comments by owners, members and collaborators, and answer their replies under CodeOtter's inline comments (\"@codeotter remember <rule>\" saves a team learning)" },
+            { key: "commands", label: "PR comment commands", type: "checkbox", text: "Run /review, /describe, /improve, /ask, /docs, /changelog and /fix [n] from comments by owners, members and collaborators, and answer their replies under CodeOtter's inline comments (\"@codeotter remember <rule>\" saves a team learning)" },
             {
               key: "checks",
               label: "Pre-merge checks",
