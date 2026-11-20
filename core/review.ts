@@ -9,6 +9,7 @@ import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, ge
 import { changeDigest, deriveSuggestionFromDetail, judge, S1_SCORES, scoreWithSystemOne, verifyFindingsWithSystemOne } from "./engines.ts";
 import { formatReviewComment, formatScoresComment } from "./comments.ts";
 import { repoOf } from "./views.ts";
+import { audit, AUTO, currentActor, orgOfRepo } from "./audit.ts";
 import type { BlastRadius, DiffContextStats, OutsideImpact } from "./diff.ts";
 import type { GitHistory, LinkedIssue, PullRequest } from "./context.ts";
 import type { Finding, Gate, IncrementalCommit, IncrementalContext, Judgement, ScoreKey, Scores, Verdict, WalkthroughItem } from "./engines.ts";
@@ -694,6 +695,8 @@ export async function syncPrComments(r: CommentTarget, repo = repoOf(r.pr), { po
     }
   }
   if (posted.length) r.commentsPosted = posted;
+  // outside a request or a comment command, posting is the automation's
+  if (posted.length) await audit(currentActor(AUTO), "review.post", r.pr.url, { posted }, orgOfRepo(repo));
   return posted;
 }
 

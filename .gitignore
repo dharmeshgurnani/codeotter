@@ -6,6 +6,7 @@ server.log
 pb_data/
 .pb/
 config.json
+audit.jsonl
 pb.log
 .env.*
 !.env.example

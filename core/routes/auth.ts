@@ -11,7 +11,8 @@ import { PB_URL, store } from "../store.ts";
 import type { AuthResult } from "../store.ts";
 import { forgetGithubRepos } from "../git.ts";
 import { ENTRA_TENANT_RE, entraTenant, LOGIN_PROVIDERS, oauthFlows } from "../settings-pages.ts";
-import { admit, currentUser, NOT_INVITED } from "../access.ts";
+import { admit, currentUser, NOT_INVITED, userView } from "../access.ts";
+import { actorOf, audit } from "../audit.ts";
 import { cookie, own, session } from "./middleware.ts";
 
 export const auth = new Hono();
@@ -69,7 +70,9 @@ auth.get("/auth/callback", async (c) => {
   const q = c.req.query();
   if (!flow || flow.expires < Date.now() || flow.state !== q.state) return fail("Sign-in state mismatch, try again");
   if (q.error) return fail(q.error_description || q.error);
-  let signedIn: AuthResult;
+  let signedIn: AuthResult | undefined;
+  // the provider's login, or the account's email, for the audit log (a refused sign-in has no account left)
+  const who = () => signedIn?.meta?.username || signedIn?.record.email || "";
   try {
     signedIn = await store.authWithOAuth2({ provider: flow.provider, code: q.code, codeVerifier: flow.codeVerifier, redirectURL: `${APP_URL}/auth/callback` });
     // First account: owner. Later ones need an invite; an uninvited account is deleted again, never left usable.
@@ -80,12 +83,16 @@ auth.get("/auth/callback", async (c) => {
       if (ENTRA_TENANT_RE.test(entraTenant(p))) entraEmail = String(signedIn.meta?.email || signedIn.meta?.rawUser?.mail || signedIn.meta?.rawUser?.userPrincipalName || "");
     }
     if (!(await admit(signedIn.record, [flow.provider], signedIn.meta?.username, entraEmail))) {
-      await store.deleteUser(signedIn.record.id).catch((e) => console.error(`Could not delete uninvited account ${signedIn.record.id}: ${e.message}`));
+      const refused = signedIn.record.id;
+      await store.deleteUser(refused).catch((e) => console.error(`Could not delete uninvited account ${refused}: ${e.message}`));
+      await audit({ id: "anonymous", name: who() || "anonymous" }, "signin.refused", who(), { provider: flow.provider, reason: NOT_INVITED });
       return fail(NOT_INVITED);
     }
   } catch (e) {
+    await audit({ id: "anonymous", name: who() || "anonymous" }, "signin.refused", who(), { provider: flow.provider, reason: e instanceof Error ? e.message : String(e) });
     return fail(e instanceof Error ? e.message : String(e));
   }
+  await audit({ id: signedIn.record.id, name: userView(signedIn.record).name }, "signin.success", who(), { provider: flow.provider, role: signedIn.record.role || "" });
   cookie(c, "pr_auth", signedIn.token, 14 * 86400);
   return c.redirect(flow.back || "/", 302);
 });
@@ -120,6 +127,7 @@ auth.get("/github/manifest/callback", async (c) => {
   cookie(c, "pr_manifest", "", 0);
   cookie(c, "pr_manifest_return", "", 0);
   forgetGithubRepos();
+  await audit(actorOf(await currentUser(session(c)).catch(() => null)), "git-provider.app", "github", { slug: app.slug || "" });
   if (app.slug && returnTo.startsWith("/onboarding")) return c.redirect(`https://github.com/apps/${encodeURIComponent(app.slug)}/installations/new`, 302);
   return c.redirect(`${returnTo}?connected=${encodeURIComponent(app.html_url || app.slug || "github")}`, 302);
 });

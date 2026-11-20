@@ -9,6 +9,7 @@ import { reviewConfig } from "./context.ts";
 import { score, SHA_RE, syncPrComments, triageConfig, triagePr } from "./review.ts";
 import { commenterTrusted, commentPrNumber, oneLine, parseCommand, runCommand } from "./pr-tools.ts";
 import { repoOf } from "./views.ts";
+import { AUTO, withActor } from "./audit.ts";
 import type { ChildProcess } from "node:child_process";
 import type { HookHeaders } from "./forges.ts";
 import type { WebhookDelivery } from "./store.ts";
@@ -49,7 +50,8 @@ async function drainPrQueue() {
     while (PR_QUEUE.size) {
       const [url, { repo, p }] = PR_QUEUE.entries().next().value!; // the map is not empty
       PR_QUEUE.delete(url);
-      await handlePr(repo, p).catch((e: Error) => console.warn(`[pr-events] ${url}: ${e.message}`));
+      // queued work is the automation's, whichever request happened to start the drain
+      await withActor(AUTO, () => handlePr(repo, p)).catch((e: Error) => console.warn(`[pr-events] ${url}: ${e.message}`));
     }
   } finally {
     prDraining = false;

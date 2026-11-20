@@ -133,7 +133,7 @@ export function SettingsPage({ forgeUrls, page, repo = "", org, setOrg, user, on
         {msg.status === 403 && !user && <> <a className="text-brand" href="/login" onClick={(e) => { e.preventDefault(); onLogin(); }}>Sign in</a></>}
       </p>
     ) : (
-      <FormSkeleton sections={page === "model" ? [4, 3] : page === "repos" ? [2] : page === "repo" ? [13] : page === "oauth" ? [7] : page === "git" ? [1] : page === "models" ? [2, 1] : [1]} />
+      <FormSkeleton sections={page === "model" ? [4, 3] : page === "repos" ? [2] : page === "repo" ? [13] : page === "oauth" ? [7] : page === "git" ? [1] : page === "models" ? [2, 1] : page === "audit" ? [4, 1] : [1]} />
     );
   return (
     <div className="w-full">

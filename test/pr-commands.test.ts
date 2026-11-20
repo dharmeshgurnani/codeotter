@@ -40,6 +40,9 @@ function load({ forgePermission = "write", forgeStatus = 0, toolFails = false } 
     syncPrComments: async (r: { pr: { url: string } }, repo: string, opts: unknown) => { calls.push(["sync", r.pr.url, repo, opts]); return []; },
     runPrTool: async (url: string, id: string, opts: unknown) => { calls.push(["tool", url, id, opts]); if (toolFails) throw new Error("model said no"); return {}; },
     createPrComment: async (url: string, _repo: string, n: number, body: string) => { calls.push(["comment", url, n, body]); },
+    audit: async () => {},
+    orgOfRepo: (r: string) => r.split("/")[0],
+    withActor: (_actor: unknown, fn: () => unknown) => fn(),
   };
   const names = Object.keys(stubs);
   const api = new Function(...names, `${block}; return { parseCommand, commentPrNumber, commenterTrusted, commentsSince, runCommand };`)(...names.map((n) => stubs[n])) as Commands;

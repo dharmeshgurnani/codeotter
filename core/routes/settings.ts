@@ -5,6 +5,7 @@ import { createMiddleware } from "hono/factory";
 import { OWNER_RE } from "../config.ts";
 import { SETTINGS_PAGES } from "../settings-pages.ts";
 import { onboardedRepo } from "../access.ts";
+import { auditAction, auditSettings } from "../audit.ts";
 import { cookie, gate, jsonBody, own } from "./middleware.ts";
 import type { Env, Viewer } from "./middleware.ts";
 
@@ -14,7 +15,7 @@ export type SettingsScope = { org: string; repo: string };
 type SettingsAction = (body: Record<string, unknown>, ctx: { setCookie: (name: string, value: string, maxAge: number) => void }) => Promise<unknown>;
 type SettingsPage = {
   access?: string;
-  load: (scope: SettingsScope, user: Viewer["user"]) => Promise<unknown>;
+  load: (scope: SettingsScope, user: Viewer["user"], view?: Record<string, unknown>) => Promise<unknown>;
   save: (body: Record<string, unknown>, scope: SettingsScope, user: Viewer["user"]) => Promise<unknown>;
   test?: () => Promise<unknown>;
   actions?: Record<string, SettingsAction>;
@@ -45,8 +46,10 @@ settings.get("/:page{[a-z]+}", page, access, scope, async (c) => c.json(await c.
 
 settings.post("/:page{[a-z]+}", page, access, scope, async (c) => {
   const p = c.get("page"), s = c.get("scope"), user = c.get("viewer").user;
-  await p.save(await jsonBody(c), s, user);
-  return c.json(await p.load(s, user));
+  const body = await jsonBody(c);
+  await p.save(body, s, user);
+  await auditSettings(c.req.param("page"), body, s);
+  return c.json(await p.load(s, user, body));
 });
 
 settings.post("/:page{[a-z]+}/:action{[a-z]+}", page, access, async (c) => {
@@ -54,7 +57,10 @@ settings.post("/:page{[a-z]+}/:action{[a-z]+}", page, access, async (c) => {
   if (id === "test" && typeof p.test === "function") return c.json(await p.test());
   const action = own(p.actions || {}, id);
   if (!action) throw new Error(`No action ${id} on ${c.req.param("page")}`);
-  return c.json(await action(await jsonBody(c), { setCookie: (name, value, maxAge) => cookie(c, name, value, maxAge) }));
+  const body = await jsonBody(c);
+  const result = await action(body, { setCookie: (name, value, maxAge) => cookie(c, name, value, maxAge) });
+  await auditAction(c.req.param("page"), id, body);
+  return c.json(result);
 });
 
 settings.on(["GET", "PUT", "PATCH", "DELETE"], "/:page{[a-z]+}/:action{[a-z]+}", page, access, (c) => c.json({ error: "POST only" }, 405));

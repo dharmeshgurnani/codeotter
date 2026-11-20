@@ -9,6 +9,7 @@ import { deriveSuggestionFromDetail, reflectFindings } from "./engines.ts";
 import { postInlineSuggestionsOnPr, resolvePr, score, syncPrComments } from "./review.ts";
 import { CATCH_UP_EVERY, HANDLED_COMMENTS, lastCatchUp, remember, webhookHealthy } from "./queue.ts";
 import { repoOf } from "./views.ts";
+import { audit, orgOfRepo, withActor } from "./audit.ts";
 import type { ForgeComment } from "./forges.ts";
 import type { Guide, PullRequest, ReviewSettings } from "./context.ts";
 import type { Finding } from "./engines.ts";
@@ -260,13 +261,18 @@ export async function runCommand(repo: string, c: PrComment, { cmd, arg }: PrCom
   const id = Number(c.id);
   if (isForgeRepo(repo)) await Promise.resolve().then(() => forgeOf(repo).react(repo, c as ForgeComment)).catch(() => {});
   else if (Number.isSafeInteger(id) && id > 0) await ghAsync("api", "--method", "POST", `repos/${repo}/issues/comments/${id}/reactions`, "-f", "content=eyes").catch(() => {});
+  const login = String(c.user?.login || "unknown");
+  const actor = { id: `comment:${login}`, name: login };
+  await audit(actor, "command.run", prUrl, { command: `/${cmd}` }, orgOfRepo(repo));
   try {
-    if (cmd === "review") {
-      await syncPrComments(await score(prUrl, true, repo), repo, { postScores: true, postReview: true });
-    } else {
-      await runPrTool(prUrl, cmd, { question: arg });
-      await runPrTool(prUrl, cmd, { action: "comment" });
-    }
+    await withActor(actor, async () => {
+      if (cmd === "review") {
+        await syncPrComments(await score(prUrl, true, repo), repo, { postScores: true, postReview: true });
+      } else {
+        await runPrTool(prUrl, cmd, { question: arg });
+        await runPrTool(prUrl, cmd, { action: "comment" });
+      }
+    });
   } catch (e) {
     await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/${cmd}\` failed: ${oneLine((e as Error).message, 500)}`).catch(() => {});
     throw e;

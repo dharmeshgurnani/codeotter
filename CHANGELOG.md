@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Audit log.** An append-only record of sign-ins (and refusals), account role and repository-access changes, invites, settings saves (the page and the fields sent; passwords, tokens, keys and secrets stored as `••••`), model, git and auth provider changes, webhook secrets, repositories onboarded or removed, reviews posted to pull requests (by account, comment author or `auto`), comment commands and local model downloads, switches and deletes. Owners read it under Settings → Workspace → Audit log, filtered by action and actor and scoped to the active organization, and download it as CSV (`GET /api/audit/export`). The newest 10,000 entries within 180 days are kept (`CODEOTTER_AUDIT_MAX`, `CODEOTTER_AUDIT_DAYS`). Stored in a new PocketBase `audit` collection, or `audit.jsonl` with file storage.
 - **TypeScript.** `core/`, `tui/`, `bin/`, `test/` and `web/scripts/` are strict TypeScript (`.ts`), run directly by Node's type stripping, with no build step. Node 22.18 or later is required. `pnpm start` runs `node core/server.ts`, and `codeotter` is `tui/codeotter.ts`. `pnpm typecheck` (strict, no `any`) runs in CI and before `pnpm test`. Malformed API request fields are treated as empty instead of failing with a TypeError. PocketBase migrations stay JavaScript.
 ## 0.7.0 (2026-11-08)
 
