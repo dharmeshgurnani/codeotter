@@ -9,6 +9,8 @@ import { repoOf } from "./views.ts";
 import type { ChangedFile } from "./diff.ts";
 import type { PrCommit as ForgePrCommit, PullRequest as ForgePullRequest } from "./forges.ts";
 import type { GuideSetting, RepoSetting } from "./store.ts";
+import { CONFIG_FILE, normalizeRules, parseRepoConfig, RULE_DEFAULTS } from "./repo-rules.ts";
+import type { RepoRules } from "./repo-rules.ts";
 
 // A pull request in gh's JSON shape (`gh pr view --json`); the forge adapters normalise theirs to the same fields.
 export type PrCommit = Partial<Omit<ForgePrCommit, "authors">> & { authors?: { login?: string; name?: string }[] };
@@ -17,7 +19,8 @@ export type PrCommit = Partial<Omit<ForgePrCommit, "authors">> & { authors?: { l
 export type PullRequest = Pick<ForgePullRequest, "url" | "number" | "title" | "author" | "baseRefName" | "headRefName" | "changedFiles" | "additions" | "deletions">
   & Partial<Pick<ForgePullRequest, "body" | "headRefOid" | "headRepo" | "state" | "isDraft" | "updatedAt" | "labels">>
   & { files: ChangedFile[]; commits?: PrCommit[]; headSha?: string };
-export interface ReviewSettings {
+// Path filters, path instructions and skip rules (repo-rules.ts) are review settings too.
+export interface ReviewSettings extends RepoRules {
   maxFindings: number;
   diffChars: number;
   contextLines: number;
@@ -37,7 +40,7 @@ export interface BaseCommit { sha: string; message: string; author: string; }
 export interface GitHistory { prCommits: GitCommit[]; baseCommits: BaseCommit[]; formatted?: string; }
 export interface LinkedIssue { number: number; repo: string; title: string; body: string; state: string; url: string; labels: string[]; }
 
-export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: false, postReview: false, postInlineSuggestions: false, commands: false, auto: false };
+export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: false, postReview: false, postInlineSuggestions: false, commands: false, auto: false, ...RULE_DEFAULTS };
 // Review settings are per repository (repoSettings[repo].review, from Repository settings). Repositories not yet saved
 // there fall back to the old install-wide "review" setting and the per-repository posting toggles kept in "guides".
 export const reviewConfig = async (repo = ""): Promise<ReviewSettings> => {
@@ -60,6 +63,7 @@ export const normalizeReview = (v: { [K in keyof ReviewSettings]?: unknown }): R
   postInlineSuggestions: !!v.postInlineSuggestions,
   auto: !!v.auto,
   commands: !!v.commands,
+  ...normalizeRules(v),
 });
 
 // Repository review guides: AGENTS.md and/or CLAUDE.md at the repo root (both are used when both exist, since one is
@@ -110,6 +114,30 @@ export async function guideFor(repo: string, ref = "", contentRepo = repo): Prom
   if (!use) return null;
   const per = Math.floor(GUIDE_CHARS / files.length);
   return { file: files.join(" + "), text: (await Promise.all(files.map(async (f) => `--- ${f} ---\n${(await guideText(contentRepo, f, ref)).slice(0, per)}`))).join("\n\n") };
+}
+
+// `.codeotter.json` (schema in repo-rules.ts), read like the guides but only from the base repository at the base branch.
+const configCache = new Map<string, { rules: Partial<RepoRules> | null; at: number }>();
+export const clearRepoConfigCache = () => configCache.clear();
+// The base repository's `.codeotter.json` at `baseRef` (the default branch when empty), cached for ten minutes.
+// Takes the base repository only: the head (a fork's or a branch's copy) is never read.
+export async function repoConfigFile(repo: string, baseRef = ""): Promise<Partial<RepoRules> | null> {
+  if (!REPO_RE.test(repo)) throw new Error("Invalid repository");
+  const key = `${repo}@${baseRef}`;
+  const hit = configCache.get(key);
+  if (hit && Date.now() - hit.at < 600e3) return hit.rules;
+  let text: string | null;
+  if (isForgeRepo(repo)) text = await forgeOf(repo).file(repo, CONFIG_FILE, baseRef);
+  else text = await ghAsync("api", `repos/${repo}/contents/${CONFIG_FILE}${baseRef ? `?ref=${encodeURIComponent(baseRef)}` : ""}`, "-H", "Accept: application/vnd.github.raw").catch(() => null);
+  const rules = text === null || !text.trim() ? null : parseRepoConfig(text.slice(0, 65536));
+  if (configCache.size > 500) configCache.clear();
+  configCache.set(key, { rules, at: Date.now() });
+  return rules;
+}
+// Repository settings with the file's keys over them. `pr` names the base branch; its head is not used.
+export async function effectiveRules(repo: string, ui: Partial<RepoRules>, pr: { baseRefName?: string } = {}): Promise<RepoRules & { configFile: string[] | null }> {
+  const file = await repoConfigFile(repo, pr.baseRefName || "");
+  return { ...normalizeRules({ ...ui, ...(file || {}) }), configFile: file ? Object.keys(file) : null };
 }
 
 export function normalizeLearningList(list: unknown): string[] {

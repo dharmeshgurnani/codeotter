@@ -371,7 +371,7 @@ export async function openPrs(repo: string, { strict = false } = {}): Promise<Pu
   // a git server's error (bad token, server down) reaches the page instead of looking like "no pull requests"
   if (isForgeRepo(repo)) return forgeOf(repo).openPrs(repo);
   try {
-    return JSON.parse(await ghAsync("pr", "list", "-R", repo, "--json", "number,title,author,url,updatedAt,additions,deletions,changedFiles,headRefOid,isDraft,labels", "--limit", "200"));
+    return JSON.parse(await ghAsync("pr", "list", "-R", repo, "--json", "number,title,author,url,updatedAt,additions,deletions,changedFiles,headRefOid,isDraft,labels,baseRefName", "--limit", "200"));
   } catch (e) {
     if (strict) throw e;
     return [];

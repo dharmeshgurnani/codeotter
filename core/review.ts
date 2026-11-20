@@ -5,10 +5,11 @@ import { store } from "./store.ts";
 import { createPrComment, forgeOf, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, readPr, repos, validPrUrl } from "./git.ts";
 import { askSystemOne, llmConfig, s1Config } from "./models.ts";
 import { acceptedSuggestions, blastRadius, dynamicContextFiles, extendDiffContext, parseDiff, sliceOutsideDiffImpact } from "./diff.ts";
-import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, getRepoAccepted, getRepoLearnings, guideFor, headFileTexts, REVIEW_DEFAULTS, reviewConfig, shaMatch } from "./context.ts";
+import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, getRepoAccepted, getRepoLearnings, effectiveRules, guideFor, headFileTexts, REVIEW_DEFAULTS, reviewConfig, shaMatch } from "./context.ts";
 import { changeDigest, deriveSuggestionFromDetail, judge, S1_SCORES, scoreWithSystemOne, verifyFindingsWithSystemOne } from "./engines.ts";
 import { formatReviewComment, formatScoresComment } from "./comments.ts";
 import { repoOf } from "./views.ts";
+import { filterDiff } from "./repo-rules.ts";
 import type { BlastRadius, DiffContextStats, OutsideImpact } from "./diff.ts";
 import type { GitHistory, LinkedIssue, PullRequest } from "./context.ts";
 import type { Finding, Gate, IncrementalCommit, IncrementalContext, Judgement, ScoreKey, Scores, Verdict, WalkthroughItem } from "./engines.ts";
@@ -262,11 +263,15 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
       ]);
       live.guide = guide?.file || null;
       live.learnings = learnings;
-      let diff = rawDiff;
+      // .codeotter.json on the base branch wins over Repository settings for this review; excluded paths never reach a model
+      const { configFile: _file, ...rules } = await effectiveRules(repoOf(live.pr), rc, live.pr);
+      Object.assign(rc, rules);
+      let diff = filterDiff(rawDiff, rc).diff;
+      if (rawDiff.trim() && !diff.trim()) throw new Error("Every changed file is excluded by the path filters");
       if (rc.contextLines > 0) {
-        const parsed = parseDiff(rawDiff);
+        const parsed = parseDiff(diff);
         const sources = await headFileTexts(live.pr, dynamicContextFiles(parsed));
-        const ext = extendDiffContext(rawDiff, sources, { before: rc.contextLines, after: 1 });
+        const ext = extendDiffContext(diff, sources, { before: rc.contextLines, after: 1 });
         diff = ext.diff;
         live.dynamicContext = ext.stats;
       }
@@ -321,6 +326,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
                 .join("\n\n");
             }
           } catch {}
+          deltaDiff = filterDiff(deltaDiff, rc).diff;
         }
         const shortPrev = (prevSha || currentHeadSha || "prev").slice(0, 7);
         const shortHead = (currentHeadSha || prevSha || "head").slice(0, 7);

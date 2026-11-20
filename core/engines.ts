@@ -3,6 +3,7 @@ import { ensureSidecar } from "./local-models.ts";
 import { askModel, askSystemOne } from "./models.ts";
 import { blastRadius, compressDiff, splitHunks } from "./diff.ts";
 import { extractHeadSha, REVIEW_DEFAULTS } from "./context.ts";
+import { diffFiles, pathInstructionBlock } from "./repo-rules.ts";
 import type { LlmConfig, S1Answers, S1Config, S1Questions } from "./models.ts";
 import type { LocalModel } from "./local-models.ts";
 import type { OutsideImpact } from "./diff.ts";
@@ -418,6 +419,7 @@ function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings =
   const acceptedBlock = accepted?.length
     ? `\nFixes this team accepted from earlier reviews (look for the same kinds of problems):\n${accepted.slice(-10).map((a) => `- ${a}`).join("\n")}\n`
     : "";
+  const pathBlock = pathInstructionBlock(r.pathInstructions, diffFiles(diff));
   return `You are CodeOtter, a strict senior staff code reviewer. Review this pull request using the repository's review guidelines (AGENTS.md / CLAUDE.md), the repository team learnings, the linked issues and acceptance criteria, the git commit history, the outside-diff call graph context, and the code diff. Reply with ONLY a JSON object:
 {"summary":"3-5 sentence architectural walkthrough covering what changed, commit progression, fulfillment of linked issue requirements, adherence to repository guidelines, and outside caller safety","verdict":"approve|comment|request_changes",
 ${wantScores ? ` "scores":{"quality":0-100,"correctness_risk":0-100 (100 = very risky),"test_coverage":0-100,"readability":0-100,"pr_hygiene":0-100 (title, description, scope, commit focus),"blast_radius":0-100 (100 = system-wide or critical-path impact)},\n` : ""} "findings":[{"severity":"blocker|major|minor|nit|high|medium|low","file":"path","line":42,"title":"short","detail":"specific line/behaviour and fix (cite AGENTS.md/CLAUDE.md rule, linked issue #number requirement, or commit if relevant)","suggestion":"optional exact replacement code"}],
@@ -428,7 +430,7 @@ PR #${pr.number}: ${pr.title}
 Author: ${pr.author.login}  Base: ${pr.baseRefName} <- Head: ${pr.headRefName}${pr.headSha ? ` (${pr.headSha.slice(0, 7)})` : ""}  Files: ${pr.changedFiles}  +${pr.additions} -${pr.deletions}
 Description:
 ${(pr.body || "(none)").slice(0, c.contextChars ? Math.min(3000, Math.floor(c.contextChars / 10)) : 3000)}
-${outsideBlock}${incrementalBlock}${issueBlock}${learningsBlock}${acceptedBlock}${gitHistory?.formatted ? `\nGit Change History (commits in this PR and recent target branch history):\n${gitHistory.formatted.slice(0, 4000)}\n` : ""}${guide ? `\nRepository Review Guidelines from ${guide.file} (MANDATORY: verify all code changes and commits against these rules and flag any violation in findings):\n${guide.text}\n` : ""}
+${outsideBlock}${incrementalBlock}${issueBlock}${pathBlock}${learningsBlock}${acceptedBlock}${gitHistory?.formatted ? `\nGit Change History (commits in this PR and recent target branch history):\n${gitHistory.formatted.slice(0, 4000)}\n` : ""}${guide ? `\nRepository Review Guidelines from ${guide.file} (MANDATORY: verify all code changes and commits against these rules and flag any violation in findings):\n${guide.text}\n` : ""}
 Diff${diff.length > Math.min(r.diffChars, c.contextChars || Infinity) ? " (over budget: highest-priority files first, the rest named at the end)" : ""}:
 ${compressDiff(diff, Math.min(r.diffChars, c.contextChars || Infinity)).diff}`;
 }
