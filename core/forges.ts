@@ -129,6 +129,9 @@ export interface Forge {
   comment(repo: string, n: number, body: string): Promise<unknown>;
   editComment(repo: string, n: number, cid: number | string, body: string): Promise<unknown>;
   inline<C extends InlineComment>(repo: string, n: number, comments: C[], sha?: string): Promise<C[]>;
+  // Resolve the still-open inline comments this token wrote whose body `ours` accepts; where the server cannot resolve
+  // one, reply `note` instead. Returns how many were resolved or answered.
+  resolveInline(repo: string, n: number, ours: (body: string) => boolean, note: string): Promise<number>;
   singleLineSuggestions?: boolean;
   multiLineSuggestions?: boolean;
   setBody(repo: string, n: number, body: string): Promise<unknown>;
@@ -332,11 +335,11 @@ interface GiteaPull {
 interface GiteaFile { filename: string; additions?: number; deletions?: number }
 interface GiteaCommit { sha: string; commit?: { message?: string; author?: { name?: string; date?: string } }; author?: { login?: string } }
 interface GiteaComment { id: number; body?: string; created_at?: string; html_url?: string; user?: GiteaUser }
+interface GiteaReview { id?: number; state?: string; user?: GiteaUser }
+interface GiteaReviewComment { id: number; body?: string; created_at?: string; html_url?: string; user?: GiteaUser; resolver?: GiteaUser | null; path?: string; position?: number; original_position?: number; diff_hunk?: string }
 interface GiteaContent { encoding?: string; content?: unknown }
 interface GiteaIssue { number?: number; title?: string; body?: string; state?: string; labels?: GiteaLabel[] }
 interface GiteaHook { id?: number; config?: { url?: string } }
-interface GiteaReview { id?: number; state?: string }
-interface GiteaReviewComment { id: number; body?: string; created_at?: string; user?: GiteaUser; path?: string; position?: number; original_position?: number; diff_hunk?: string }
 function gitea(id: string, f: AuthedConfig): Forge {
   f.auth = () => `token ${f.token}`;
   const api = <T = unknown>(path: string, opts: ApiOptions = {}): Promise<T> => {
@@ -431,6 +434,24 @@ function gitea(id: string, f: AuthedConfig): Forge {
         return list0;
       }
     },
+    // The API cannot resolve a conversation: one PR comment names every fixed one instead.
+    async resolveInline(repo, n, ours, note) {
+      const me = await api<GiteaUser | null>("user");
+      const open: GiteaReviewComment[] = [];
+      for (const rv of await list<GiteaReview>(`${r(repo)}/pulls/${n}/reviews`)) {
+        if (!me?.id || rv.user?.id !== me.id || !Number.isSafeInteger(Number(rv.id))) continue;
+        const rows = await api<GiteaReviewComment[] | null>(`${r(repo)}/pulls/${n}/reviews/${Number(rv.id)}/comments`);
+        open.push(...(Array.isArray(rows) ? rows : []).filter((c) => c.user?.id === me.id && !c.resolver && ours(String(c.body || ""))));
+      }
+      if (!open.length) return 0;
+      const item = (c: GiteaReviewComment) => {
+        const where = `\`${c.path || "comment"}\``;
+        const title = firstLine(String(c.body || "").replace(/<!--[\s\S]*?-->/g, "").trim()).slice(0, 160);
+        return `- ${c.html_url ? `[${where}](${c.html_url})` : where}: ${title}`;
+      };
+      await api(`${r(repo)}/issues/${n}/comments`, { method: "POST", body: { body: [note, "", ...open.map(item)].join("\n") } });
+      return open.length;
+    },
     singleLineSuggestions: true,
     setBody: (repo, n, body) => api(`${r(repo)}/pulls/${n}`, { method: "PATCH", body: { body } }),
     commentsSince: async (repo, since) => (await api<GiteaComment[] | null>(`${r(repo)}/issues/comments?since=${enc(since)}&limit=50`) || []).map(toComment),
@@ -485,7 +506,7 @@ interface BbPull {
 interface BbPage<T> { values?: T[]; next?: string }
 interface BbDiffstat { new?: { path?: string }; old?: { path?: string }; lines_added?: number; lines_removed?: number }
 interface BbCommit { hash: string; message?: string; author?: { user?: BbUser; raw?: string }; date?: string }
-interface BbComment { id: number; content?: { raw?: string }; created_on?: string; user?: BbUser; inline?: unknown; parent?: unknown; deleted?: boolean }
+interface BbComment { id: number; content?: { raw?: string }; created_on?: string; user?: BbUser; inline?: unknown; parent?: unknown; deleted?: boolean; resolution?: unknown }
 interface BbRepo { mainbranch?: { name?: string }; workspace?: { slug?: string }; full_name?: string; slug?: string }
 interface BbIssue { id?: number; title?: string; content?: { raw?: string }; state?: string; links?: { html?: { href?: string } }; kind?: string; priority?: string }
 interface BbHook { url?: string; uuid: string }
@@ -590,6 +611,21 @@ function bitbucket(id: string, f: AuthedConfig): Forge {
       }
       return failed;
     },
+    async resolveInline(repo, n, ours, note) {
+      const me = await orNull(api<BbUser | null>("user")).catch(() => null);
+      const meId = me?.account_id || me?.uuid;
+      const open = (await list<BbComment>(`${r(repo)}/pullrequests/${n}/comments`)).filter((c) => c.inline && !c.parent && !c.deleted && !c.resolution
+        && (!meId || (c.user?.account_id || c.user?.uuid) === meId) && ours(String(c.content?.raw || "")) && Number.isSafeInteger(Number(c.id)));
+      for (const c of open) {
+        try {
+          await api(`${r(repo)}/pullrequests/${n}/comments/${Number(c.id)}/resolve`, { method: "POST" });
+        } catch (e) {
+          if (![400, 403, 404, 405].includes(statusOf(e) ?? 0)) throw e;
+          await api(`${r(repo)}/pullrequests/${n}/comments`, { method: "POST", body: { content: { raw: note }, parent: { id: Number(c.id) } } });
+        }
+      }
+      return open.length;
+    },
     async setBody(repo, n, body) {
       const p = await api<BbPull>(`${r(repo)}/pullrequests/${n}`);
       return api(`${r(repo)}/pullrequests/${n}`, { method: "PUT", body: { title: p.title, description: body } });
@@ -648,7 +684,7 @@ interface DcPull {
   state?: string; draft?: boolean; version?: number;
 }
 interface DcPage<T> { values?: T[]; isLastPage?: boolean; nextPageStart: number }
-interface DcComment { id: number; text?: string; createdDate?: number; author?: DcUser; version?: number }
+interface DcComment { id: number; text?: string; createdDate?: number; author?: DcUser; version?: number; threadResolved?: boolean }
 interface DcActivity { action?: string; comment?: DcComment; commentAnchor?: unknown }
 interface DcCommit { id: string; message?: string; author?: DcUser; authorTimestamp?: number }
 interface DcSegment { type?: string; lines?: { line: string }[] }
@@ -759,6 +795,18 @@ function bitbucketdc(id: string, f: AuthedConfig): Forge {
       }
       return failed;
     },
+    // Matched by the CodeOtter marker alone (no me()). Resolving a thread needs Bitbucket 8.9+; older servers get a reply.
+    async resolveInline(repo, n, ours, note) {
+      const open = (await list<DcActivity>(`${r(repo)}/pull-requests/${n}/activities`, 1000))
+        .filter((a): a is DcActivity & { comment: DcComment } => a.action === "COMMENTED" && !!a.comment && !!a.commentAnchor && !a.comment.threadResolved && ours(String(a.comment.text || "")) && Number.isSafeInteger(Number(a.comment.id)));
+      for (const { comment: c } of open) {
+        const path = `${r(repo)}/pull-requests/${n}/comments/${Number(c.id)}`;
+        const now = await api<DcComment>(path);
+        const done = await api<DcComment | null>(path, { method: "PUT", body: { text: now.text, version: now.version, threadResolved: true } }).catch((e: unknown) => { if ([400, 409].includes(statusOf(e) ?? 0)) return null; throw e; });
+        if (!done?.threadResolved) await api(`${r(repo)}/pull-requests/${n}/comments`, { method: "POST", body: { text: note, parent: { id: Number(c.id) } } });
+      }
+      return open.length;
+    },
     async setBody(repo, n, body) {
       const p = await api<DcPull>(`${r(repo)}/pull-requests/${n}`);
       return api(`${r(repo)}/pull-requests/${n}`, { method: "PUT", body: { version: p.version, title: p.title, description: body } });
@@ -829,7 +877,7 @@ interface AzComment {
   id: number; parentCommentId?: number; isDeleted?: boolean; commentType?: string; content?: string; publishedDate: string;
   author?: AzIdentity; _links?: { threads?: { href?: string } };
 }
-interface AzThread { id: number; isDeleted?: boolean; threadContext?: unknown; comments?: AzComment[] }
+interface AzThread { id: number; isDeleted?: boolean; threadContext?: unknown; comments?: AzComment[]; status?: string }
 interface AzGitRepo { id?: string; name: string; isDisabled?: boolean; project: { id?: string; name: string } }
 interface AzWorkItem { id: number; fields?: { "System.Title"?: string; "System.Description"?: string; "System.State"?: string; "System.Tags"?: string } }
 interface AzSubscription { id?: string; eventType?: string; consumerInputs?: { url?: string }; publisherInputs?: { repository?: string } }
@@ -927,6 +975,7 @@ function azure(id: string, f: AuthedConfig): Forge {
     .filter((t): t is AzThread & { comments: AzComment[] } => !t.isDeleted && !t.threadContext && !!t.comments?.length)
     .map((t) => { const c = t.comments.find((x) => !x.parentCommentId) || t.comments[0]; return c.isDeleted || c.commentType === "system" ? null : toComment(t.id, c, n); })
     .filter((c): c is ForgeComment => Boolean(c));
+  const me = async (repo: string): Promise<ForgeUser | null> => { const d = await api<{ authenticatedUser?: { id?: string } } | null>(`${enc(parts(repo)[0])}/_apis/connectionData?api-version=7.1-preview`).catch(() => null); return d?.authenticatedUser ? { id: d.authenticatedUser.id, login: "" } : null; };
   const ids = async (repo: string) => { const x = await api<AzGitRepo>(g(repo)); return { repositoryId: x.id, projectId: x.project?.id }; };
   const EVENTS = ["git.pullrequest.created", "git.pullrequest.updated", "ms.vss-code.git-pullrequest-comment-event"];
   return {
@@ -952,7 +1001,7 @@ function azure(id: string, f: AuthedConfig): Forge {
       for (const org of f.orgs) await api(`${enc(org)}/_apis/projects?$top=1`);
       return `Connected to Azure DevOps (${f.orgs.join(", ")})`;
     },
-    me: async (repo) => { const d = await api<{ authenticatedUser?: { id?: string } } | null>(`${enc(parts(repo)[0])}/_apis/connectionData?api-version=7.1-preview`).catch(() => null); return d?.authenticatedUser ? { id: d.authenticatedUser.id, login: "" } : null; },
+    me,
     async listRepos() {
       const out: string[] = [];
       for (const org of f.orgs || []) {
@@ -1028,6 +1077,21 @@ function azure(id: string, f: AuthedConfig): Forge {
       return failed;
     },
     multiLineSuggestions: true,
+    // An inline thread whose first comment this token wrote gets the note as a reply and moves from active to fixed.
+    async resolveInline(repo, n, ours, note) {
+      const self = await me(repo);
+      const open = (await threads(repo, n)).flatMap((t) => {
+        const c = t.comments?.find((x) => !x.parentCommentId);
+        const mine = !t.isDeleted && !!t.threadContext && ["active", "pending"].includes(String(t.status || "")) && !!c && !c.isDeleted
+          && (!self?.id || c.author?.id === self.id) && ours(String(c.content || "")) && Number.isSafeInteger(Number(t.id)) && Number.isSafeInteger(Number(c.id));
+        return mine && c ? [{ thread: Number(t.id), first: Number(c.id) }] : [];
+      });
+      for (const { thread, first } of open) {
+        await api(`${g(repo)}/pullRequests/${n}/threads/${thread}/comments`, { method: "POST", body: { parentCommentId: first, content: note, commentType: 1 } });
+        await api(`${g(repo)}/pullRequests/${n}/threads/${thread}`, { method: "PATCH", body: { status: "fixed" } });
+      }
+      return open.length;
+    },
     async setBody(repo, n, body) {
       if (body.length > AZURE_MAX_DESCRIPTION) throw new Error(`Azure DevOps limits a pull request description to ${AZURE_MAX_DESCRIPTION} characters (this one is ${body.length})`);
       return api(`${g(repo)}/pullrequests/${n}`, { method: "PATCH", body: { description: body } });

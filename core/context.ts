@@ -30,6 +30,7 @@ export interface ReviewSettings extends RepoRules {
   postScores: boolean;
   postReview: boolean;
   postInlineSuggestions: boolean;
+  resolveFixed: boolean; // resolve our inline comments a later push fixed (only while inline suggestions are posted)
   commands: boolean;
   auto: boolean;
   profile: ReviewProfile;
@@ -48,7 +49,7 @@ export interface BaseCommit { sha: string; message: string; author: string; }
 export interface GitHistory { prCommits: GitCommit[]; baseCommits: BaseCommit[]; formatted?: string; }
 export interface LinkedIssue { number: number; repo: string; title: string; body: string; state: string; url: string; labels: string[]; }
 
-export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, commands: true, auto: true, profile: "balanced", minSeverity: "nit", checks: [], ...RULE_DEFAULTS };
+export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, resolveFixed: true, commands: true, auto: true, profile: "balanced", minSeverity: "nit", checks: [], ...RULE_DEFAULTS };
 // Review strictness: a profile supplies the defaults for maxFindings and reflectMin (values set explicitly still win)
 // and the tone of the language-model instructions (engines.ts).
 export type ReviewProfile = "chill" | "balanced" | "assertive";
@@ -101,6 +102,7 @@ export const normalizeReview = (v: { [K in keyof ReviewSettings]?: unknown }): R
   postScores: !!v.postScores,
   postReview: !!v.postReview,
   postInlineSuggestions: !!v.postInlineSuggestions,
+  resolveFixed: v.resolveFixed === undefined ? REVIEW_DEFAULTS.resolveFixed : !!v.resolveFixed,
   auto: !!v.auto,
   commands: !!v.commands,
   profile: isProfile(v.profile) ? v.profile : REVIEW_DEFAULTS.profile,

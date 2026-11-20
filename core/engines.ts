@@ -287,6 +287,49 @@ export async function verifyFindingsWithSystemOne(findings: Finding[], s1: S1Con
   return kept.sort((x, y) => y.confidence - x.confidence);
 }
 
+// <fixed-check>
+// Which prior findings the push since the last review fixed. The re-review no longer reporting a finding only makes it a
+// candidate; a model reads each candidate against the delta diff: System One answers yes/no per finding, else the language
+// model answers for all of them in one JSON reply. Only findings judged fixed come back; a failed answer throws.
+const S1_FIXED_CHECK = "The code change fixes the problem the review comment describes.";
+const S1_FIXED_MIN = 0.5;
+const BLANK = "\n\n";
+const fixedCommentText = (f: Finding) => `[${f.severity}] ${f.file}${f.line ? `:${f.line}` : ""}: ${f.title}\n${String(f.detail || "").split(`${BLANK}@@`)[0].slice(0, 800)}`;
+export async function confirmFixedFindings(findings: Finding[], deltaDiff: string, s1: S1Config | null, llm: LlmConfig | null): Promise<Finding[]> {
+  if (!findings.length || !deltaDiff.trim()) return [];
+  if (s1?.enabled) {
+    const fixed: Finding[] = [];
+    for (const f of findings) {
+      const comment = fixedCommentText(f);
+      const room = Math.max(400, (s1.contextChars || 8000) - comment.length - 400);
+      const a = await askSystemOne({ file: f.file, review_comment: comment, code_change: compressDiff(deltaDiff, room).diff }, { fixed: { type: "noul", instructions: S1_FIXED_CHECK } }, s1);
+      const yes = Number(a?.fixed?.noul);
+      if (!Number.isFinite(yes)) throw new Error(`System One model ${s1.provider}/${s1.model} did not answer whether a review comment was fixed`);
+      if (yes >= S1_FIXED_MIN) fixed.push(f);
+    }
+    return fixed;
+  }
+  if (!llm || llm.api === "codereviewer") throw new Error("No model to check fixed comments: configure System One or a language model");
+  const list = findings.map((f, i) => `${i}. ${fixedCommentText(f)}`).join(BLANK);
+  const text = await askModel(`These review comments were posted on a pull request. The diff below is everything pushed since. For each comment, answer whether this diff fixes the problem it describes. Answer true only when the change clearly addresses it; a comment the diff does not touch is not fixed. Reply with ONLY a JSON object: {"fixed":[{"index":0,"fixed":true}]}
+
+Comments:
+${list}
+
+Diff since the comments:
+${compressDiff(deltaDiff, Math.min(60000, llm.contextChars || Infinity)).diff}`, { ...llm, temperature: 0 });
+  let out: { fixed?: unknown };
+  try {
+    out = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1));
+  } catch {
+    throw new Error(`${llm.provider}/${llm.model} did not return valid JSON when checking fixed comments`);
+  }
+  const rows = Array.isArray(out.fixed) ? (out.fixed as ({ index?: unknown; fixed?: unknown } | null)[]) : [];
+  const yes = new Set(rows.filter((x) => x?.fixed === true).map((x) => Number(x?.index)).filter((i) => Number.isInteger(i)));
+  return findings.filter((_, i) => yes.has(i));
+}
+// </fixed-check>
+
 function findFileLineInDiff(file: string, diff: string): number {
   if (!file || !diff) return 0;
   const lines = String(diff).split("\n");

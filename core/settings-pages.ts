@@ -315,6 +315,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             { key: "postScores", label: "Post scores on PR", type: "checkbox", text: "Add a PR comment with all System One scores after review" },
             { key: "postReview", label: "Add PR review as a comment", type: "checkbox", text: "Add a PR comment with the review summary and link to the full report" },
             { key: "postInlineSuggestions", label: "Post inline suggestions", type: "checkbox", text: "Post inline committable suggestion comments on PR diff lines" },
+            { key: "resolveFixed", label: "Resolve fixed comments", type: "checkbox", text: "Resolve CodeOtter's inline comments that a later push fixed" },
             { key: "auto", label: "Auto-review", type: "checkbox", text: "Review every new or updated pull request and post the result (PRs labelled codeotter:skip are left alone)" },
             { key: "configFile", label: "Repository config", type: "readonly" },
             { key: "reviewDrafts", label: "Draft pull requests", type: "checkbox", text: "Auto-review drafts" },
