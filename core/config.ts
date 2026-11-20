@@ -40,6 +40,7 @@ export const FORGES: Record<string, ForgeConfig> = {
   bitbucket: { kind: "bitbucket", label: "Bitbucket", pb: "bitbucket", fixed: true, url: "https://bitbucket.org", token: process.env.BITBUCKET_TOKEN || "", user: process.env.BITBUCKET_USER || "" },
   bitbucketdc: { kind: "bitbucketdc", label: "Bitbucket Data Center", url: forgeOrigin(process.env.BITBUCKET_DC_URL || ""), token: process.env.BITBUCKET_DC_TOKEN || "" },
   azure: { kind: "azure", label: "Azure DevOps", pb: "microsoft", signInLabel: "Microsoft", fixed: true, url: "https://dev.azure.com", token: process.env.AZURE_DEVOPS_TOKEN || "", orgs: envList(process.env.AZURE_DEVOPS_ORGS) },
+  gitlab: { kind: "gitlab", label: "GitLab", pb: "gitlab", url: forgeOrigin(process.env.GITLAB_URL || ""), token: process.env.GITLAB_TOKEN || "" },
 };
 export const FORGE_IDS = Object.keys(FORGES);
 export const FORGE_API: Record<string, Forge> = Object.fromEntries(FORGE_IDS.map((id) => [id, makeForge(id, FORGES[id])]));
@@ -65,9 +66,10 @@ export function availableUpdate(): { version: string; url: string } | null {
 }
 // Declared before repoFromCwd() runs below: a const used before its declaration throws, and the catch blocks there would hide it.
 // <repo-id>
-// owner/name everywhere, except Azure DevOps: azure~org/project/repo, whose project and repository names may hold spaces.
-export const OWNER_RE = /^(?:(?:forgejo|gitea|bitbucket|bitbucketdc|azure)~)?[\w][\w.-]*$/;
-export const REPO_RE = /^(?:(?:(?:forgejo|gitea|bitbucket|bitbucketdc)~)?[\w][\w.-]*\/[\w][\w.-]*|azure~[\w][\w.-]*\/[\w](?:[\w. -]*[\w.-])?\/[\w](?:[\w. -]*[\w.-])?)$/;
+// owner/name everywhere, except Azure DevOps: azure~org/project/repo, whose project and repository names may hold spaces,
+// and GitLab: gitlab~group[/subgroup...]/project (nested groups, up to 20 segments).
+export const OWNER_RE = /^(?:(?:forgejo|gitea|bitbucket|bitbucketdc|azure|gitlab)~)?[\w][\w.-]*$/;
+export const REPO_RE = /^(?:(?:(?:forgejo|gitea|bitbucket|bitbucketdc)~)?[\w][\w.-]*\/[\w][\w.-]*|azure~[\w][\w.-]*\/[\w](?:[\w. -]*[\w.-])?\/[\w](?:[\w. -]*[\w.-])?|gitlab~[\w][\w.-]*(?:\/[\w][\w.-]*){1,19})$/;
 // </repo-id>
 export const REPO: string = process.env.REPO || (FORGE_IDS.some(forgeActive) ? "" : repoFromCwd());
 function repoFromCwd(): string {

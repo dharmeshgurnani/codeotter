@@ -96,7 +96,7 @@ const OAUTH_APP_LINKS: Record<string, string> = {
   microsoft: "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade",
 };
 // The PocketBase OAuth2 provider entry for a sign-in row. GitHub and Bitbucket use PocketBase's built-in endpoints;
-// Forgejo and Gitea point at their configured server; Microsoft at the one tenant.
+// Forgejo, Gitea and GitLab point at their configured server; Microsoft at the one tenant.
 export function oauthProvider(id: string, current: Partial<OAuthProviderConfig> | undefined, clientId: unknown, clientSecret: unknown, tenant: unknown = ""): OAuthProviderConfig {
   const spec = LOGIN_PROVIDERS[id];
   const base = { ...current, name: spec.pb, clientId: String(clientId || "").trim(), ...(clientSecret ? { clientSecret: String(clientSecret) } : {}) };
@@ -108,6 +108,7 @@ export function oauthProvider(id: string, current: Partial<OAuthProviderConfig> 
   }
   const url = FORGES[id].url;
   if (!url) throw new Error(`Set the ${spec.label} server under Admin / Git providers first`);
+  if (spec.pb === "gitlab") return { ...base, displayName: spec.label, pkce: true, authURL: `${url}/oauth/authorize`, tokenURL: `${url}/oauth/token`, userInfoURL: `${url}/api/v4/user` };
   return { ...base, displayName: spec.label, pkce: true,
     authURL: `${url}/login/oauth/authorize`, tokenURL: `${url}/login/oauth/access_token`, userInfoURL: id === "gitea" ? `${url}/api/v1/user` : `${url}/login/oauth/userinfo` };
 }
@@ -191,7 +192,7 @@ async function githubManifest(body: Body, http: CookieWriter): Promise<ActionRes
 // Admin / Git providers and Admin / Auth providers draw the same table: a row per provider with Provider, Server and Status.
 // Only the row's action differs: Test and a gear for the connection there, a sign-in toggle here.
 const PROVIDER_COLUMNS: { key: string; label: string }[] = [{ key: "provider", label: "Provider" }, { key: "server", label: "Server" }, { key: "status", label: "Status" }];
-const PROVIDER_ICONS: Record<string, string> = { github: "https://github.com/github.png?size=64", forgejo: "https://forgejo.org/favicon.svg", gitea: "https://github.com/go-gitea.png?size=64", bitbucket: "/providers/bitbucket.svg", bitbucketdc: "/providers/bitbucket.svg", azure: "/providers/azure-devops.svg", microsoft: "/providers/microsoft.svg" };
+const PROVIDER_ICONS: Record<string, string> = { github: "https://github.com/github.png?size=64", forgejo: "https://forgejo.org/favicon.svg", gitea: "https://github.com/go-gitea.png?size=64", bitbucket: "/providers/bitbucket.svg", bitbucketdc: "/providers/bitbucket.svg", gitlab: "/providers/gitlab.svg", azure: "/providers/azure-devops.svg", microsoft: "/providers/microsoft.svg" };
 const providerUrl = (id: string) => (id === "github" ? "https://github.com" : FORGES[id].url);
 // `as` overrides what the row shows (the Auth providers page draws Azure DevOps' sign-in as Microsoft Entra ID).
 function providerRow(id: string, status: CellObject, extra: Pick<Row, "actions" | "settings" | "toggle" | "toggleDisabled">, as: { label?: string; url?: string; icon?: string } = {}): Row {
@@ -606,7 +607,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             title: `Sign in with ${spec.label}`,
             fields: [
               ...(spec.pb === "microsoft" ? ([{ key: "tenant", label: "Tenant", type: "text", placeholder: "contoso.onmicrosoft.com or tenant ID", hint: "One directory: invites match its users by email." }] satisfies Field[]) : []),
-              { key: "clientId", label: spec.pb === "bitbucket" ? "Key" : spec.pb === "microsoft" ? "Application (client) ID" : "Client ID", type: "text", link: { label: spec.pb === "bitbucket" ? "OAuth consumers" : spec.pb === "microsoft" ? "App registrations" : "Create OAuth app", url: OAUTH_APP_LINKS[spec.pb] || `${url}/user/settings/applications` } },
+              { key: "clientId", label: spec.pb === "bitbucket" ? "Key" : spec.pb === "microsoft" ? "Application (client) ID" : "Client ID", type: "text", link: { label: spec.pb === "bitbucket" ? "OAuth consumers" : spec.pb === "microsoft" ? "App registrations" : "Create OAuth app", url: OAUTH_APP_LINKS[spec.pb] || (spec.pb === "gitlab" ? `${url}/-/user_settings/applications` : `${url}/user/settings/applications`) } },
               { key: "clientSecret", label: spec.pb === "bitbucket" ? "Secret" : "Client secret", type: "password", placeholder: current.clientId ? "Saved" : "", hint: current.clientId ? "Leave blank to keep the stored secret." : "" },
               { key: "callback", label: spec.pb === "microsoft" ? "Redirect URI" : "Callback URL", type: "readonly" },
             ],

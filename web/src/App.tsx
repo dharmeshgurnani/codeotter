@@ -103,12 +103,12 @@ export default function App() {
 
   const reviewUrl = (url: string) => `/review?pr=${encodeURIComponent(url)}`;
   useEffect(() => {
-    if (["/settings/forgejo", "/settings/gitea", "/settings/bitbucket", "/settings/azure"].includes(path)) go("/settings/git", true);
+    if (["/settings/forgejo", "/settings/gitea", "/settings/bitbucket", "/settings/azure", "/settings/gitlab"].includes(path)) go("/settings/git", true);
   }, [path]);
   const settingsPage = path.startsWith("/settings/") ? path.slice("/settings/".length) : "";
   // /repo/owner/name -> reviews for that repo, /repo/owner/name/open -> its open pull requests (Azure: /repo/azure~org/project/repo)
   const repoParts = path.startsWith("/repo/") ? path.slice("/repo/".length).split("/") : [];
-  const repoLen = repoSegments(repoParts[0] ?? "");
+  const repoLen = repoSegments(repoParts[0] ?? "", repoParts, board?.repos ?? []);
   const repoPage = repoParts.slice(0, repoLen).join("/");
   const repoView = repoParts[repoLen] === "open" ? "open" : repoParts[repoLen] === "settings" ? "settings" : "reviews";
   const repoViewTitle = repoView === "open" ? "Open pull requests" : repoView === "settings" ? "Repository settings" : "Reviews";

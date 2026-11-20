@@ -209,7 +209,7 @@ export async function handleWebhook(src: string, h: HookHeaders, body: Buffer): 
 async function routeWebhook(src: string, event: string, x: GitHubPayload | null) {
   if (event === "ping") return;
   if (event === "installation" || event === "installation_repositories") { forgetGithubRepos(); return; }
-  // Bitbucket and Azure DevOps payloads have their own shapes; their adapter turns them into a PR or a comment.
+  // Bitbucket, Azure DevOps and GitLab payloads have their own shapes; their adapter turns them into a PR or a comment.
   const routed = FORGE_API[src]?.route?.(event, x);
   if (FORGE_API[src]?.route) {
     if (!routed || !REPO_RE.test(routed.repo) || !(await repos()).includes(routed.repo)) return;
