@@ -42,6 +42,9 @@ function load({ forgePermission = "write", forgeStatus = 0, toolFails = false } 
     runPrTool: async (url: string, id: string, opts: unknown) => { calls.push(["tool", url, id, opts]); if (toolFails) throw new Error("model said no"); return {}; },
     createPrComment: async (url: string, _repo: string, n: number, body: string) => { calls.push(["comment", url, n, body]); },
     fixFindings: async (url: string, repo: string, arg: string) => { calls.push(["fix", url, repo, arg]); return "posted 1 suggestion checked against `abc1234`. Nothing was pushed."; },
+    audit: async () => {},
+    orgOfRepo: (r: string) => r.split("/")[0],
+    withActor: (_actor: unknown, fn: () => unknown) => fn(),
   };
   const names = Object.keys(stubs);
   const api = new Function(...names, `${block}; return { parseCommand, commentPrNumber, commenterTrusted, commentsSince, runCommand };`)(...names.map((n) => stubs[n])) as Commands;

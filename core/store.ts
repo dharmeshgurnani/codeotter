@@ -90,6 +90,16 @@ export interface PbStore extends BaseStore {
   setOAuth(oauth2: OAuthConfig): Promise<unknown>;
 }
 export type Store = PbStore;
+// Audit log entries (core/audit.ts writes them): append-only, newest first when listed, trimmed by count and age.
+export interface AuditEntry { at: string; actor: string; actorName: string; action: string; target: string; org: string; detail: Record<string, unknown> }
+// `org` lists that organization's entries plus instance-wide ones (org "").
+export interface AuditQuery { action?: string; actor?: string; org?: string; page: number; perPage: number }
+export interface AuditStore {
+  add(e: AuditEntry): Promise<void>;
+  list(q: AuditQuery): Promise<{ items: AuditEntry[]; total: number }>;
+  // Keeps the newest `max` entries at or after `before` (ISO time); returns how many were dropped.
+  trim(max: number, before: string): Promise<number>;
+}
 
 // Store: PocketBase when PB_URL is set (the Docker image sets it, or auto-detected locally), plain JSON files in scores/ otherwise.
 function findPocketBase() {
@@ -365,5 +375,61 @@ const pbStore: PbStore = {
     await pb(hit ? `collections/settings/records/${hit.id}` : "collections/settings/records", { method: hit ? "PATCH" : "POST", body: JSON.stringify({ key, value }) });
   }),
 };
+// <audit-store>
+const isAuditEntry = (x: unknown): x is AuditEntry => isObj(x) && ["at", "actor", "actorName", "action", "target", "org"].every((k) => typeof x[k] === "string") && isObj(x.detail);
+const AUDIT = join(CODEOTTER_HOME, "audit.jsonl");
+let auditChain: Promise<unknown> = Promise.resolve();
+const withAuditLock = <T>(fn: () => Promise<T>): Promise<T> => { const run = auditChain.then(fn, fn); auditChain = run.catch(() => {}); return run; };
+const readAudit = (): AuditEntry[] => (existsSync(AUDIT) ? readFileSync(AUDIT, "utf8").split("\n") : []).flatMap((line) => { try { const e: unknown = line ? JSON.parse(line) : null; return isAuditEntry(e) ? [e] : []; } catch { return []; } });
+const auditMatch = (q: AuditQuery) => (e: AuditEntry) => (!q.action || e.action === q.action) && (!q.actor || e.actor === q.actor) && (!q.org || !e.org || e.org === q.org);
+const fileAudit: AuditStore = {
+  add: (e) => withAuditLock(async () => appendFileSync(AUDIT, `${JSON.stringify(e)}\n`)),
+  async list(q) {
+    const all = readAudit().filter(auditMatch(q)).reverse();
+    return { items: all.slice((q.page - 1) * q.perPage, q.page * q.perPage), total: all.length };
+  },
+  trim: (max, before) => withAuditLock(async () => {
+    const all = readAudit();
+    const keep = all.filter((e) => e.at >= before).slice(-max);
+    if (keep.length === all.length) return 0;
+    const tmp = `${AUDIT}.${process.pid}.tmp`;
+    writeFileSync(tmp, keep.map((e) => `${JSON.stringify(e)}\n`).join(""));
+    renameSync(tmp, AUDIT);
+    return all.length - keep.length;
+  }),
+};
+// A filter value never holds a quote or backslash (pbFilterEq refuses them); the joined filter is encoded once.
+const pbAuditFilter = (q: AuditQuery) => {
+  const parts = [q.action && ["action", q.action], q.actor && ["actor", q.actor]].filter((x): x is string[] => Array.isArray(x)).map(([k, v]) => decodeURIComponent(pbFilterEq(k, v)));
+  if (q.org) parts.push(`(${decodeURIComponent(pbFilterEq("org", q.org))} || org="")`);
+  return parts.length ? `&filter=${encodeURIComponent(parts.join(" && "))}` : "";
+};
+const pbAudit: AuditStore = {
+  add: async (e) => { await pb("collections/audit/records", { method: "POST", body: JSON.stringify(e) }); },
+  async list(q) {
+    const r = await pb(`collections/audit/records?perPage=${q.perPage}&page=${q.page}&sort=-at,-created${pbAuditFilter(q)}`);
+    const items = pbItems(r).flatMap((x): AuditEntry[] => (isAuditEntry(x) ? [{ at: x.at, actor: x.actor, actorName: x.actorName, action: x.action, target: x.target, org: x.org, detail: x.detail }] : []));
+    return { items, total: Number(isObj(r) && r.totalItems) || 0 };
+  },
+  async trim(max, before) {
+    let dropped = 0;
+    const drop = async (ids: unknown[]) => { for (const id of ids) { await pb(`collections/audit/records/${encodeURIComponent(String(id))}`, { method: "DELETE" }); dropped++; } };
+    // bounded: a trim never runs away; the next one continues
+    for (let i = 0; i < 50; i++) {
+      const old = pbItems(await pb(`collections/audit/records?perPage=200&fields=id&filter=${encodeURIComponent(`at<"${before.replace(/["\\]/g, "")}"`)}`));
+      if (!old.length) break;
+      await drop(old.map((x) => x.id));
+    }
+    for (let i = 0; i < 50; i++) {
+      const r = await pb("collections/audit/records?perPage=1&fields=id");
+      const total = Number(isObj(r) && r.totalItems) || 0;
+      if (total <= max) break;
+      await drop(pbItems(await pb(`collections/audit/records?perPage=${Math.min(200, total - max)}&sort=at,created&fields=id`)).map((x) => x.id));
+    }
+    return dropped;
+  },
+};
+export const auditStore: AuditStore = PB_URL ? pbAudit : fileAudit;
+// </audit-store>
 // Typed as the full store: the file store lacks the PocketBase-only methods, which callers reach only when PB_URL is set.
 export const store: Store = PB_URL ? pbStore : (fileStore as Store);

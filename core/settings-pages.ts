@@ -13,6 +13,7 @@ import { actionSecret, describeDelivery, forwarderStatus, LOCAL_APP_URL, reposCh
 import { repoOf } from "./views.ts";
 import { clearTicketCache, jiraBase, LINEAR_API, testJira, testLinear, trackerKeys, trackerSettings } from "./trackers.ts";
 import { accessQueue, allowed, effectiveRole, emailDomainAllowed, isEmailDomain, isRole, onboardedRepo, ROLES, SSO_PB, userView } from "./access.ts";
+import { auditPage, auditRepos } from "./audit.ts";
 import type { Access, Role, SessionUser } from "./access.ts";
 import type { Cell, CellObject, Tone } from "./views.ts";
 import type { OAuthProviderConfig, SsoSetting } from "./store.ts";
@@ -63,7 +64,8 @@ export interface SettingsPage {
   title: string;
   group: SettingsGroup;
   access: Access;
-  load(scope?: PageScope, user?: SessionUser | null): Promise<PageData>;
+  // `view`: the body just posted (a page whose Apply only changes what it shows, e.g. the audit log's filter).
+  load(scope?: PageScope, user?: SessionUser | null, view?: Body): Promise<PageData>;
   save(body: Body, scope?: PageScope): Promise<void>;
   test?(): Promise<{ ok: boolean; reply: string; ms?: number }>;
   actions?: Record<string, PageAction>;
@@ -329,6 +331,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
       }
       const before = await repos();
       await store.setSetting("repos", next);
+      await auditRepos(before, next);
       reposChanged(before, next).catch((e) => console.warn(`[repos] ${e.message}`));
       const [guides, repoSettings] = await Promise.all([
         store.getSetting("guides").then((x) => ({ ...(x || {}) })),
@@ -998,6 +1001,7 @@ const accountsPage: SettingsPage & { invite(v: Body): Promise<void> } = {
   },
 };
 SETTINGS_PAGES.accounts = accountsPage;
+SETTINGS_PAGES.audit = auditPage;
 // Local models page: what is downloaded, what is available, one action per row. Nothing downloads by itself.
 // What a running sidecar reports as its device, as GPU or CPU: laya and llama.cpp say vulkan:N / VulkanN / cuda /
 // metal, the Python sidecar cuda or cpu.

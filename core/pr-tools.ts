@@ -11,6 +11,7 @@ import { CATCH_UP_EVERY, HANDLED_COMMENTS, lastCatchUp, remember, webhookHealthy
 import { repoOf } from "./views.ts";
 import { fixFindings } from "./fix.ts";
 import type { ForgeComment, ThreadComment } from "./forges.ts";
+import { audit, orgOfRepo, withActor } from "./audit.ts";
 import type { Guide, PullRequest, ReviewSettings } from "./context.ts";
 import type { Finding } from "./engines.ts";
 import type { LlmConfig } from "./models.ts";
@@ -261,16 +262,21 @@ export async function runCommand(repo: string, c: PrComment, { cmd, arg }: PrCom
   const id = Number(c.id);
   if (isForgeRepo(repo)) await Promise.resolve().then(() => forgeOf(repo).react(repo, c as ForgeComment)).catch(() => {});
   else if (Number.isSafeInteger(id) && id > 0) await ghAsApp(repo, "api", "--method", "POST", `repos/${repo}/issues/comments/${id}/reactions`, "-f", "content=eyes").catch(() => {});
+  const login = String(c.user?.login || "unknown");
+  const actor = { id: `comment:${login}`, name: login };
+  await audit(actor, "command.run", prUrl, { command: `/${cmd}` }, orgOfRepo(repo));
   try {
-    if (cmd === "review") {
-      await syncPrComments(await score(prUrl, true, repo), repo, { postScores: true, postReview: true });
-    } else if (cmd === "fix") {
-      // suggestions only: nothing is pushed to the branch
-      await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/fix${arg ? ` ${oneLine(arg, 20)}` : ""}\`: ${await fixFindings(prUrl, repo, arg)}`);
-    } else {
-      await runPrTool(prUrl, cmd, { question: arg });
-      await runPrTool(prUrl, cmd, { action: "comment" });
-    }
+    await withActor(actor, async () => {
+      if (cmd === "review") {
+        await syncPrComments(await score(prUrl, true, repo), repo, { postScores: true, postReview: true });
+      } else if (cmd === "fix") {
+        // suggestions only: nothing is pushed to the branch
+        await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/fix${arg ? ` ${oneLine(arg, 20)}` : ""}\`: ${await fixFindings(prUrl, repo, arg)}`);
+      } else {
+        await runPrTool(prUrl, cmd, { question: arg });
+        await runPrTool(prUrl, cmd, { action: "comment" });
+      }
+    });
   } catch (e) {
     await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/${cmd}\` failed: ${oneLine((e as Error).message, 500)}`).catch(() => {});
     throw e;
@@ -330,7 +336,11 @@ export async function answerReplies(repo: string, number: number, commentId = ""
     if (!remember(HANDLED_COMMENTS, `${repo}#reply:${last.id}`)) continue;
     const asComment: PrComment = { id: last.id, body: last.body, created_at: last.created_at, prNumber: number, author_association: last.author_association, user: last.user };
     if (!(await commenterTrusted(repo, asComment).catch(() => false))) continue;
-    await answerThread(repo, number, t);
+    // audited like a comment command: who replied, and whether the reply saved a team learning
+    const login = String(last.user.login || "unknown");
+    const actor = { id: `comment:${login}`, name: login };
+    await audit(actor, "command.run", prUrlFor(repo, number), { command: REMEMBER_RE.test(plain(last.body, 2000)) ? "@codeotter remember" : "reply", thread: String(root.id) }, orgOfRepo(repo));
+    await withActor(actor, () => answerThread(repo, number, t));
     answered++;
   }
   return answered;

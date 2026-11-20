@@ -19,6 +19,7 @@ import { homeData, renderScore, repoOf } from "../views.ts";
 import { analyticsData, periodOf, recordOutcome } from "../analytics.ts";
 import { settingsPages } from "../settings-pages.ts";
 import { assertRepo, checkRepoScope, requestOrg, seesAll, visibleRepos } from "../access.ts";
+import { audit, orgOfRepo } from "../audit.ts";
 import { gate, jsonBody } from "./middleware.ts";
 import type { Env } from "./middleware.ts";
 
@@ -122,7 +123,9 @@ reviews.post("/tools", review, async (c) => {
   if (!validPrUrl(prUrl)) throw new Error("Invalid pull request URL");
   checkRepoScope(repoOf({ url: prUrl }), requestOrg(c.req.query("org")));
   await assertRepo(c.get("viewer"), repoOf({ url: prUrl }));
-  return c.json(await runPrTool(prUrl, String(body.tool || ""), { question: typeof body.question === "string" ? body.question : undefined, action: String(body.action || "run") }));
+  const result = await runPrTool(prUrl, String(body.tool || ""), { question: typeof body.question === "string" ? body.question : undefined, action: String(body.action || "run") });
+  if (body.action === "apply") await audit(null, "pr-tool.run", prUrl, { tool: String(body.tool), action: "apply" }, orgOfRepo(repoOf({ url: prUrl })));
+  return c.json(result);
 });
 
 reviews.post("/review-suggestions", review, async (c) => {
@@ -175,6 +178,7 @@ reviews.post("/review-suggestions", review, async (c) => {
     findingIdx: body.findingIdx !== undefined && body.findingIdx !== null ? Number(body.findingIdx) : null,
   });
   if (resInfo.posted > 0) await recordOutcome("posted", prUrl, repo, resInfo.posted);
+  if (resInfo.posted > 0) await audit(null, "review.post", prUrl, { posted: [`inline suggestions (${resInfo.posted})`] }, orgOfRepo(repo));
   if (stored && resInfo.posted > 0) {
     const tag = resInfo.comments[0]
       ? `inline suggestion (${resInfo.comments[0].path}:L${resInfo.comments[0].line})`

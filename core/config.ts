@@ -18,6 +18,9 @@ if (existsSync(ENV_FILE) && typeof process.loadEnvFile === "function") {
 }
 
 export const PORT = process.env.PORT || 4747;
+// Audit log retention: the newest AUDIT_MAX entries, none older than AUDIT_DAYS.
+export const AUDIT_MAX = Math.max(100, Number(process.env.CODEOTTER_AUDIT_MAX) || 10000);
+export const AUDIT_DAYS = Math.max(1, Number(process.env.CODEOTTER_AUDIT_DAYS) || 180);
 // Public address of this app, used for the OAuth callback. Set APP_URL when deployed behind a domain.
 // Render and Railway publish the service's own address, so one-click deploys work without setting it.
 export const APP_URL = (process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || (process.env.RAILWAY_PUBLIC_DOMAIN && `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`) || `http://localhost:${PORT}`).replace(/\/+$/, "");

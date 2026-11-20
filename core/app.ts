@@ -9,6 +9,7 @@ import { onboarding } from "./routes/onboarding.ts";
 import { settings } from "./routes/settings.ts";
 import { auth } from "./routes/auth.ts";
 import { site } from "./routes/site.ts";
+import { auditRoutes } from "./routes/audit.ts";
 
 export const app = new Hono();
 
@@ -20,6 +21,7 @@ app.route("/webhooks", webhooks);
 app.route("/api", reviews);
 app.route("/api/onboarding", onboarding);
 app.route("/api/settings", settings);
+app.route("/api/audit", auditRoutes);
 app.route("/", auth);
 app.route("/", site);
 

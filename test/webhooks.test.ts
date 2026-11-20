@@ -63,6 +63,8 @@ function load({ scoreFails = false, repos = ["acme/app", "gitea~acme/lib", "bitb
     spawn: () => { throw new Error("no spawn in tests"); },
     fetch: async () => { throw new Error("no network in tests"); },
     createGitHubAppJwt: () => "jwt",
+    AUTO: { id: "auto", name: "auto" },
+    withActor: (_actor: unknown, fn: () => unknown) => fn(),
     forgetGithubRepos: () => {},
     store: { getSetting: async (k: string) => settings.get(k) ?? null, setSetting: async (k: string, v: unknown) => { settings.set(k, v); } },
     triageConfig: async () => ({ auto: false, ...(settings.get("triage") || {}) }),

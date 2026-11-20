@@ -82,6 +82,10 @@ function load({ ghComments = [] as Row[], giteaReviews = {} as Record<number, Ro
     },
     // replies are writes: posted as the GitHub App bot where installed (git.ts falls back to the operator)
     ghAsApp: async (repo: string, ...args: string[]) => { calls.push(["gh", ...args]); calls.push(["as-app", repo]); return "{}"; },
+    audit: async (actor: { id: string }, action: string, target: string, detail: { command?: string }) => { calls.push(["audit", actor.id, action, target, detail.command]); },
+    orgOfRepo: (r: string) => r.split("/")[0],
+    withActor: (_actor: unknown, fn: () => unknown) => fn(),
+    prUrlFor: (repo: string, n: number) => `https://github.com/${repo}/pull/${n}`,
   };
   const names = Object.keys(stubs);
   const api = new Function(...names, `${block}; return { handleWebhook, answerReplies, pending: () => PR_QUEUE.size || REPLY_QUEUE.size || prDraining };`)(...names.map((n) => stubs[n])) as Api;
@@ -109,6 +113,7 @@ const hook = (c: Row, action = "created") => ({ action, repository: { full_name:
   assert.deepStrictEqual(posts[0].slice(1, 5), ["api", "--method", "POST", "repos/acme/app/pulls/7/comments/100/replies"]);
   assert.match(String(posts[0][6]), /^body=<!-- codeotter:reply -->\nFair point/);
   assert.ok(api.calls.some((c) => c[0] === "as-app" && c[1] === "acme/app"), "the reply is posted as the GitHub App bot where installed");
+  assert.ok(api.calls.some((c) => c[0] === "audit" && c[2] === "command.run" && c[3] === "https://github.com/acme/app/pull/7" && c[4] === "reply"), "the reply is audited like a comment command");
   assert.match(api.prompts[0], /Tax is hard-coded/);
   assert.match(api.prompts[0], /return t \* 1\.15/, "the hunk");
   assert.match(api.prompts[0], /Latest reply from dev:\nThis is intentional/);
