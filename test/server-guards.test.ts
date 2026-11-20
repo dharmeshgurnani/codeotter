@@ -202,7 +202,7 @@ ctx.diagnostic("gate: bootstrap owner, 403 with login flag once an account exist
 const loadAsk = (reply: Reply): AskModel => {
   const fetch = async () => reply;
   const PROVIDERS = { openai: { label: "OpenAI" }, local_x: { noKey: true } };
-  return new Function("fetch", "PROVIDERS", "ensureSidecar", "withAbort", `${serverBlocks("ask-model")}; return askModel;`)(fetch, PROVIDERS, async () => 1, () => undefined) as AskModel;
+  return new Function("fetch", "PROVIDERS", "ensureSidecar", "withAbort", "addUsage", `${serverBlocks("ask-model")}; return askModel;`)(fetch, PROVIDERS, async () => 1, () => undefined, () => {}) as AskModel;
 };
 const jsonReply = (body: unknown, status = 200): Reply => ({ ok: status < 400, status, json: async () => body, text: async () => JSON.stringify(body) });
 const c = { provider: "openai", model: "gpt", apiKey: "k", baseUrl: "https://api.example.com/v1/" };

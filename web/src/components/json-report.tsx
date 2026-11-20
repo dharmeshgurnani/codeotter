@@ -1,16 +1,42 @@
 // One renderer for every read-only dashboard/report. The server sends sections; nothing here is page-specific.
-// Kinds: "stats" (cards: label, value, unit, hint, optional action), "table" (columns + rows, cells may link), "links".
+// Kinds: "stats" (cards: label, value, unit, hint, optional action), "table" (columns + rows, cells may link), "links",
+// "bars" (a labelled count series, drawn as plain SVG bars).
 import { CellView, DataTable, type Cell } from "@/components/data-table";
 
 export type { Cell } from "@/components/data-table";
 export type StatItem = { label: string; value: string | number; unit?: string; hint?: string; action?: { label: string; path: string } };
+export type BarItem = { label: string; value: number };
 export type ReportSection =
   | { id: string; kind: "stats"; title?: string; description?: string; items: StatItem[] }
   | { id: string; kind: "table"; title: string; description?: string; columns: string[]; rows: Cell[][]; empty?: string }
-  | { id: string; kind: "links"; title: string; description?: string; items: { label: string; hint?: string; path?: string; href?: string }[] };
+  | { id: string; kind: "links"; title: string; description?: string; items: { label: string; hint?: string; path?: string; href?: string }[] }
+  | { id: string; kind: "bars"; title: string; description?: string; items: BarItem[] };
 
 // Server JSON is trusted for shape but not for completeness: a missing list renders as empty, never as a crash.
 const list = <T,>(v: T[] | undefined | null): T[] => (Array.isArray(v) ? v : []);
+
+// Bars in a fixed-height SVG: one column per item, the value above each non-zero bar, about six axis labels.
+function Bars({ items }: { items: BarItem[] }) {
+  const n = Math.max(items.length, 1);
+  const max = Math.max(1, ...items.map((b) => (Number.isFinite(b.value) ? b.value : 0)));
+  const W = 100 / n;
+  const every = Math.max(1, Math.ceil(n / 6));
+  return (
+    <div className="rounded-[10px] border border-border px-4 pt-4 pb-2">
+      <svg role="img" aria-label={items.map((b) => `${b.label}: ${b.value}`).join(", ")} viewBox="0 0 100 40" preserveAspectRatio="none" className="h-40 w-full">
+        {items.map((b, i) => {
+          const h = (Math.max(0, Number(b.value) || 0) / max) * 36;
+          return <rect key={i} x={i * W + W * 0.15} y={40 - h} width={W * 0.7} height={h} rx={0.4} className="fill-brand"><title>{`${b.label}: ${b.value}`}</title></rect>;
+        })}
+      </svg>
+      <div className="mt-1 flex text-xs text-muted-foreground tabular-nums">
+        {items.map((b, i) => (
+          <span key={i} className="truncate text-center" style={{ width: `${W}%` }}>{i % every === 0 ? b.label : ""}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 const Heading = ({ s }: { s: ReportSection }) =>
   s.title ? (
@@ -66,6 +92,7 @@ export function JsonReport({ sections, go }: { sections: ReportSection[]; go: (p
               empty={s.empty ?? "Nothing yet."}
             />
           )}
+          {s.kind === "bars" && <Bars items={list(s.items)} />}
           {s.kind === "links" && (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {list(s.items).map((it, i) => (

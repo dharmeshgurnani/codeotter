@@ -72,6 +72,17 @@ test("http routes", async (ctx) => {
   ctx.diagnostic("gated routes answer the operator in file mode; ?org= is validated");
 
   {
+    // analytics events in file mode: one JSON line each in CODEOTTER_HOME/analytics.jsonl
+    const post = await app.request("/api/learnings?org=acme", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prUrl: "https://github.com/acme/api/pull/3", title: "noise" }) });
+    assert.equal(post.status, 200);
+    const [status, body] = await json(await app.request("/api/analytics?org=acme&days=7"));
+    assert.equal(status, 200);
+    const totals = (body.sections as { id: string; items?: { label: string; hint?: string }[] }[]).find((s) => s.id === "totals");
+    assert.equal(totals?.items?.find((i) => i.label === "Acceptance rate")?.hint, "0 applied · 0 posted · 1 dismissed");
+  }
+  ctx.diagnostic("analytics reads events from the JSON-file store");
+
+  {
     const res = await app.request("/api/hf-avatar?owner=qwen");
     assert.equal(res.status, 302);
     assert.match(res.headers.get("location") ?? "", /cdn-avatars\.huggingface\.co/);

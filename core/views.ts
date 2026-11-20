@@ -9,7 +9,7 @@ import type { Viewer } from "./access.ts";
 import type { ReviewRecord } from "./review.ts";
 import type { Finding } from "./engines.ts";
 
-// Report JSON drawn by web/src/components/json-report.tsx; cells are web/src/components/data-table.tsx's Cell.
+// Report JSON drawn by web/src/components/json-report.tsx (kinds: stats, table, links, bars); cells are web/src/components/data-table.tsx's Cell.
 export type Tone = "ok" | "muted" | "warn" | "bad" | "info" | "accent";
 export type CellObject = { text: string; icon?: string; tone?: Tone; mono?: boolean; info?: string; progress?: number; path?: string; href?: string };
 export type Cell = string | number | CellObject;
@@ -18,7 +18,8 @@ export type LinkItem = { label: string; hint?: string; path?: string; href?: str
 export type ReportSection =
   | { id: string; kind: "stats"; title?: string; description?: string; items: StatItem[] }
   | { id: string; kind: "table"; title: string; description?: string; columns: string[]; rows: Cell[][]; empty?: string }
-  | { id: string; kind: "links"; title: string; description?: string; items: LinkItem[] };
+  | { id: string; kind: "links"; title: string; description?: string; items: LinkItem[] }
+  | { id: string; kind: "bars"; title: string; description?: string; items: { label: string; value: number }[] };
 type Blast = ReviewRecord["blast"];
 
 const ESC: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
