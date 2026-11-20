@@ -9,6 +9,7 @@ import { deriveSuggestionFromDetail, reflectFindings } from "./engines.ts";
 import { postInlineSuggestionsOnPr, resolvePr, score, syncPrComments } from "./review.ts";
 import { CATCH_UP_EVERY, HANDLED_COMMENTS, lastCatchUp, remember, webhookHealthy } from "./queue.ts";
 import { repoOf } from "./views.ts";
+import { fixFindings } from "./fix.ts";
 import type { ForgeComment } from "./forges.ts";
 import type { Guide, PullRequest, ReviewSettings } from "./context.ts";
 import type { Finding } from "./engines.ts";
@@ -234,10 +235,10 @@ export async function runPrTool(prUrl: string, id: string, { question = "", acti
 // </pr-tools>
 
 // <pr-commands>
-// PR comment commands: a comment whose first line is /review, /describe, /improve, /docs, /changelog or /ask <question>
-// runs that action and replies on the pull request. Off unless enabled in Settings, and only the repository's owner,
+// PR comment commands: a comment whose first line is /review, /describe, /improve, /docs, /changelog, /ask <question> or
+// /fix [n] runs that action and replies on the pull request. Off unless enabled in Settings, and only the repository's owner,
 // members and collaborators can trigger one: anyone can comment on a public repository and spend its model budget.
-const COMMANDS = ["review", "describe", "improve", "ask", "docs", "changelog"];
+const COMMANDS = ["review", "describe", "improve", "ask", "docs", "changelog", "fix"];
 export function parseCommand(body: unknown): PrCommand | null {
   const m = String(body || "").trimStart().split("\n")[0].trim().match(/^\/([a-z]+)(?:\s+(.*))?$/i);
   if (!m || !COMMANDS.includes(m[1].toLowerCase())) return null;
@@ -263,6 +264,9 @@ export async function runCommand(repo: string, c: PrComment, { cmd, arg }: PrCom
   try {
     if (cmd === "review") {
       await syncPrComments(await score(prUrl, true, repo), repo, { postScores: true, postReview: true });
+    } else if (cmd === "fix") {
+      // suggestions only: nothing is pushed to the branch
+      await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/fix${arg ? ` ${oneLine(arg, 20)}` : ""}\`: ${await fixFindings(prUrl, repo, arg)}`);
     } else {
       await runPrTool(prUrl, cmd, { question: arg });
       await runPrTool(prUrl, cmd, { action: "comment" });

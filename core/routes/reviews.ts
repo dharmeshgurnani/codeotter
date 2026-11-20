@@ -13,6 +13,8 @@ import type { Severity } from "../engines.ts";
 import type { InlineTarget } from "../review.ts";
 import { activeReviews, postInlineSuggestionsOnPr, resolvePr, score, startOrPollReview, triagePr } from "../review.ts";
 import { PR_TOOLS, runPrTool } from "../pr-tools.ts";
+import { reviewPrompts } from "../fix.ts";
+import type { ReviewRecord } from "../review.ts";
 import { homeData, renderScore, repoOf } from "../views.ts";
 import { settingsPages } from "../settings-pages.ts";
 import { assertRepo, checkRepoScope, requestOrg, seesAll, visibleRepos } from "../access.ts";
@@ -207,8 +209,10 @@ export async function scoreResult(c: Context<Env>) {
   const resolved = await resolvePr(ref, repo);
   checkRepoScope(parsed(resolved.urlGuess).repo, requestOrg(c.req.query("org")));
   await assertRepo(c.get("viewer"), parsed(resolved.urlGuess).repo);
-  if (c.req.path === "/api/score" && c.req.query("async") !== undefined) return c.json(await startOrPollReview(ref, force, repo, c.req.query("part") || ""));
+  // the review page's "Copy fix prompt" actions read agentPrompts
+  const withPrompts = (r: ReviewRecord) => ({ ...r, agentPrompts: reviewPrompts(r, parsed(resolved.urlGuess).repo) });
+  if (c.req.path === "/api/score" && c.req.query("async") !== undefined) return c.json(withPrompts(await startOrPollReview(ref, force, repo, c.req.query("part") || "")));
   const result = await score(ref, force, repo);
-  return c.req.path === "/api/score" ? c.json(result) : c.html(renderScore(result));
+  return c.req.path === "/api/score" ? c.json(withPrompts(result)) : c.html(renderScore(result));
 }
 reviews.get("/score", review, scoreResult);

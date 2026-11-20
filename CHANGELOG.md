@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Fix with AI.** Each finding, and the review as a whole, has a self-contained prompt for a coding agent (Claude Code, Codex, Cursor, Copilot agent): repository, PR, branch, `file:line`, the finding, its diff hunk, the suggested fix and the repository's AGENTS.md/CLAUDE.md. The review page has **Copy fix prompt** per finding and **Copy prompt for all**; posted review summaries and inline findings carry it in a collapsed "Prompt for AI agents" block (Repository settings → **Prompt for AI agents**, on by default). New comment command **`/fix`** (or `/fix <n>` for one finding of the posted review): the language model writes a patch for the open findings, each hunk is checked against the PR head in memory, and the ones that apply are posted as committable suggestions. Nothing is pushed to the branch. Inline suggestions now keep the indentation of their first line.
 - **TypeScript.** `core/`, `tui/`, `bin/`, `test/` and `web/scripts/` are strict TypeScript (`.ts`), run directly by Node's type stripping, with no build step. Node 22.18 or later is required. `pnpm start` runs `node core/server.ts`, and `codeotter` is `tui/codeotter.ts`. `pnpm typecheck` (strict, no `any`) runs in CI and before `pnpm test`. Malformed API request fields are treated as empty instead of failing with a TypeError. PocketBase migrations stay JavaScript.
 ## 0.7.0 (2026-11-08)
 

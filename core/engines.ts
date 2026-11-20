@@ -20,6 +20,7 @@ export interface Finding {
   suggestion?: string;
   dismissed?: boolean;
   confidence?: number; // 0..1, from reflection or System One
+  hunk?: string; // the diff hunk at the finding, attached when the review is stored (for agent prompts)
 }
 export type Verdict = "approve" | "comment" | "request_changes";
 export interface Gate { id: string; label: string; yes: number; pass: boolean; }
@@ -357,9 +358,11 @@ export function deriveSuggestionFromDetail(raw: unknown, diff = ""): Finding {
   // 2. Determine replacement suggestion snippet (without markdown backticks)
   let suggestion = "";
   if (typeof f?.suggestion === "string" && f.suggestion.trim()) {
+    // leading blank lines and trailing space go; the first line keeps its indentation (the suggestion is committed as is)
     suggestion = f.suggestion
-      .trim()
-      .replace(/^```(?:suggestion|[a-zA-Z0-9_-]*)\r?\n?/i, "")
+      .replace(/^(?:[ \t]*\r?\n)+/, "")
+      .trimEnd()
+      .replace(/^[ \t]*```(?:suggestion|[a-zA-Z0-9_-]*)\r?\n?/i, "")
       .replace(/\r?\n?```$/i, "")
       .replace(/\r?\n$/, "");
   }

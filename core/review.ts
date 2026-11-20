@@ -8,6 +8,7 @@ import { acceptedSuggestions, blastRadius, dynamicContextFiles, extendDiffContex
 import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, getRepoAccepted, getRepoLearnings, guideFor, headFileTexts, REVIEW_DEFAULTS, reviewConfig, shaMatch } from "./context.ts";
 import { changeDigest, deriveSuggestionFromDetail, judge, S1_SCORES, scoreWithSystemOne, verifyFindingsWithSystemOne } from "./engines.ts";
 import { formatReviewComment, formatScoresComment } from "./comments.ts";
+import { findingPrompt, hunkAt, promptDetails } from "./fix.ts";
 import { repoOf } from "./views.ts";
 import type { BlastRadius, DiffContextStats, OutsideImpact } from "./diff.ts";
 import type { GitHistory, LinkedIssue, PullRequest } from "./context.ts";
@@ -54,7 +55,7 @@ interface TriageBase { url: string; repo: string; number: number; title: string;
 export interface TriageResult extends TriageBase { risk: number; blast: number; verdict: "attention" | "ok"; stopAt: number; model: string; seconds: number; }
 export type TriageEntry = TriageResult | (TriageBase & { error: string });
 // What posting inline suggestions needs: a pull request and its findings (stored or freshly normalised).
-export interface InlineTarget { pr: Pick<PullRequest, "url" | "number"> & Partial<PullRequest>; review?: { findings?: Finding[] }; headSha?: string; gitHistory?: Pick<GitHistory, "prCommits">; }
+export interface InlineTarget { pr: Pick<PullRequest, "url" | "number"> & Partial<PullRequest>; review?: { findings?: Finding[] }; headSha?: string; gitHistory?: Pick<GitHistory, "prCommits">; guide?: string | null; }
 // syncPrComments gets a full review, or only { pr } when it posts triage or tool comments.
 export type CommentTarget = InlineTarget & Partial<Omit<ReviewRecord, "review" | "pr">> & { review?: Partial<ReviewBody> };
 export interface InlineComment { path: string; line: number; startLine?: number; side: "RIGHT"; body: string; finding: Finding; }
@@ -441,6 +442,8 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
       } else if (!hasValidScores(review?.scores) && hasValidScores(initialScores)) {
         review = { ...review, scores: initialScores };
       }
+      // the code each finding points at, kept for the "Fix with AI" prompts
+      if (review?.findings?.length) review = { ...review, findings: review.findings.map((f) => (f.hunk || !f.file ? f : { ...f, hunk: hunkAt(diff, f.file, f.line) || undefined })) };
       const finalGates = typed?.gates || (live.gates?.length ? live.gates : cached?.gates) || [];
       let finalIncremental = cached?.incremental;
       if (incrementalCtx) {
@@ -505,8 +508,10 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
   return live;
 }
 
-export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r.pr), { findingIdx = null }: { findingIdx?: number | string | null } = {}): Promise<InlineResult> {
+export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r.pr), { findingIdx = null, agentPrompts }: { findingIdx?: number | string | null; agentPrompts?: boolean } = {}): Promise<InlineResult> {
   if (!r?.pr?.number || !repo || !REPO_RE.test(repo)) throw new Error("Invalid PR or repository");
+  // the repository's "Prompt for AI agents" setting unless the caller decides (/fix posts fixes, not findings)
+  const withPrompts = agentPrompts ?? (await reviewConfig(repo)).agentPrompts;
   const allFindings = Array.isArray(r.review?.findings) ? r.review.findings : [];
   const candidates =
     findingIdx !== null && findingIdx !== undefined
@@ -544,6 +549,7 @@ export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r
               "```",
             ]
           : []),
+        ...(withPrompts ? ["", promptDetails(findingPrompt({ repo, pr: r.pr, guide: r.guide }, { ...f, hunk: rawF.hunk }))] : []),
       ];
       return {
         path: f.file,
@@ -669,6 +675,7 @@ export async function syncPrComments(r: CommentTarget, repo = repoOf(r.pr), { po
   };
 
   const posted: string[] = [];
+  const agentPrompts = postReview || postInlineSuggestions ? (await reviewConfig(repo)).agentPrompts : false;
   if (triage) posted.push(await upsert("<!-- codeotter:triage -->", formatTriageComment(triage), "triage"));
   for (const [marker, body, label] of extra) posted.push(await upsert(marker, body, label));
   if (postScores) {
@@ -680,14 +687,14 @@ export async function syncPrComments(r: CommentTarget, repo = repoOf(r.pr), { po
   }
   if (postReview) {
     try {
-      posted.push(await upsert("<!-- codeotter:review -->", formatReviewComment(r as ReviewRecord), "review")); // likewise postReview
+      posted.push(await upsert("<!-- codeotter:review -->", formatReviewComment(r as ReviewRecord, { agentPrompts, repo }), "review")); // likewise postReview
     } catch (e) {
       r.commentError = [r.commentError, (e as Error).message].filter(Boolean).join("; ");
     }
   }
   if (postInlineSuggestions) {
     try {
-      const inlineRes = await postInlineSuggestionsOnPr(r, repo);
+      const inlineRes = await postInlineSuggestionsOnPr(r, repo, { agentPrompts });
       if (inlineRes.posted > 0) posted.push(`inline suggestions (${inlineRes.posted})`);
     } catch (e) {
       r.commentError = [r.commentError, (e as Error).message].filter(Boolean).join("; ");

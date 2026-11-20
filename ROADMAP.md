@@ -2,6 +2,7 @@
 
 | Status | Feature | Date |
 | :---: | :--- | :--- |
+| [x] | Fix with AI: a self-contained prompt per finding and for all findings (copy on the review page; collapsed "Prompt for AI agents" in posted comments, per-repository setting) and the `/fix [n]` comment command, which posts a model patch as committable suggestions only after it applies to the PR head; nothing is pushed | 2026-11-20 |
 | [x] | Backend in one module per subsystem; HTTP on Hono with one route module per area and route-level access middleware | 2026-11-07 |
 | [x] | Bitbucket Cloud, Bitbucket Data Center and Azure DevOps repositories (reviews, inline comments, statuses, PR tools, comment commands, webhooks / service hooks) alongside GitHub, Forgejo and Gitea; sign-in with Bitbucket and Microsoft Entra ID. Stub-tested; not yet run against live servers | 2026-11-07 |
 | [x] | Developer role, per-account repository access and invites (uninvited sign-ins refused) | 2026-10-13 |

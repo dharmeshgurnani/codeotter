@@ -28,6 +28,7 @@ export interface ReviewSettings {
   postInlineSuggestions: boolean;
   commands: boolean;
   auto: boolean;
+  agentPrompts: boolean; // a collapsed "Prompt for AI agents" block in posted review and inline comments
 }
 export interface Guide { file: string; text: string; }
 // Per-repository posting toggles older installs kept in "guides" / "repoSettings" before repoSettings[repo].review.
@@ -37,7 +38,7 @@ export interface BaseCommit { sha: string; message: string; author: string; }
 export interface GitHistory { prCommits: GitCommit[]; baseCommits: BaseCommit[]; formatted?: string; }
 export interface LinkedIssue { number: number; repo: string; title: string; body: string; state: string; url: string; labels: string[]; }
 
-export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: false, postReview: false, postInlineSuggestions: false, commands: false, auto: false };
+export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: false, postReview: false, postInlineSuggestions: false, commands: false, auto: false, agentPrompts: true };
 // Review settings are per repository (repoSettings[repo].review, from Repository settings). Repositories not yet saved
 // there fall back to the old install-wide "review" setting and the per-repository posting toggles kept in "guides".
 export const reviewConfig = async (repo = ""): Promise<ReviewSettings> => {
@@ -60,6 +61,7 @@ export const normalizeReview = (v: { [K in keyof ReviewSettings]?: unknown }): R
   postInlineSuggestions: !!v.postInlineSuggestions,
   auto: !!v.auto,
   commands: !!v.commands,
+  agentPrompts: v.agentPrompts === undefined ? REVIEW_DEFAULTS.agentPrompts : !!v.agentPrompts,
 });
 
 // Repository review guides: AGENTS.md and/or CLAUDE.md at the repo root (both are used when both exist, since one is

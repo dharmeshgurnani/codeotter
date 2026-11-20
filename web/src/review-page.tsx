@@ -775,9 +775,19 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                 <Badge tone="accent">{activeLearnings.length} persistent rule{activeLearnings.length === 1 ? "" : "s"}</Badge>
               )}
             </div>
-            <a href="/settings/repos" className="text-xs font-medium text-brand hover:underline">
-              Manage rules in Settings →
-            </a>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                disabled={!r.agentPrompts?.all}
+                onClick={() => handleCopySuggestion("prompt:all", r.agentPrompts!.all)}
+                className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2.5 py-1 text-xs font-medium text-neutral-800 hover:bg-accent disabled:opacity-50"
+              >
+                <span>{copiedFixKey === "prompt:all" ? "✓ Copied prompt" : "Copy prompt for all"}</span>
+              </button>
+              <a href="/settings/repos" className="text-xs font-medium text-brand hover:underline">
+                Manage rules in Settings →
+              </a>
+            </div>
           </div>
 
           {learningNotice && (
@@ -795,6 +805,7 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                 const postingSug = postingSuggestionKey === fKey;
                 const postedSug = !!postedSuggestionKeys[fKey];
                 const copiedFix = copiedFixKey === fKey;
+                const fixPrompt = r.agentPrompts?.findings?.[idx] || "";
                 const sevTone = f.severity === "high" ? "bad" : f.severity === "medium" ? "warn" : f.severity === "low" ? "info" : "muted";
                 return (
                   <li key={fKey} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-4 py-2.5 text-sm">
@@ -823,6 +834,14 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                       )}
                     </div>
                     <div className="shrink-0 flex flex-wrap items-center gap-1.5">
+                      <button
+                        type="button"
+                        disabled={!fixPrompt}
+                        onClick={() => handleCopySuggestion(`prompt:${fKey}`, fixPrompt)}
+                        className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2.5 py-1 text-xs font-medium text-neutral-800 hover:bg-accent disabled:opacity-50"
+                      >
+                        <span>{copiedFixKey === `prompt:${fKey}` ? "✓ Copied prompt" : "Copy fix prompt"}</span>
+                      </button>
                       {f.suggestion && (
                         <button
                           type="button"

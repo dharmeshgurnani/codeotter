@@ -2,14 +2,15 @@
 import { APP_URL } from "./config.ts";
 import { HOTSPOTS } from "./diff.ts";
 import { deriveSuggestionFromDetail, S1_SCORES } from "./engines.ts";
-import { effort, VERDICT } from "./views.ts";
+import { allFindingsPrompt, promptDetails } from "./fix.ts";
+import { effort, repoOf, VERDICT } from "./views.ts";
 import type { BlastRadius, ChangedFile, OutsideImpact } from "./diff.ts";
 import type { ScoreKey } from "./engines.ts";
 import type { ReviewBody, ReviewRecord } from "./review.ts";
 
 export type ScoresCommentInput = Pick<ReviewRecord, "pr" | "blast" | "review"> & Partial<Pick<ReviewRecord, "gates" | "linkedIssues" | "headSha" | "incremental">>;
 type MermaidInput = { pr: ReviewRecord["pr"]; blast?: Partial<BlastRadius>; review?: Partial<ReviewBody>; outsideDiffImpact?: OutsideImpact };
-export type ReviewCommentInput = ScoresCommentInput & MermaidInput;
+export type ReviewCommentInput = ScoresCommentInput & MermaidInput & { guide?: string | null };
 
 export function formatScoresComment(r: ScoresCommentInput): string {
   const { pr, blast, review: v, gates = [], linkedIssues = [], headSha, incremental } = r;
@@ -186,13 +187,16 @@ function buildBlastMermaid(r: MermaidInput): string {
   return out.join("\n");
 }
 
-export function formatReviewComment(r: ReviewCommentInput): string {
+// agentPrompts: add the collapsed "Prompt for AI agents" block for the actionable findings (a per-repository setting).
+export function formatReviewComment(r: ReviewCommentInput, { agentPrompts = false, repo = "" }: { agentPrompts?: boolean; repo?: string } = {}): string {
   const { pr, blast, review: v, linkedIssues = [], headSha, incremental } = r;
   const appLink = `${APP_URL}/review?pr=${encodeURIComponent(pr.url)}`;
   const [vl] = VERDICT[v.verdict] || ["Commented"];
   const e = effort(blast);
   const actionable = (v.findings || []).filter((f) => !f.dismissed && f.severity !== "nit").map((f) => deriveSuggestionFromDetail(f, ""));
   const resolved = incremental?.resolvedFindings || [];
+  const open = (v.findings || []).filter((f) => !f.dismissed && f.severity !== "nit");
+  const prompt = agentPrompts && open.length ? promptDetails(allFindingsPrompt({ repo: repo || repoOf(pr), pr, guide: r.guide }, open)) : "";
   const lines = [
     `<!-- codeotter:review -->`,
     `### 🦦 CodeOtter — PR Review Summary`,
@@ -236,6 +240,7 @@ export function formatReviewComment(r: ReviewCommentInput): string {
                 : []),
             ];
           }),
+          ...(prompt ? ["", prompt] : []),
         ]
       : []),
     ...(resolved.length
