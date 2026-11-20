@@ -23,6 +23,9 @@ export interface ReviewFailure { sha: string; at: number; tries: number; error: 
 export interface WebhookDelivery { at: number; event: string; delivery: string }
 export interface GuideSetting { use?: boolean; learnings?: string[] }
 export interface RepoSetting { review?: Partial<ReviewSettings>; learnings?: string[]; accepted?: string[] }
+// Generic OpenID Connect sign-in (PocketBase provider oidc2): the issuer it was discovered from, the email domains whose
+// verified addresses are trusted, auto-admission and whether the other sign-in buttons are hidden.
+export interface SsoSetting { issuer?: string; domains?: string[]; autoAdmit?: boolean; require?: boolean }
 export interface SettingsMap {
   access: Record<string, string[]>;
   invites: Invite[];
@@ -46,6 +49,7 @@ export interface SettingsMap {
   onboardingComplete: boolean;
   runtimeDevices: Record<string, { device: string; model: string }>;
   issueTrackers: TrackerSettings;
+  sso: SsoSetting;
   [webhook: `${string}Webhook`]: { secret?: string };
   [origin: `${string}Origin`]: string;
 }
@@ -53,9 +57,9 @@ export type SettingKey = keyof SettingsMap;
 export type SettingValue<K extends string> = K extends SettingKey ? SettingsMap[K] : unknown;
 // PocketBase records and auth payloads this app reads.
 export interface UserRecord { id: string; name?: string; username?: string; email?: string; role?: Role | ""; avatar?: string; verified?: boolean; created?: string }
-export interface OAuthProviderConfig { name: string; clientId?: string; clientSecret?: string; displayName?: string; authURL?: string; tokenURL?: string; userInfoURL?: string; pkce?: boolean }
+export interface OAuthProviderConfig { name: string; clientId?: string; clientSecret?: string; displayName?: string; authURL?: string; tokenURL?: string; userInfoURL?: string; pkce?: boolean; extra?: Record<string, unknown> }
 export interface OAuthConfig { enabled?: boolean; providers: OAuthProviderConfig[] }
-export interface AuthMethodProvider { name: string; state?: string; codeVerifier?: string; authURL?: string }
+export interface AuthMethodProvider { name: string; displayName?: string; state?: string; codeVerifier?: string; authURL?: string }
 export interface AuthMethods { oauth2?: { enabled?: boolean; providers: AuthMethodProvider[] } }
 export interface AuthResult { token: string; record: UserRecord; meta?: { email?: string; username?: string; rawUser?: Record<string, unknown> } }
 export interface OAuth2Body { provider: string; code: string; codeVerifier?: string; redirectURL: string }

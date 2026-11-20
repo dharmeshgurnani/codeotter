@@ -53,23 +53,42 @@ export function accessQueue<T>(fn: () => T | Promise<T>): Promise<T> {
   admitting = run.catch(() => {});
   return run;
 }
-// `entraEmail` is set only for a Microsoft sign-in through a single-tenant app (the caller checks the tenant).
-export const admit = (record: UserRecord, providers: string[], username = "", entraEmail = ""): Promise<Role | ""> => accessQueue(() => admitOne(record, providers, username, entraEmail));
-async function admitOne(record: UserRecord, providers: string[], username: string, entraEmail = ""): Promise<Role | ""> {
+// Generic OpenID Connect sign-in (enterprise SSO) runs on PocketBase's second OIDC slot: `oidc` is Forgejo's.
+export const SSO_PB = "oidc2";
+const DOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/;
+export const isEmailDomain = (d: string) => DOMAIN_RE.test(d);
+// An address whose domain is one of the SSO page's "Allowed email domains" (none set: no address is trusted).
+export const emailDomainAllowed = (email: string, domains: string[] | undefined) => { const d = String(email || "").toLowerCase().split("@"); return d.length === 2 && !!d[0] && (domains || []).includes(d[1]); };
+// The email an SSO identity is trusted with: verified by PocketBase (it keeps an OIDC email only when the IdP says
+// email_verified) and by the IdP's own claim, and in an allowed domain, i.e. an address the admin's directory assigns.
+export async function ssoEmail(record: UserRecord, rawUser: Record<string, unknown> | undefined): Promise<string> {
+  const email = String(record.email || "").toLowerCase();
+  const claim = rawUser?.email_verified;
+  if (record.verified !== true || !email || (claim !== true && claim !== "true")) return "";
+  return emailDomainAllowed(email, (await store.getSetting("sso"))?.domains) ? email : "";
+}
+// `directoryEmail` is set only for a Microsoft sign-in through a single-tenant app (the caller checks the tenant), or for
+// an SSO sign-in with a verified email in an allowed domain (ssoEmail).
+export const admit = (record: UserRecord, providers: string[], username = "", directoryEmail = ""): Promise<Role | ""> => accessQueue(() => admitOne(record, providers, username, directoryEmail));
+async function admitOne(record: UserRecord, providers: string[], username: string, directoryEmail = ""): Promise<Role | ""> {
   if (record.role) return record.role;
   let role: Role = "owner";
   if ((await store.users()).some((u) => u.role === "owner")) {
     const login = String(username || "").toLowerCase();
-    // Email matches GitHub identities (PocketBase keeps GitHub's verified primary email) and Microsoft identities from the
-    // one configured tenant, whose addresses its admins assign. Other providers may not verify an email.
+    // Email matches GitHub identities (PocketBase keeps GitHub's verified primary email), Microsoft identities from the
+    // one configured tenant, and SSO identities in an allowed domain: addresses their admins assign. Other providers
+    // may not verify an email.
     const email = record.verified === true && record.email ? String(record.email).toLowerCase() : "";
-    const entra = providers.includes("microsoft") ? String(entraEmail || "").toLowerCase() : "";
-    const emailMatch = (i: Invite) => (i.pb === "github" ? !!email && i.login === email : i.pb === "microsoft" ? !!entra && i.login === entra : false);
+    const sso = providers.includes(SSO_PB) ? (await store.getSetting("sso")) || {} : null;
+    const directory = String(directoryEmail || "").toLowerCase();
+    const entra = providers.includes("microsoft") || (sso && emailDomainAllowed(directory, sso.domains)) ? directory : "";
+    const emailMatch = (i: Invite) => (i.pb === "github" ? !!email && i.login === email : i.pb === "microsoft" || i.pb === SSO_PB ? !!entra && i.login === entra : false);
     const hit = ((await store.getSetting("invites")) || []).find((i) => providers.includes(i.pb) && (i.login.includes("@") ? emailMatch(i) : !!login && i.login === login));
-    if (!hit) return "";
-    role = hit.role;
-    if (role === "developer") await store.setSetting("access", { ...((await store.getSetting("access")) || {}), [record.id]: hit.repos || [] });
-    await store.setSetting("invites", ((await store.getSetting("invites")) || []).filter((i) => i.id !== hit.id));
+    // SSO may admit its allowed domains without an invite, as developers with no repositories (off by default).
+    if (!hit && !(sso?.autoAdmit && entra)) return "";
+    role = hit ? hit.role : "developer";
+    if (role === "developer") await store.setSetting("access", { ...((await store.getSetting("access")) || {}), [record.id]: hit?.repos || [] });
+    if (hit) await store.setSetting("invites", ((await store.getSetting("invites")) || []).filter((i) => i.id !== hit.id));
   }
   await store.setRole(record.id, role);
   record.role = role;
@@ -87,7 +106,7 @@ export async function currentUser(token: string | undefined): Promise<SessionUse
 const hasUsers = async () => (PB_URL ? (await store.users()).length > 0 : false);
 // effective role for access checks: the real role; an anonymous visitor counts as owner only while no account exists
 // yet (bootstrap) or when the operator sets PR_SCORER_RECOVERY=1 (locked out: restart with it, fix sign-in, unset it).
-const RECOVERY = process.env.PR_SCORER_RECOVERY === "1";
+export const RECOVERY = process.env.PR_SCORER_RECOVERY === "1";
 export const effectiveRole = async (user: { role?: Role | "" } | null | undefined): Promise<Role | ""> => user?.role || (RECOVERY || !PB_URL || !(await hasUsers()) ? "owner" : "");
 // Access levels: "owner" (owner), "admin" (owner, admin), "review" (any role; developers then pass canSeeRepo per repository).
 export const allowed = (role: Role | "", access: Access | string): boolean => (access === "owner" ? role === "owner" : access === "admin" ? role === "owner" || role === "admin" : access === "review" ? isRole(role) : true);
@@ -98,6 +117,13 @@ export async function gate(token: string | undefined, access: Access = "admin"):
   const role = await effectiveRole(user);
   if (allowed(role, access)) return { user, role, ok: true };
   return { user, role, ok: false, refusal: { error: user ? `This needs the ${access} role` : "Sign in to continue", login: !user } };
+}
+// "Require SSO": while SSO sign-in is on, the other providers are hidden and refused, except in recovery mode
+// (PR_SCORER_RECOVERY=1), which is how an owner signs in another way.
+export async function ssoRequired(): Promise<boolean> {
+  if (RECOVERY || !PB_URL || !(await store.getSetting("sso"))?.require) return false;
+  const m = await store.authMethods();
+  return !!m.oauth2?.enabled && m.oauth2.providers.some((p) => p.name === SSO_PB);
 }
 // </roles>
 // What a viewer ({ user, role } from gate) may see: owners and admins every repository, a developer only the repositories
