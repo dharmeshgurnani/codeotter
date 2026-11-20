@@ -1,6 +1,6 @@
 # Stage 1: build the React UI
 # Built on the runner's own platform; only the runtime stage is per-architecture.
-FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web
+FROM --platform=$BUILDPLATFORM node:26-bookworm-slim AS web
 WORKDIR /app/web
 RUN npm i -g pnpm@10.20.0
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
@@ -11,14 +11,14 @@ COPY package.json /app/package.json
 RUN pnpm build
 
 # Production dependencies are pure JavaScript: the terminal UI's and the backend's HTTP server (Hono).
-FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS terminal-deps
+FROM --platform=$BUILDPLATFORM node:26-bookworm-slim AS terminal-deps
 WORKDIR /app
 RUN npm i -g pnpm@10.20.0
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --prod --frozen-lockfile
 
 # Runtime = node + python3 + venv + gh + pocketbase in one image
-FROM node:22-bookworm-slim
+FROM node:26-bookworm-slim
 ARG PB_VERSION=0.40.4
 ARG GH_VERSION=2.92.0
 ARG TARGETARCH=amd64
