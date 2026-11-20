@@ -181,7 +181,6 @@ function exec(cmd: string, args: string[], { cwd, timeoutMs, env }: { cwd?: stri
     let settled = false;
     const done = (r: ExecResult) => { if (!settled) { settled = true; clearTimeout(timer); res(r); } };
     const timer = setTimeout(() => { timedOut = true; try { p.kill("SIGKILL"); } catch {} done({ code: null, stderr, timedOut: true }); }, timeoutMs);
-    timer.unref?.();
     p.stdout?.on("data", () => {});
     p.stderr?.on("data", (d) => { stderr = (stderr + d).slice(-2000); });
     p.on("error", (e) => { if (!settled) { settled = true; clearTimeout(timer); rej(e); } });

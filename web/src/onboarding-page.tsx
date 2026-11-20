@@ -10,6 +10,9 @@ import { GitHubMark, ForgejoMark, GiteaMark, BitbucketMark, AzureDevOpsMark, Git
 import { FORGE_LABELS } from "./types";
 import { storageSet } from "@/lib/storage";
 
+// Only an http(s) server origin becomes a link: the URL is typed by the user.
+const httpOrigin = (u: string): string => { try { const x = new URL(u); return x.protocol === "https:" || x.protocol === "http:" ? x.origin + x.pathname.replace(/\/+$/, "") : ""; } catch { return ""; } };
+
 // One shape for every API response: JSON on success, {error} on failure (the error text, never the body, reaches the screen).
 const readJson = async (res: Response) => {
   const d = await res.json().catch(() => ({ error: String(res.status) }));
@@ -701,7 +704,7 @@ export function OnboardingPage({
                           <label className="block text-xs font-medium text-neutral-700">OAuth Client ID (Optional)</label>
                           {(forgeUrl || !selfHosted) && (
                             <a
-                              href={provider === "bitbucket" ? "https://support.atlassian.com/bitbucket-cloud/docs/use-oauth-on-bitbucket-cloud/" : provider === "azure" ? "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade" : provider === "gitlab" ? `${forgeUrl}/-/user_settings/applications` : `${forgeUrl}/user/settings/applications`}
+                              href={provider === "bitbucket" ? "https://support.atlassian.com/bitbucket-cloud/docs/use-oauth-on-bitbucket-cloud/" : provider === "azure" ? "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade" : httpOrigin(forgeUrl) ? `${httpOrigin(forgeUrl)}${provider === "gitlab" ? "/-/user_settings/applications" : "/user/settings/applications"}` : undefined}
                               target="_blank"
                               rel="noreferrer"
                               className="text-[11px] text-blue-600 hover:underline"
