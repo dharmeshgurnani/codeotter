@@ -18,6 +18,7 @@ import type { OAuthProviderConfig } from "./store.ts";
 import type { ProviderDef } from "./providers.ts";
 import type { LocalModel } from "./local-models.ts";
 import type { ReviewSettings } from "./context.ts";
+import { analyzerAsset, analyzerBin, ANALYZER_IDS, ANALYZERS, canInstall, installAnalyzer, isAnalyzerId, removeAnalyzer } from "./analyzers.ts";
 
 // Page JSON drawn by web/src/components/json-form.tsx (Field, Section, Action, Row there).
 export type Option = { value: string | number; label: string; icon?: string };
@@ -311,6 +312,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             { key: "postInlineSuggestions", label: "Post inline suggestions", type: "checkbox", text: "Post inline committable suggestion comments on PR diff lines" },
             { key: "auto", label: "Auto-review", type: "checkbox", text: "Review every new or updated pull request and post the result (drafts and PRs labelled codeotter:skip are left alone)" },
             { key: "commands", label: "PR comment commands", type: "checkbox", text: "Run /review, /describe, /improve, /ask, /docs and /changelog from comments by owners, members and collaborators" },
+            ...ANALYZER_IDS.map((id): Field => ({ key: id, label: ANALYZERS[id].checks, type: "checkbox", text: `Run ${ANALYZERS[id].label} on the changed files; the language model confirms or rejects each result` })),
             files.length ? { key: "useGuides", label: "Review guidelines", type: "checkbox", text: `Follow ${files.join(" + ")}` } : { key: "noGuides", label: "Review guidelines", type: "readonly" },
             { key: "learnings", label: "Team learnings", type: "list", hint: "Dismissed findings, kept as rules for this repository." },
             { key: "accepted", label: "Accepted fixes", type: "list" },
@@ -928,6 +930,70 @@ SETTINGS_PAGES.models = {
       if (m.kind === "s1") { const s1 = (await store.getSetting("s1")) || {}; if (s1.provider === m.id) await store.setSetting("s1", { provider: "none" }); }
       else { const l = (await store.getSetting("llm")) || {}; if (l.provider === `local_${m.id}`) await store.setSetting("llm", { provider: "minimax" }); }
       return { message: `${m.label} deleted.` };
+    },
+  },
+};
+
+// Static analyzers: install-wide availability. Each runs from PATH or a pinned download started here; repositories opt in.
+SETTINGS_PAGES.analyzers = {
+  title: "Analyzers",
+  group: "admin",
+  access: "admin",
+  async load() {
+    const rows = ANALYZER_IDS.map((id): Row => {
+      const a = ANALYZERS[id];
+      const { bin, source } = analyzerBin(id);
+      const d = downloads.get(`analyzer:${id}`);
+      const pct = d?.active && d.total ? Math.round((d.done / d.total) * 100) : undefined;
+      const status: CellObject = d?.active
+        ? { text: d.label || `Downloading${pct !== undefined ? ` ${pct}%` : ""}`, tone: "warn", ...(pct !== undefined ? { progress: pct } : {}) }
+        : bin ? { text: "Available", tone: "ok", info: bin }
+        : d?.error ? { text: d.error, tone: "bad" }
+        : canInstall(id) ? { text: "Not installed", tone: "muted" }
+        : { text: a.install.kind === "pip" ? "Needs Python 3.10+" : `No build for ${process.platform}-${process.arch}`, tone: "warn" };
+      return {
+        id,
+        label: a.label,
+        cells: {
+          analyzer: { text: a.label, info: a.license },
+          checks: a.checks,
+          version: { text: a.version, mono: true },
+          source: source === "path" ? "PATH" : source === "download" ? (a.install.kind === "pip" ? "pip (venv)" : "Download") : "",
+          status,
+        },
+        actions: [
+          { id: "download", label: "Download", icon: "download", variant: "default", ...(d?.active ? { loading: true } : bin || !canInstall(id) ? { disabled: true } : {}) },
+          { id: "delete", label: `Delete ${a.label}`, icon: "trash", iconOnly: true, danger: true, variant: "outline", ...(source === "download" && !d?.active ? {} : { disabled: true }) },
+        ],
+        state: d?.active ? "downloading" : bin ? "ready" : "missing",
+      };
+    });
+    return {
+      sections: [{
+        id: "analyzers",
+        title: "Analyzers",
+        description: "Run on the changed files of a pull request; their results go to the language model as evidence. Enable per repository in Repository settings.",
+        fields: [{ key: "rows", label: "Analyzers", type: "table", columns: [{ key: "analyzer", label: "Analyzer" }, { key: "checks", label: "Checks" }, { key: "version", label: "Version" }, { key: "source", label: "Source" }, { key: "status", label: "Status" }] }],
+        poll: rows.some((r) => r.state === "downloading") ? 2000 : 0,
+      }],
+      values: { analyzers: { rows } },
+    };
+  },
+  async save() {},
+  actions: {
+    async download(body) {
+      const id = body?.item;
+      if (!isAnalyzerId(id)) throw new Error("Unknown analyzer");
+      if (!canInstall(id)) throw new Error(ANALYZERS[id].install.kind === "pip" ? "Python 3.10+ is needed" : `No ${ANALYZERS[id].label} build for ${process.platform}-${process.arch}`);
+      installAnalyzer(id).catch(() => {});
+      const asset = analyzerAsset(id);
+      return { message: asset ? `Downloading ${asset.file}…` : `Installing ${ANALYZERS[id].label}…` };
+    },
+    async delete(body) {
+      const id = body?.item;
+      if (!isAnalyzerId(id)) throw new Error("Unknown analyzer");
+      removeAnalyzer(id);
+      return { message: `${ANALYZERS[id].label} deleted.` };
     },
   },
 };

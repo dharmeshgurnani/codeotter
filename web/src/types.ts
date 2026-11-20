@@ -23,6 +23,7 @@ export type Finding = {
   suggestion?: string;
   dismissed?: boolean;
   confidence?: number;
+  analyzer?: string;
 };
 export type Review = {
   pr: Pr;
@@ -67,6 +68,7 @@ export type Review = {
   };
   commentsPosted?: string[];
   commentError?: string;
+  analyzers?: { id: string; label: string; status: "ok" | "failed" | "timeout" | "unavailable"; found: number; kept: number; ms: number; error?: string }[];
   at: string;
 };
 export type User = { id: string; name: string; email: string; role: string; avatar: string };

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Static analysis evidence.** Repository settings has per-repository switches for gitleaks (secrets), Semgrep (`p/ci` SAST rules) and Trivy (dependency vulnerabilities). Each runs on the head text of the PR's changed files in a temporary tree; only results within 3 lines of an added line are kept (Trivy: a package named on an added line of a changed manifest) and handed to the language model, which confirms or rejects each one. Confirmed results become findings tagged with the analyzer. Secret values are never put in a prompt, comment or stored review: tool output is redacted and known values are scrubbed from the model's reply. A missing, failing or timed-out analyzer is shown under Static analysis on the review page and never fails the review. Settings → System → Analyzers lists availability (PATH or downloaded) and downloads pinned releases on click: gitleaks 8.30.1 and Trivy 0.76.2 archives checked against their SHA-256, Semgrep 1.186.0 into a pip venv.
 - **TypeScript.** `core/`, `tui/`, `bin/`, `test/` and `web/scripts/` are strict TypeScript (`.ts`), run directly by Node's type stripping, with no build step. Node 22.18 or later is required. `pnpm start` runs `node core/server.ts`, and `codeotter` is `tui/codeotter.ts`. `pnpm typecheck` (strict, no `any`) runs in CI and before `pnpm test`. Malformed API request fields are treated as empty instead of failing with a TypeError. PocketBase migrations stay JavaScript.
 ## 0.7.0 (2026-11-08)
 
