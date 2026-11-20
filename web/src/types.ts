@@ -78,7 +78,8 @@ export type Board = { repo: string; repos: string[]; onboardingNeeded?: boolean;
 
 // A pull request URL's repository id, given the configured origins (provider id -> origin). Same rules as repoFromUrl in
 // core/forges.ts: owner/name for GitHub, Forgejo, Gitea and Bitbucket; PROJECT/repo for Bitbucket Data Center
-// (/projects/P/repos/r/...); org/project/repo for Azure DevOps (/org/project/_git/repo/...).
+// (/projects/P/repos/r/...); org/project/repo for Azure DevOps (/org/project/_git/repo/...); group[/subgroup...]/project
+// for GitLab (/group/sub/project/-/merge_requests/...).
 export const repoFromUrl = (url: string, origins: Record<string, string> = {}) => {
   try {
     const u = new URL(url);
@@ -87,16 +88,22 @@ export const repoFromUrl = (url: string, origins: Record<string, string> = {}) =
     const seg = u.pathname.split("/").slice(1);
     if (source === "bitbucketdc") return seg[0] === "projects" && seg[2] === "repos" ? `${source}~${seg[1]}/${seg[3]}` : "";
     if (source === "azure") return seg[2] === "_git" ? `${source}~${[seg[0], seg[1], seg[3]].map(decodeURIComponent).join("/")}` : "";
+    if (source === "gitlab") return seg.indexOf("-") >= 2 ? `${source}~${seg.slice(0, seg.indexOf("-")).join("/")}` : "";
     return `${source ? `${source}~` : ""}${seg.slice(0, 2).join("/")}`;
   } catch { return ""; }
 };
-export const FORGE_LABELS: Record<string, string> = { forgejo: "Forgejo", gitea: "Gitea", bitbucket: "Bitbucket", bitbucketdc: "Bitbucket Data Center", azure: "Azure DevOps" };
-export const FORGE_PREFIX = /^(forgejo|gitea|bitbucket|bitbucketdc|azure)~/;
+export const FORGE_LABELS: Record<string, string> = { forgejo: "Forgejo", gitea: "Gitea", bitbucket: "Bitbucket", bitbucketdc: "Bitbucket Data Center", azure: "Azure DevOps", gitlab: "GitLab" };
+export const FORGE_PREFIX = /^(forgejo|gitea|bitbucket|bitbucketdc|azure|gitlab)~/;
 export const forgeId = (id: string) => FORGE_PREFIX.exec(id)?.[1] || "";
 export const forgeLabel = (id: string) => FORGE_LABELS[forgeId(id)] || "GitHub";
 export const repoLabel = (id: string) => forgeId(id) ? `${id.replace(FORGE_PREFIX, "")} · ${forgeLabel(id)}` : id;
-// Repository ids have two segments, three for Azure DevOps (org/project/repo).
-export const repoSegments = (id: string) => (id.startsWith("azure~") ? 3 : 2);
+// Repository ids have two segments, three for Azure DevOps (org/project/repo). A GitLab project sits under nested groups,
+// so its length comes from the route: `parts` is the path after /repo/, whose last part may be a view (open, settings).
+export const repoSegments = (id: string, parts: string[] = [], known: string[] = []) => {
+  if (!id.startsWith("gitlab~")) return id.startsWith("azure~") ? 3 : 2;
+  if (known.includes(parts.join("/"))) return parts.length;
+  return parts.length > 2 && ["open", "settings"].includes(parts.at(-1) ?? "") ? parts.length - 1 : Math.max(2, parts.length);
+};
 
 export const VERDICT = { approve: ["Approved", "ok"], comment: ["Commented", "warn"], request_changes: ["Changes requested", "bad"] } as const;
 export const tone = (v: number, invert = false) => {

@@ -218,8 +218,8 @@ export async function homeData(org = "", g: Viewer = { role: "owner" }): Promise
     { id: "links", kind: "links", title: "Quick links", items: [
       ...(admin ? [
         { label: "Manage repositories", hint: "Add or remove onboarded repositories", path: "/settings/repos" },
-        { label: "Git providers", hint: "GitHub, Bitbucket, Azure DevOps, Forgejo and Gitea", path: "/settings/git" },
-        { label: "Auth providers", hint: "Sign-in with GitHub, Bitbucket, Microsoft, Forgejo and Gitea", path: "/settings/oauth" },
+        { label: "Git providers", hint: "GitHub, GitLab, Bitbucket, Azure DevOps, Forgejo and Gitea", path: "/settings/git" },
+        { label: "Auth providers", hint: "Sign-in with GitHub, GitLab, Bitbucket, Microsoft, Forgejo and Gitea", path: "/settings/oauth" },
       ] : []),
       { label: "Documentation", hint: "docs.codeotter.io", href: "https://docs.codeotter.io/docs" },
     ] },

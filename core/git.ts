@@ -46,7 +46,7 @@ function runGh(args: string[], env: NodeJS.ProcessEnv): Promise<string> {
   });
 }
 // <pr-url>
-const FORGE_PREFIX = /^(forgejo|gitea|bitbucket|bitbucketdc|azure)~/;
+const FORGE_PREFIX = /^(forgejo|gitea|bitbucket|bitbucketdc|azure|gitlab)~/;
 export const forgeId = (repo: string) => FORGE_PREFIX.exec(String(repo))?.[1] || "";
 export const isForgeRepo = (repo: string) => !!forgeId(repo);
 export const nativeRepo = (repo: string) => String(repo).replace(FORGE_PREFIX, "");

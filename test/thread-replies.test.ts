@@ -59,6 +59,7 @@ function load({ ghComments = [] as Row[], giteaReviews = {} as Record<number, Ro
     openPrs: async () => [],
     forgeId: (r: string) => /^([a-z]+)~/.exec(r)?.[1] || "",
     isForgeRepo: (r: string) => /^[a-z]+~/.test(r),
+    hunkAt: () => "",
     nativeRepo: (r: string) => r.replace(/^[a-z]+~/, ""),
     oneLine: (x: unknown, max: number) => String(x ?? "").replace(/\s+/g, " ").trim().slice(0, max),
     isObj: (x: unknown) => !!x && typeof x === "object" && !Array.isArray(x),

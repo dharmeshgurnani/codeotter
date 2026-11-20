@@ -364,7 +364,7 @@ const pbStore: PbStore = {
   userFile: (id, file) => fetch(`${PB_URL}/api/files/users/${id}/${file}`, { signal: AbortSignal.timeout(10000) }),
   users: async () => pbItems(await pb("collections/users/records?perPage=200&sort=created")).flatMap((x) => (isUserRecord(x) ? [x] : [])),
   setRole: (id, role) => pb(`collections/users/records/${id}`, { method: "PATCH", body: JSON.stringify({ role }) }),
-  // PocketBase provider names (github, oidc, gitea) linked to an account, from its OAuth identities.
+  // PocketBase provider names (github, oidc, gitea, gitlab) linked to an account, from its OAuth identities.
   identities: async (id) => pbItems(await pb(`collections/_externalAuths/records?perPage=50&filter=${pbFilterEq("recordRef", String(id))}`)).map((i) => String(i.provider)),
   deleteUser: (id) => pb(`collections/users/records/${encodeURIComponent(id)}`, { method: "DELETE" }),
   setOAuth: async (oauth2) => pb("collections/users", { method: "PATCH", body: JSON.stringify({ oauth2 }) }),

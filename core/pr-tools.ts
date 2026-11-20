@@ -9,7 +9,7 @@ import { deriveSuggestionFromDetail, reflectFindings } from "./engines.ts";
 import { postInlineSuggestionsOnPr, resolvePr, score, syncPrComments } from "./review.ts";
 import { CATCH_UP_EVERY, HANDLED_COMMENTS, lastCatchUp, remember, webhookHealthy } from "./queue.ts";
 import { repoOf } from "./views.ts";
-import { fixFindings } from "./fix.ts";
+import { fixFindings, hunkAt } from "./fix.ts";
 import type { ForgeComment, ThreadComment } from "./forges.ts";
 import { audit, orgOfRepo, withActor } from "./audit.ts";
 import type { Guide, PullRequest, ReviewSettings } from "./context.ts";
@@ -357,6 +357,8 @@ async function answerThread(repo: string, number: number, t: ThreadComment[]) {
   try {
     if (!c.model) throw new Error("Replies need a language model: open Admin / Model provider");
     if (c.api === "codereviewer") throw new Error("CodeReviewer cannot hold a conversation: pick a language model in Admin / Model provider");
+    // servers whose thread comments carry no diff hunk (GitLab): cut it from the pull request's diff
+    const hunk = root.hunk || (isForgeRepo(repo) && root.path && root.line > 0 ? hunkAt(await forgeOf(repo).diff(repo, number).catch(() => ""), root.path, root.line) : "");
     const history = t.slice(1, -1).slice(-10).map((x) => `${isOurs(x, "") ? "CodeOtter" : x.user.login || "reviewer"}: ${plain(x.body, 1500)}`).join("\n\n");
     const out = await askJson(c, `You are CodeOtter. A developer replied under one of your inline review comments on pull request #${number}. Answer the latest reply directly and briefly: explain, concede when the reply is right, or hold your point with a concrete reason from the code. Do not repeat your original comment. Reply with ONLY a JSON object:
 {"answer":"markdown","dismissed":false,"learning":""}
@@ -364,7 +366,7 @@ Set "dismissed" to true only when the reply shows the finding is intentional, a 
 
 File: ${root.path}${root.line ? ` line ${Math.abs(root.line)}` : ""}
 Diff hunk:
-${root.hunk.slice(0, 4000) || "(not available)"}
+${hunk.slice(0, 4000) || "(not available)"}
 
 Your original comment:
 ${plain(root.body, 3000)}

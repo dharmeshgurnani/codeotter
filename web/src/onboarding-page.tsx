@@ -6,7 +6,7 @@ import { InfoTip } from "@/components/info-tip";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { DitherCanvas } from "@/components/dither-canvas";
 import { toast } from "sonner";
-import { GitHubMark, ForgejoMark, GiteaMark, BitbucketMark, AzureDevOpsMark } from "./login-page";
+import { GitHubMark, ForgejoMark, GiteaMark, BitbucketMark, AzureDevOpsMark, GitLabMark } from "./login-page";
 import { FORGE_LABELS } from "./types";
 import { storageSet } from "@/lib/storage";
 
@@ -62,10 +62,10 @@ export function OnboardingPage({
   const [showManualGh, setShowManualGh] = useState(false);
 
   // Step 1: Provider State
-  type ProviderId = "github" | "forgejo" | "gitea" | "bitbucket" | "bitbucketdc" | "azure";
+  type ProviderId = "github" | "forgejo" | "gitea" | "bitbucket" | "bitbucketdc" | "azure" | "gitlab";
   const [provider, setProvider] = useState<ProviderId>("github");
   // Bitbucket Cloud and Azure DevOps have one public server; their form asks for an account email or organizations instead.
-  const selfHosted = provider === "forgejo" || provider === "gitea" || provider === "bitbucketdc";
+  const selfHosted = provider === "forgejo" || provider === "gitea" || provider === "bitbucketdc" || provider === "gitlab";
   const [forgeUser, setForgeUser] = useState("");
   const [forgeOrgs, setForgeOrgs] = useState("");
   const [forgeTenant, setForgeTenant] = useState("");
@@ -426,6 +426,17 @@ export function OnboardingPage({
                     ),
                   },
                   {
+                    id: "gitlab" as const,
+                    label: "GitLab",
+                    badge: "Cloud / Self-Managed",
+                    hint: "gitlab.com or a self-managed instance with an access token, GitLab sign-in",
+                    icon: (
+                      <div className="flex size-7 items-center justify-center rounded-md bg-[#FC6D26] text-white p-1">
+                        <GitLabMark />
+                      </div>
+                    ),
+                  },
+                  {
                     id: "forgejo" as const,
                     label: "Forgejo",
                     badge: "Self-Hosted",
@@ -690,7 +701,7 @@ export function OnboardingPage({
                           <label className="block text-xs font-medium text-neutral-700">OAuth Client ID (Optional)</label>
                           {(forgeUrl || !selfHosted) && (
                             <a
-                              href={provider === "bitbucket" ? "https://support.atlassian.com/bitbucket-cloud/docs/use-oauth-on-bitbucket-cloud/" : provider === "azure" ? "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade" : `${forgeUrl}/user/settings/applications`}
+                              href={provider === "bitbucket" ? "https://support.atlassian.com/bitbucket-cloud/docs/use-oauth-on-bitbucket-cloud/" : provider === "azure" ? "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade" : provider === "gitlab" ? `${forgeUrl}/-/user_settings/applications` : `${forgeUrl}/user/settings/applications`}
                               target="_blank"
                               rel="noreferrer"
                               className="text-[11px] text-blue-600 hover:underline"
