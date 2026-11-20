@@ -130,9 +130,9 @@ test("GitHub App installation tokens", async (ctx) => {
   assert.equal(await appInstallationToken(""), "ghs_inst9", "no owner and one installation: that one");
   ctx.diagnostic("installation tokens per owner, cached, and never guessed between installations");
 
-  const before = listed.length;
+  const listedBefore = listed.length;
   forgetGithubRepos();
   assert.equal(await appInstallationToken("solo"), "ghs_inst9");
-  assert.ok(listed.length > before, "forgetGithubRepos (new App or install) drops cached tokens");
+  assert.ok(listed.length > listedBefore, "forgetGithubRepos (new App or install) drops cached tokens");
   ctx.diagnostic("a new App or installation drops the cached tokens");
 });

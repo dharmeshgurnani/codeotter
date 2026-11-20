@@ -187,7 +187,7 @@ async function githubManifest(body: Body, http: CookieWriter): Promise<ActionRes
     // false: GitHub then sends the installer to setup_url (onboarding) instead of the sign-in callback
     request_oauth_on_install: false,
     // GitHub refuses a localhost webhook URL; a laptop gets events through the forwarder instead.
-    ...(LOCAL_APP_URL ? {} : { hook_attributes: { url: webhookUrl("github"), active: true }, default_events: ["pull_request", "issue_comment"] }),
+    ...(LOCAL_APP_URL ? {} : { hook_attributes: { url: webhookUrl("github"), active: true }, default_events: ["pull_request", "issue_comment", "pull_request_review_comment"] }),
   };
   return { submit: { url: `https://github.com/settings/apps/new?state=${state}`, fields: { manifest: JSON.stringify(manifest) } } };
 }
@@ -326,7 +326,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             { key: "pathInclude", label: "Include paths", type: "textarea", placeholder: "src/**", hint: "Globs, one per line. Empty: every file." },
             { key: "pathExclude", label: "Exclude paths", type: "textarea", placeholder: "**/*.lock\ndist/\n*.min.js" },
             { key: "pathInstructions", label: "Path instructions", type: "textarea", placeholder: "src/api/**: Every handler checks the session.\n**/*.sql: Migrations must be reversible.", hint: "glob: instructions, one per line. Sent to the language model when a matching file changes." },
-            { key: "commands", label: "PR comment commands", type: "checkbox", text: "Run /review, /describe, /improve, /ask, /docs and /changelog from comments by owners, members and collaborators" },
+            { key: "commands", label: "PR comment commands", type: "checkbox", text: "Run /review, /describe, /improve, /ask, /docs and /changelog from comments by owners, members and collaborators, and answer their replies under CodeOtter's inline comments (\"@codeotter remember <rule>\" saves a team learning)" },
             {
               key: "checks",
               label: "Pre-merge checks",
@@ -533,7 +533,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
               { key: "webhookSecret", label: "Webhook secret", type: "password", placeholder: app.webhookSecret ? "Saved" : "", hint: app.webhookSecret ? "Leave blank to keep the stored secret." : "Apps created by Create app carry one. For an existing app, set the URL above and a secret under the app's Webhook settings, then paste the secret here." },
               { key: "webhookStatus", label: "Last delivery", type: "readonly" },
               { key: "actionSecret", label: "Action secret", type: "readonly", hint: "Repository secret CODEOTTER_SECRET for the CodeOtter GitHub Action." },
-              { key: "forward", label: "Forward webhooks here", type: "checkbox", text: "gh webhook forward streams each GitHub repository's pull_request and issue_comment events to this process (local development without a public URL; needs gh extension install cli/gh-webhook)" },
+              { key: "forward", label: "Forward webhooks here", type: "checkbox", text: "gh webhook forward streams each GitHub repository's pull_request, issue_comment and pull_request_review_comment events to this process (local development without a public URL; needs gh extension install cli/gh-webhook)" },
               { key: "forwardStatus", label: "Forwarders", type: "readonly", hideWhen: { field: "forward", in: ["false"] } },
             ],
             values: { token: "", ...(githubToken ? { clearToken: false } : {}), postAs: appPostingActive(app) ? `${app.slug || `GitHub App ${app.id}`}[bot] where installed, else ${githubToken ? "the saved token" : "the gh login"}` : githubToken ? "The saved token" : "The gh login", webhookUrl: webhookUrl("github"), webhookSecret: "", webhookStatus: describeDelivery("github"), actionSecret: await actionSecret(), forward, forwardStatus: forwarderStatus() },
