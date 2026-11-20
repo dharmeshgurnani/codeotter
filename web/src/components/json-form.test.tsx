@@ -129,4 +129,31 @@ describe("JsonForm", () => {
     rerender(<JsonForm sections={[invite]} values={{ invite: { role: "admin", repos: [] } }} saved={vals} busy="" onChange={onChange} onAction={() => {}} />);
     expect(screen.queryByRole("group", { name: "Repositories" })).not.toBeInTheDocument();
   });
+
+  it("edits repeatable rows: a control per sub-field, remove per row, Add appends a blank row", () => {
+    const repo: Section = {
+      id: "repo",
+      title: "Review",
+      fields: [{
+        key: "checks",
+        label: "Pre-merge checks",
+        type: "rows",
+        fields: [
+          { key: "name", label: "Name", type: "text" },
+          { key: "mode", label: "Mode", type: "select", options: [{ value: "warn", label: "Warn" }, { value: "block", label: "Block" }] },
+        ],
+      }],
+    };
+    const onChange = vi.fn();
+    const vals = { repo: { checks: [{ name: "Changelog", mode: "block" }] } };
+    render(<JsonForm sections={[repo]} values={vals} saved={vals} busy="" onChange={onChange} onAction={() => {}} />);
+    expect(screen.getByText("Pre-merge checks")).toBeInTheDocument();
+    expect(screen.getByLabelText("Name 1")).toHaveValue("Changelog");
+    fireEvent.change(screen.getByLabelText("Mode 1"), { target: { value: "warn" } });
+    expect(onChange).toHaveBeenLastCalledWith("repo", { checks: [{ name: "Changelog", mode: "warn" }] });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    expect(onChange).toHaveBeenLastCalledWith("repo", { checks: [{ name: "Changelog", mode: "block" }, { name: "", mode: "warn" }] });
+    fireEvent.click(screen.getByRole("button", { name: "Remove Pre-merge checks 1" }));
+    expect(onChange).toHaveBeenLastCalledWith("repo", { checks: [] });
+  });
 });

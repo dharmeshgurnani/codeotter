@@ -2,6 +2,19 @@
 
 | Status | Feature | Date |
 | :---: | :--- | :--- |
+| [x] | Post comments, reviews and statuses as the GitHub App bot (installation tokens) instead of the operator's `gh` login | 2026-11-20 |
+| [x] | Review strictness profile per repository (chill / balanced / assertive: findings budget, self-check threshold, model instructions) and a minimum severity for posted comments | 2026-11-20 |
+| [x] | Path filters, path instructions and auto-review skip rules (drafts, authors, base branches, title keywords, labels) per repository, overridable by `.codeotter.json` on the base branch | 2026-11-20 |
+| [x] | Custom pre-merge checks per repository: yes/no questions (off / warn / block) asked of System One with the built-in gates, or of the language model without it; shown on the review page and PR comments; `codeotter/checks` commit status | 2026-11-20 |
+| [x] | Conversational replies under CodeOtter's inline comments (GitHub, GitLab, Forgejo, Gitea): the language model answers trusted replies in the thread; `@codeotter remember <rule>` saves a team learning, dismissals are offered one. Bitbucket and Azure DevOps threads not yet; installs that receive events only through the CodeOtter GitHub Action get no replies until the Action forwards `pull_request_review_comment` | 2026-11-20 |
+| [x] | Resolve fixed comments: CodeOtter's inline comments a later push fixed (model-confirmed) are resolved on GitHub, GitLab, Bitbucket Cloud/Data Center and Azure DevOps, or answered on Forgejo/Gitea; per-repository setting. Stub-tested | 2026-11-20 |
+| [x] | Fix with AI: a self-contained prompt per finding and for all findings (copy on the review page; collapsed "Prompt for AI agents" in posted comments, per-repository setting) and the `/fix [n]` comment command, which posts a model patch as committable suggestions only after it applies to the PR head; nothing is pushed | 2026-11-20 |
+| [x] | Jira and Linear tickets as linked issues: keys from the PR title, branch and description (configured project / team keys, Linear URLs), title, description and acceptance criteria in the prompt and the `issue_requirements` gate; Settings → System → Issue trackers | 2026-11-20 |
+| [x] | Static analysis evidence: gitleaks, Semgrep and Trivy on a PR's changed files (PATH or pinned, checksum-verified download under Settings → System → Analyzers), results on changed lines given to the language model to confirm or reject, secrets redacted, per-repository opt-in | 2026-11-20 |
+| [x] | Analytics: per-review tokens, estimated cost, duration, findings by severity, gates and suggestion outcomes (posted, applied, dismissed); report per period, repository and organization, developer-scoped | 2026-11-20 |
+| [x] | Enterprise SSO: generic OpenID Connect sign-in (Okta, Entra ID, Google Workspace, Keycloak, Authentik, JumpCloud) on PocketBase's `oidc2` slot; invites by verified email in allowed domains, optional auto-admit and Require SSO. Stub-tested; not yet run against a live IdP | 2026-11-20 |
+| [x] | Audit log: sign-ins, accounts, invites, settings and provider changes (secrets masked), repositories, posted reviews, comment commands and local models; owner-only page under Settings → Workspace with filters and CSV export; kept for 10,000 entries / 180 days | 2026-11-20 |
+| [x] | GitLab repositories, gitlab.com or self-managed (nested groups; merge request reviews, inline suggestions, statuses including `codeotter/checks`, PR tools, comment commands, replies in diff discussions, resolving fixed discussions, project hooks) and GitLab sign-in. Stub-tested; not yet run against a live server | 2026-11-20 |
 | [x] | Backend in one module per subsystem; HTTP on Hono with one route module per area and route-level access middleware | 2026-11-07 |
 | [x] | Backend, CLI and tests in strict TypeScript, run by Node type stripping with no build step | 2026-11-08 |
 | [x] | Bitbucket Cloud, Bitbucket Data Center and Azure DevOps repositories (reviews, inline comments, statuses, PR tools, comment commands, webhooks / service hooks) alongside GitHub, Forgejo and Gitea; sign-in with Bitbucket and Microsoft Entra ID. Stub-tested; not yet run against live servers | 2026-11-07 |
@@ -16,7 +29,6 @@
 | [x] | Accepted fixes: suggestions authors applied are remembered per repository and guide later reviews (PR-Agent-inspired) | 2026-10-04 |
 | [x] | PR comment commands: /review, /describe, /improve, /ask, /docs, /changelog (PR-Agent-inspired) | 2026-10-04 |
 | [x] | PR events and comment commands via webhooks (GitHub App manifest with `hook_attributes`, Forgejo/Gitea repository hooks), one review queue with retries, catch-up poll, failed-delivery redelivery after restart, `gh webhook forward` for localhost | 2026-11-01 |
-| [ ] | Post comments, reviews and statuses as the GitHub App bot (installation tokens) instead of the operator's `gh` login | |
 | [x] | Docs and Changelog tools (PR-Agent-inspired) | 2026-10-04 |
 | [x] | Improve: ranked, self-checked code suggestions posted as multi-line committable suggestions (PR-Agent-inspired) | 2026-10-04 |
 | [x] | Ask: free-form questions about a PR (PR-Agent-inspired) | 2026-10-04 |

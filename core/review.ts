@@ -2,13 +2,19 @@
 import { APP_URL, REPO_RE } from "./config.ts";
 import { PROVIDERS } from "./providers.ts";
 import { store } from "./store.ts";
-import { createPrComment, forgeOf, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, readPr, repos, validPrUrl } from "./git.ts";
-import { askSystemOne, llmConfig, s1Config } from "./models.ts";
+import { createPrComment, forgeOf, ghAsApp, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, readPr, repos, validPrUrl } from "./git.ts";
+import { askSystemOne, llmConfig, metered, newUsage, s1Config } from "./models.ts";
+import { estimateCost, recordEvent, reviewEvent } from "./analytics.ts";
 import { acceptedSuggestions, blastRadius, dynamicContextFiles, extendDiffContext, parseDiff, sliceOutsideDiffImpact } from "./diff.ts";
-import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, getRepoAccepted, getRepoLearnings, guideFor, headFileTexts, REVIEW_DEFAULTS, reviewConfig, shaMatch } from "./context.ts";
-import { changeDigest, deriveSuggestionFromDetail, judge, S1_SCORES, scoreWithSystemOne, verifyFindingsWithSystemOne } from "./engines.ts";
+import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, getRepoAccepted, getRepoLearnings, effectiveRules, guideFor, headFileTexts, postable, REVIEW_DEFAULTS, reviewConfig, shaMatch } from "./context.ts";
+import { changeDigest, confirmFixedFindings, deriveSuggestionFromDetail, judge, S1_SCORES, scoreWithSystemOne, verifyFindingsWithSystemOne } from "./engines.ts";
 import { formatReviewComment, formatScoresComment } from "./comments.ts";
+import { findingPrompt, hunkAt, promptDetails } from "./fix.ts";
 import { repoOf } from "./views.ts";
+import { filterDiff } from "./repo-rules.ts";
+import { analysisFailed, ANALYZER_IDS, changedLines, redactDeep, runAnalyzers } from "./analyzers.ts";
+import type { Analysis, AnalyzerRun } from "./analyzers.ts";
+import { audit, AUTO, currentActor, orgOfRepo } from "./audit.ts";
 import type { BlastRadius, DiffContextStats, OutsideImpact } from "./diff.ts";
 import type { GitHistory, LinkedIssue, PullRequest } from "./context.ts";
 import type { Finding, Gate, IncrementalCommit, IncrementalContext, Judgement, ScoreKey, Scores, Verdict, WalkthroughItem } from "./engines.ts";
@@ -47,6 +53,7 @@ export interface ReviewRecord {
   pending?: ReviewPending;
   commentError?: string;
   commentsPosted?: string[];
+  analyzers?: AnalyzerRun[];
 }
 export interface ActiveReview { state: ReviewRecord; error: string | null; promise: Promise<ReviewRecord> | null; done: boolean; }
 export interface TriageConfig { auto: boolean; stopAt: number; }
@@ -54,7 +61,7 @@ interface TriageBase { url: string; repo: string; number: number; title: string;
 export interface TriageResult extends TriageBase { risk: number; blast: number; verdict: "attention" | "ok"; stopAt: number; model: string; seconds: number; }
 export type TriageEntry = TriageResult | (TriageBase & { error: string });
 // What posting inline suggestions needs: a pull request and its findings (stored or freshly normalised).
-export interface InlineTarget { pr: Pick<PullRequest, "url" | "number"> & Partial<PullRequest>; review?: { findings?: Finding[] }; headSha?: string; gitHistory?: Pick<GitHistory, "prCommits">; }
+export interface InlineTarget { pr: Pick<PullRequest, "url" | "number"> & Partial<PullRequest>; review?: { findings?: Finding[] }; headSha?: string; gitHistory?: Pick<GitHistory, "prCommits">; guide?: string | null; }
 // syncPrComments gets a full review, or only { pr } when it posts triage or tool comments.
 export type CommentTarget = InlineTarget & Partial<Omit<ReviewRecord, "review" | "pr">> & { review?: Partial<ReviewBody> };
 export interface InlineComment { path: string; line: number; startLine?: number; side: "RIGHT"; body: string; finding: Finding; }
@@ -67,11 +74,13 @@ const TRIAGE_CONTEXT = "codeotter/triage";
 export const SHA_RE = /^[0-9a-f]{7,40}$/i;
 export const triageConfig = async (): Promise<TriageConfig> => ({ auto: false, stopAt: 75, ...((await store.getSetting("triage")) || {}) });
 const triageRuns = new Map<string, Promise<TriageResult>>();
-async function postTriageStatus(repo: string, sha: string, state: "pending" | "success" | "failure" | "error", description: string, url: string): Promise<unknown> {
+type StatusState = "pending" | "success" | "failure" | "error";
+const postTriageStatus = (repo: string, sha: string, state: StatusState, description: string, url: string): Promise<unknown> => postCommitStatus(repo, sha, TRIAGE_CONTEXT, state, description, url);
+async function postCommitStatus(repo: string, sha: string, context: string, state: StatusState, description: string, url: string): Promise<unknown> {
   if (!SHA_RE.test(sha || "")) return;
-  const fields = { state, context: TRIAGE_CONTEXT, description: description.slice(0, 140), target_url: `${APP_URL}/review?pr=${encodeURIComponent(url)}` };
+  const fields = { state, context, description: description.slice(0, 140), target_url: `${APP_URL}/review?pr=${encodeURIComponent(url)}` };
   if (isForgeRepo(repo)) return forgeOf(repo).status(repo, sha, fields, parsePrUrl(url)?.number);
-  return ghAsync(["api", "--method", "POST", `repos/${repo}/statuses/${sha}`, ...Object.entries(fields).flatMap(([k, v]) => ["-f", `${k}=${v}`])]);
+  return ghAsApp(repo, ["api", "--method", "POST", `repos/${repo}/statuses/${sha}`, ...Object.entries(fields).flatMap(([k, v]) => ["-f", `${k}=${v}`])]);
 }
 function formatTriageComment(t: TriageResult): string {
   const level = S1_SCORES.correctness_risk[Math.min(4, Math.round(t.risk / 25))];
@@ -132,6 +141,20 @@ export async function triagePr(ref: string, repoHint = ""): Promise<TriageResult
   })().finally(() => triageRuns.delete(urlGuess));
   triageRuns.set(urlGuess, run);
   return run;
+}
+
+// Custom pre-merge checks publish one commit status, codeotter/checks: failure when a "block" check fails, success otherwise
+// (warn-only failures are named in the description). No custom check answered, no status.
+const CHECKS_CONTEXT = "codeotter/checks";
+export function checksStatus(gates: Gate[]): { state: "success" | "failure"; description: string } | null {
+  const custom = gates.filter((g) => g.mode);
+  if (!custom.length) return null;
+  const names = (list: Gate[]) => list.map((g) => g.label).join(", ");
+  const blocked = custom.filter((g) => !g.pass && g.mode === "block");
+  const warned = custom.filter((g) => !g.pass && g.mode === "warn");
+  if (blocked.length) return { state: "failure", description: `Failed: ${names(blocked)}${warned.length ? `; warning: ${names(warned)}` : ""}` };
+  if (warned.length) return { state: "success", description: `${custom.length - warned.length}/${custom.length} passed; warning: ${names(warned)}` };
+  return { state: "success", description: `All ${custom.length} check${custom.length === 1 ? "" : "s"} passed` };
 }
 
 export const activeReviews = new Map<string, ActiveReview>();
@@ -206,9 +229,16 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
 
   const runScores = !part || part === "scores" || !cached || !hasValidScores(cached.review?.scores);
   const runLlm = !part || part === "llm" || !cached || !cached.review?.summary;
-
   // Use cached PR metadata immediately on Re-review if available, or fetch non-blockingly via ghAsync
   const pr: PullRequest = cached?.pr || JSON.parse(await readPr(urlGuess, spec));
+  // .codeotter.json on the base branch (cached): its "checks" replace Repository settings' before the run starts; a
+  // broken file fails the review below, where the rest of the file applies.
+  const fileRules = effectiveRules(repoOf(pr), rc, pr);
+  const early = await fileRules.catch(() => null);
+  if (early?.checks) rc.checks = early.checks;
+  // Custom checks are gates: System One answers them with the scores, else the language model in its review.
+  const checks = customCount(rc.checks) ? rc.checks : [];
+  const checksRun = !!checks.length && (s1.enabled ? runScores : !!llmReady && (runLlm || runScores));
   const initialHeadSha = extractHeadSha(pr, cached?.gitHistory) || cached?.headSha || "";
   if (initialHeadSha) pr.headSha = initialHeadSha;
   const initialLearnings = await getRepoLearnings(repoOf(pr));
@@ -244,17 +274,21 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
     pending: {
       scores: runScores,
       readyScores: !runScores && hasValidScores(prevReview.scores) ? { ...prevReview.scores, blast_radius: blast.score } : {},
-      gates: runScores && !!s1.enabled,
+      gates: (runScores && !!s1.enabled) || (checksRun && !s1.enabled),
       narrative: runLlm && !!llmReady,
     },
   };
   const entry: ActiveReview = { state: live, error: null, promise: null, done: false };
   activeReviews.set(pr.url, entry);
 
-  entry.promise = (async () => {
+  // Analytics: wall time and the language model's token usage of this run (models.ts counts the calls made inside).
+  const started = Date.now();
+  const usage = newUsage();
+  entry.promise = metered(usage, async () => {
     try {
       // Refresh PR metadata in background if we started from cached.pr
       if (cached?.pr) live.pr = JSON.parse(await readPr(urlGuess, spec));
+      if (publish && checksRun) await postCommitStatus(repoOf(live.pr), live.pr.headRefOid || "", CHECKS_CONTEXT, "pending", `Running ${customCount(checks)} check(s)`, live.pr.url).catch((e) => console.warn(`[checks] ${(e as Error).message}`));
       const [rawDiff, guide, learnings] = await Promise.all([
         readPr(urlGuess, spec, true),
         Promise.resolve().then(() => guideFor(repoOf(live.pr), isForgeRepo(repoOf(live.pr)) ? live.pr.headRefOid : live.pr.headRefName, live.pr.headRepo || repoOf(live.pr))),
@@ -262,14 +296,25 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
       ]);
       live.guide = guide?.file || null;
       live.learnings = learnings;
-      let diff = rawDiff;
+      // .codeotter.json on the base branch wins over Repository settings for this review; excluded paths never reach a model
+      const { configFile: _file, ...rules } = await fileRules;
+      Object.assign(rc, rules);
+      const filtered = filterDiff(rawDiff, rc).diff;
+      let diff = filtered;
+      if (rawDiff.trim() && !diff.trim()) throw new Error("Every changed file is excluded by the path filters");
       if (rc.contextLines > 0) {
-        const parsed = parseDiff(rawDiff);
+        const parsed = parseDiff(diff);
         const sources = await headFileTexts(live.pr, dynamicContextFiles(parsed));
-        const ext = extendDiffContext(rawDiff, sources, { before: rc.contextLines, after: 1 });
+        const ext = extendDiffContext(diff, sources, { before: rc.contextLines, after: 1 });
         diff = ext.diff;
         live.dynamicContext = ext.stats;
       }
+      // Static analyzers on the head of the changed files the path filters keep, as evidence for the language model;
+      // never fail the review.
+      const analyzerIds = runLlm && llmReady && c.api !== "codereviewer" ? ANALYZER_IDS.filter((id) => rc[id]) : [];
+      const analysisTask: Promise<Analysis | null> = analyzerIds.length
+        ? headFileTexts(live.pr, [...changedLines(filtered).keys()], 100).then((files) => runAnalyzers(files, filtered, analyzerIds)).catch((e: Error) => analysisFailed(analyzerIds, e.message))
+        : Promise.resolve(null);
 
       const outsideImpact = await sliceOutsideDiffImpact(repoOf(live.pr), diff, (live.pr.files || []).map((f) => f.path));
       live.outsideDiffImpact = outsideImpact;
@@ -321,6 +366,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
                 .join("\n\n");
             }
           } catch {}
+          deltaDiff = filterDiff(deltaDiff, rc).diff;
         }
         const shortPrev = (prevSha || currentHeadSha || "prev").slice(0, 7);
         const shortHead = (currentHeadSha || prevSha || "head").slice(0, 7);
@@ -385,16 +431,20 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
               live.pending.scores = false;
               live.pending.gates = false;
             }
-          }, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes)
+          }, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes, checks)
         : Promise.resolve(null);
 
       const needLlmForScores = runScores && !s1.enabled;
       const llmTask = (runLlm || needLlmForScores) && llmReady
-        ? judge(live.pr, diff, c, rc, guide, !s1.enabled, gitHistory, (partial) => {
+        ? analysisTask.then((analysis) => { if (analysis) live.analyzers = analysis.runs; return judge(live.pr, diff, c, rc, guide, !s1.enabled, gitHistory, (partial) => {
             if (runLlm) {
               live.review = { ...live.review, ...partial, scores: live.review.scores };
             }
-          }, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes).then(({ blastRadius: llmBlast, ...nav }): Judgement => {
+          }, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes, s1.enabled ? [] : checks, analysis?.results || []).then((j) => redactDeep(j, analysis?.secrets || [])); }).then(({ blastRadius: llmBlast, checks: llmChecks, ...nav }): Judgement => {
+            if (llmChecks) {
+              live.gates = llmChecks;
+              live.pending.gates = false;
+            }
             const scores = (!runScores || s1.enabled)
               ? (hasValidScores(live.review.scores) ? live.review.scores : initialScores)
               : nav.scores;
@@ -441,6 +491,8 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
       } else if (!hasValidScores(review?.scores) && hasValidScores(initialScores)) {
         review = { ...review, scores: initialScores };
       }
+      // the code each finding points at, kept for the "Fix with AI" prompts
+      if (review?.findings?.length) review = { ...review, findings: review.findings.map((f) => (f.hunk || !f.file ? f : { ...f, hunk: hunkAt(diff, f.file, f.line) || undefined })) };
       const finalGates = typed?.gates || (live.gates?.length ? live.gates : cached?.gates) || [];
       let finalIncremental = cached?.incremental;
       if (incrementalCtx) {
@@ -480,13 +532,40 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
         linkedIssues: live.linkedIssues || [],
         gitHistory: live.gitHistory,
         at: new Date().toISOString(),
+        ...(live.analyzers ? { analyzers: live.analyzers } : !runLlm && cached?.analyzers ? { analyzers: cached.analyzers } : {}),
       };
+      const st = publish && checksRun ? checksStatus(finalGates) : null;
+      if (st) {
+        try {
+          await postCommitStatus(repoOf(live.pr), live.pr.headRefOid || "", CHECKS_CONTEXT, st.state, st.description, live.pr.url);
+        } catch (e) {
+          result.commentError = `Commit status ${CHECKS_CONTEXT}: ${(e as Error).message}`;
+        }
+      }
+      // Inline comments a later push fixed: the re-review dropped them, and a model confirms the delta fixes each one.
+      let fixed: Finding[] = [];
+      const dropped = (finalIncremental?.resolvedFindings || []).filter((f) => f.file);
+      if (publish && runLlm && rc.postInlineSuggestions && rc.resolveFixed && incrementalCtx?.deltaDiff && dropped.length) {
+        try {
+          fixed = await confirmFixedFindings(dropped, incrementalCtx.deltaDiff, s1, llmReady ? c : null);
+        } catch (e) {
+          result.commentError = `Checking fixed comments: ${(e as Error).message}`;
+        }
+      }
       await syncPrComments(result, repoOf(live.pr), {
+        resolveFixed: fixed,
         postScores: !!(publish && runScores && rc.postScores && (typed || review?.scores)),
         postReview: !!(publish && runLlm && rc.postReview && review?.summary),
         postInlineSuggestions: !!(publish && runLlm && rc.postInlineSuggestions &&(review?.findings || []).some((f) => !f.dismissed && (f.suggestion || f.line))),
       });
       await store.put(result);
+      const llmRan = llmReady && (runLlm || needLlmForScores);
+      const posted = Number((result.commentsPosted || []).map((s) => /^inline suggestions \((\d+)\)$/.exec(s)?.[1]).find(Boolean) || 0);
+      await recordEvent(reviewEvent(result, repoOf(live.pr), Date.now() - started, usage, estimateCost(
+        llmRan ? { provider: c.provider, model: c.model, local: !!c.local } : null,
+        runScores && s1.enabled ? { provider: s1.provider, model: s1.model, local: !!s1.local } : null,
+        usage,
+      ), posted));
       entry.state = result;
       entry.done = true;
       setTimeout(() => { if (activeReviews.get(live.pr.url) === entry) activeReviews.delete(live.pr.url); }, 30000).unref?.();
@@ -494,19 +573,64 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
     } catch (e) {
       entry.error = (e as Error).message;
       entry.done = true;
+      if (publish && checksRun) await postCommitStatus(repoOf(live.pr), live.pr.headRefOid || "", CHECKS_CONTEXT, "error", `Checks not run: ${entry.error}`, live.pr.url).catch(() => {});
       // The next poll reports the error; without a poller the entry (and its live state) would stay in memory for good.
       setTimeout(() => { if (activeReviews.get(live.pr.url) === entry) activeReviews.delete(live.pr.url); }, 120000).unref?.();
       throw e;
     }
-  })();
+  });
   // Async polling reads entry.error on the next request; keep background failures handled.
   entry.promise.catch(() => {});
 
   return live;
 }
 
-export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r.pr), { findingIdx = null }: { findingIdx?: number | string | null } = {}): Promise<InlineResult> {
+// <resolve-fixed>
+// What identifies an inline comment CodeOtter posted for a finding: the hidden marker and the bold title, both in its body.
+export function inlineAnchor(f: Finding): { line: number; marker: string; heading: string } {
+  const line = Number(f.line) > 0 ? Math.round(Number(f.line)) : 1;
+  return { line, marker: `<!-- codeotter:suggestion:${f.file}:${line} -->`, heading: `**${f.title || "Suggested fix"}**` };
+}
+// Resolve the inline comments CodeOtter posted for findings a later push fixed. GitHub: the review thread is resolved
+// through GraphQL, or answered when this token may not resolve it, with the identity that posted it (the App bot where
+// installed, ghAsApp); other git servers go through their adapter.
+const THREADS_QUERY = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor}nodes{id isResolved viewerCanResolve viewerCanReply comments(first:1){nodes{body viewerDidAuthor}}}}}}}";
+interface GhThread { id?: unknown; isResolved?: unknown; viewerCanResolve?: unknown; viewerCanReply?: unknown; comments?: { nodes?: ({ body?: unknown; viewerDidAuthor?: unknown } | null)[] } }
+export async function resolveFixedComments(pr: Pick<PullRequest, "url" | "number">, repo: string, fixed: Finding[], sha: string): Promise<number> {
+  const anchors = fixed.filter((f) => f.file).map((f) => inlineAnchor(deriveSuggestionFromDetail(f, "")));
+  if (!anchors.length) return 0;
+  const ours = (body: string) => anchors.some((a) => body.includes(a.marker) && body.includes(a.heading));
+  const note = `✅ Resolved in \`${String(sha).slice(0, 7)}\``;
+  if (isForgeRepo(repo)) return forgeOf(repo).resolveInline(repo, pr.number, ours, note);
+  if (!REPO_RE.test(repo)) throw new Error("Invalid repository");
+  const [owner, name] = repo.split("/");
+  const threads: GhThread[] = [];
+  for (let cursor = "", page = 0; page < 20; page++) {
+    const raw: unknown = JSON.parse(await ghAsApp(repo, ["api", "graphql", "-f", `query=${THREADS_QUERY}`, "-f", `owner=${owner}`, "-f", `name=${name}`, "-F", `number=${Number(pr.number)}`, ...(cursor ? ["-f", `cursor=${cursor}`] : [])]));
+    const rt = (raw as { data?: { repository?: { pullRequest?: { reviewThreads?: { nodes?: unknown; pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } } } } } } | null)?.data?.repository?.pullRequest?.reviewThreads;
+    if (Array.isArray(rt?.nodes)) threads.push(...(rt.nodes as GhThread[]));
+    if (rt?.pageInfo?.hasNextPage !== true || typeof rt.pageInfo.endCursor !== "string") break;
+    cursor = rt.pageInfo.endCursor;
+  }
+  let done = 0;
+  for (const t of threads) {
+    const first = t?.comments?.nodes?.[0];
+    if (!t || typeof t.id !== "string" || t.isResolved !== false || first?.viewerDidAuthor !== true || typeof first.body !== "string" || !ours(first.body)) continue;
+    if (t.viewerCanResolve === true) {
+      await ghAsApp(repo, ["api", "graphql", "-f", "query=mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}", "-f", `id=${t.id}`]);
+    } else if (t.viewerCanReply === true) {
+      await ghAsApp(repo, ["api", "graphql", "-f", "query=mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,body:$body}){comment{id}}}", "-f", `id=${t.id}`, "-f", `body=${note}`]);
+    } else continue;
+    done++;
+  }
+  return done;
+}
+// </resolve-fixed>
+
+export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r.pr), { findingIdx = null, agentPrompts }: { findingIdx?: number | string | null; agentPrompts?: boolean } = {}): Promise<InlineResult> {
   if (!r?.pr?.number || !repo || !REPO_RE.test(repo)) throw new Error("Invalid PR or repository");
+  // the repository's "Prompt for AI agents" setting unless the caller decides (/fix posts fixes, not findings)
+  const withPrompts = agentPrompts ?? (await reviewConfig(repo)).agentPrompts;
   const allFindings = Array.isArray(r.review?.findings) ? r.review.findings : [];
   const candidates =
     findingIdx !== null && findingIdx !== undefined
@@ -528,11 +652,11 @@ export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r
     .map((rawF): InlineComment | null => {
       const f = deriveSuggestionFromDetail(rawF, "");
       if (!f.file) return null;
-      const targetLine = Number(f.line) > 0 ? Math.round(Number(f.line)) : 1;
+      const { line: targetLine, marker, heading } = inlineAnchor(f);
       const explanation = String(f.detail || "").split("\n\n@@")[0].trim();
       const bodyLines = [
-        `<!-- codeotter:suggestion:${f.file}:${targetLine} -->`,
-        `🦦 **CodeOtter [${String(f.severity || "low").toUpperCase()}]** — **${f.title || "Suggested fix"}** (\`${f.file}:L${targetLine}\`)`,
+        marker,
+        `🦦 **CodeOtter [${String(f.severity || "low").toUpperCase()}]**${f.analyzer ? ` · ${f.analyzer}` : ""} — ${heading} (\`${f.file}:L${targetLine}\`)`,
         ...(explanation ? ["", explanation] : []),
         // Most git servers anchor a review comment on one line, so a multi-line fix is shown, not offered for commit
         // (GitHub and Azure DevOps take a line range).
@@ -544,6 +668,7 @@ export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r
               "```",
             ]
           : []),
+        ...(withPrompts ? ["", promptDetails(findingPrompt({ repo, pr: r.pr, guide: r.guide }, { ...f, hunk: rawF.hunk }))] : []),
       ];
       return {
         path: f.file,
@@ -598,7 +723,7 @@ export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r
 
   try {
     const args = buildReviewArgs(rawHeadSha.length >= 7);
-    await ghAsync(args);
+    await ghAsApp(repo, args);
     return {
       posted: comments.length,
       mode: "inline_review",
@@ -608,7 +733,7 @@ export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r
     try {
       if (rawHeadSha) {
         const argsNoSha = buildReviewArgs(false);
-        await ghAsync(argsNoSha);
+        await ghAsApp(repo, argsNoSha);
         return {
           posted: comments.length,
           mode: "inline_review",
@@ -633,7 +758,7 @@ export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r
           : []),
       ]),
     ].join("\n");
-    await ghAsync("pr", "comment", r.pr.url, "--body", fallbackBody);
+    await ghAsApp(repo, "pr", "comment", r.pr.url, "--body", fallbackBody);
     return {
       posted: comments.length,
       mode: "pr_comment_fallback",
@@ -642,8 +767,8 @@ export async function postInlineSuggestionsOnPr(r: InlineTarget, repo = repoOf(r
   }
 }
 
-export async function syncPrComments(r: CommentTarget, repo = repoOf(r.pr), { postScores = false, postReview = false, postInlineSuggestions = false, triage = null, extra = [] }: { postScores?: boolean; postReview?: boolean; postInlineSuggestions?: boolean; triage?: TriageResult | null; extra?: [string, string, string][] } = {}): Promise<string[]> {
-  if (!postScores && !postReview && !postInlineSuggestions && !triage && !extra.length) return [];
+export async function syncPrComments(r: CommentTarget, repo = repoOf(r.pr), { postScores = false, postReview = false, postInlineSuggestions = false, resolveFixed = [], triage = null, extra = [] }: { postScores?: boolean; postReview?: boolean; postInlineSuggestions?: boolean; resolveFixed?: Finding[]; triage?: TriageResult | null; extra?: [string, string, string][] } = {}): Promise<string[]> {
+  if (!postScores && !postReview && !postInlineSuggestions && !resolveFixed.length && !triage && !extra.length) return [];
   // on a git server, a marker comment counts only when this token wrote it (where the server can say who that is)
   const commentAuthor = isForgeRepo(repo) ? await forgeOf(repo).me(repo) : null;
   let existingComments: { id?: number | string; body?: unknown; user?: { id?: unknown } | null }[] = [];
@@ -661,14 +786,20 @@ export async function syncPrComments(r: CommentTarget, repo = repoOf(r.pr), { po
         await forgeOf(repo).editComment(repo, r.pr.number, existing.id, body);
         return `${label} (updated)`;
       }
-      await ghAsync(["api", "--method", "PATCH", `repos/${repo}/issues/comments/${existing.id}`, "-f", `body=${body}`]);
+      // a marker comment the operator posted before the app existed: the bot may not edit it, the operator can
+      const patch = ["api", "--method", "PATCH", `repos/${repo}/issues/comments/${existing.id}`, "-f", `body=${body}`];
+      await ghAsApp(repo, patch).catch(() => ghAsync(patch));
       return `${label} (updated)`;
     }
     await createPrComment(r.pr.url, repo, r.pr.number, body);
     return label;
   };
 
+  // Posted output carries only findings at or above the repository's minimum severity; the stored review keeps all.
+  const minSeverity = postReview || postInlineSuggestions ? (await reviewConfig(repo)).minSeverity : "nit";
+  const out: CommentTarget = minSeverity !== "nit" && Array.isArray(r.review?.findings) ? { ...r, review: { ...r.review, findings: postable(r.review.findings, minSeverity) } } : r;
   const posted: string[] = [];
+  const agentPrompts = postReview || postInlineSuggestions ? (await reviewConfig(repo)).agentPrompts : false;
   if (triage) posted.push(await upsert("<!-- codeotter:triage -->", formatTriageComment(triage), "triage"));
   for (const [marker, body, label] of extra) posted.push(await upsert(marker, body, label));
   if (postScores) {
@@ -680,22 +811,34 @@ export async function syncPrComments(r: CommentTarget, repo = repoOf(r.pr), { po
   }
   if (postReview) {
     try {
-      posted.push(await upsert("<!-- codeotter:review -->", formatReviewComment(r as ReviewRecord), "review")); // likewise postReview
+      posted.push(await upsert("<!-- codeotter:review -->", formatReviewComment(out as ReviewRecord, { agentPrompts, repo }), "review")); // likewise postReview
     } catch (e) {
       r.commentError = [r.commentError, (e as Error).message].filter(Boolean).join("; ");
     }
   }
   if (postInlineSuggestions) {
     try {
-      const inlineRes = await postInlineSuggestionsOnPr(r, repo);
+      const inlineRes = await postInlineSuggestionsOnPr(out, repo, { agentPrompts });
       if (inlineRes.posted > 0) posted.push(`inline suggestions (${inlineRes.posted})`);
     } catch (e) {
       r.commentError = [r.commentError, (e as Error).message].filter(Boolean).join("; ");
     }
   }
+  if (resolveFixed.length) {
+    try {
+      const n = await resolveFixedComments(r.pr, repo, resolveFixed, String(r.headSha || r.pr.headRefOid || r.pr.headSha || ""));
+      if (n > 0) posted.push(`resolved fixed comments (${n})`);
+    } catch (e) {
+      r.commentError = [r.commentError, `Resolving fixed comments: ${(e as Error).message}`].filter(Boolean).join("; ");
+    }
+  }
   if (posted.length) r.commentsPosted = posted;
+  // outside a request or a comment command, posting is the automation's
+  if (posted.length) await audit(currentActor(AUTO), "review.post", r.pr.url, { posted }, orgOfRepo(repo));
   return posted;
 }
+
+const customCount = (checks: { mode: string }[]): number => checks.filter((ch) => ch.mode !== "off").length;
 
 export async function score(ref: string, force: boolean, repo?: string): Promise<ReviewRecord> {
   const initial = await startOrPollReview(ref, force, repo);

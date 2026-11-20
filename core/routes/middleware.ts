@@ -4,6 +4,7 @@ import { createMiddleware } from "hono/factory";
 import { getCookie, setCookie } from "hono/cookie";
 import { APP_URL } from "../config.ts";
 import { gate as decide } from "../access.ts";
+import { actorOf, withActor } from "../audit.ts";
 import type { Access, GateResult } from "../access.ts";
 
 // The viewer gate() leaves on the context: { user, role } of an allowed request.
@@ -24,7 +25,8 @@ export const gate = <E extends Env = Env>(level: Access | ((c: Context<E>) => Ac
     const g = await decide(session(c), typeof level === "function" ? level(c) : level);
     if (!g.ok) return c.json(g.refusal, 403);
     c.set("viewer", g);
-    await next();
+    // audit() calls made while handling the request (and work it starts) name this viewer
+    await withActor(actorOf(g.user), next);
   });
 
 // Cross-site requests never reach the API (defence in depth on top of SameSite=Lax cookies).

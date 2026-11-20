@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { DitherCanvas } from "@/components/dither-canvas";
 import { toast } from "sonner";
-import { Loader2 } from "lucide-react";
+import { KeyRound, Loader2 } from "lucide-react";
 
 // Split login: the left column is the only way in (GitHub), the right column is showcase real estate whose content
 // comes from the server (showcase.json) so sponsors, community and case studies change without a code change.
@@ -48,12 +48,20 @@ export const MicrosoftMark = () => (
   </svg>
 );
 
+export const GitLabMark = () => (
+  <svg viewBox="0 0 24 24" className="size-5" fill="currentColor" aria-hidden="true">
+    <path d="m23.6004 9.5927-.0337-.0862L20.3.9814a.851.851 0 0 0-.3362-.405.8748.8748 0 0 0-.9997.0539.8748.8748 0 0 0-.29.4399l-2.2055 6.748H7.5375l-2.2057-6.748a.8573.8573 0 0 0-.29-.4412.8748.8748 0 0 0-.9997-.0537.8585.8585 0 0 0-.3362.4049L.4332 9.5015l-.0325.0862a6.0657 6.0657 0 0 0 2.0119 7.0105l.0113.0087.03.0213 4.976 3.7264 2.462 1.8633 1.4995 1.1321a1.0085 1.0085 0 0 0 1.2197 0l1.4995-1.1321 2.4619-1.8633 5.006-3.7489.0125-.01a6.0682 6.0682 0 0 0 2.0094-7.003z" />
+  </svg>
+);
+
 // The mark for a provider id (sign-in buttons use "azure" for Microsoft Entra ID).
 export function ProviderMark({ id, signIn = false }: { id: string; signIn?: boolean }) {
+  if (id === "gitlab") return <GitLabMark />;
   if (id === "forgejo") return <ForgejoMark />;
   if (id === "gitea") return <GiteaMark />;
   if (id === "bitbucket" || id === "bitbucketdc") return <BitbucketMark />;
   if (id === "azure") return signIn ? <MicrosoftMark /> : <AzureDevOpsMark />;
+  if (id === "sso") return <KeyRound className="size-5" aria-hidden="true" />;
   return <GitHubMark />;
 }
 

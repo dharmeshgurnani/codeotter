@@ -280,13 +280,13 @@ function buildAiReviewMarkdown(r: Review) {
   if (r.linkedIssues?.length) {
     lines.push(
       `- **Linked Issues (${r.linkedIssues.length})**: ${r.linkedIssues
-        .map((i) => `[#${i.number} ${i.title}](${i.url})${i.state ? ` (${i.state})` : ""}`)
+        .map((i) => `[${i.key || `#${i.number}`} ${i.title}](${i.url})${i.state ? ` (${i.state})` : ""}`)
         .join(" · ")}`,
     );
     for (const iss of r.linkedIssues) {
       const reqText = (iss.body || "").trim().replace(/\s+/g, " ").slice(0, 280);
       if (reqText) {
-        lines.push(`  - **#${iss.number} Requirements**: ${reqText}${(iss.body || "").trim().length > 280 ? "…" : ""}`);
+        lines.push(`  - **${iss.key || `#${iss.number}`} Requirements**: ${reqText}${(iss.body || "").trim().length > 280 ? "…" : ""}`);
       }
     }
   }
@@ -547,7 +547,8 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
     const k = w.file.split("/").slice(0, 3).join("/");
     cohorts.set(k, [...(cohorts.get(k) ?? []), w]);
   }
-  const check = (ok: boolean) => (ok ? "✅ Passed" : "⚠️ Warning");
+  // A failed custom "block" check fails; any other failed check warns.
+  const check = (ok: boolean, block = false) => <Badge tone={ok ? "ok" : block ? "bad" : "warn"}>{ok ? "Passed" : block ? "Failed" : "Warning"}</Badge>;
   const isScoreLoading = (key: string) => !!(pending?.scores && pending?.readyScores?.[key] === undefined);
   const prCommits = r.gitHistory?.prCommits ?? [];
   const bodyText = (p.body || "").trim();
@@ -675,14 +676,14 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
           )}
           {(r.linkedIssues ?? []).map((iss) => (
             <a
-              key={`${iss.repo || repo}#${iss.number}`}
+              key={`${iss.repo || repo}#${iss.key || iss.number}`}
               href={iss.url}
               target="_blank"
               rel="noreferrer"
-              title={iss.body ? `#${iss.number} ${iss.title}\n\n${iss.body.slice(0, 300)}` : `#${iss.number} ${iss.title}`}
+              title={`${iss.key || `#${iss.number}`} ${iss.title}${iss.body ? `\n\n${iss.body.slice(0, 300)}` : ""}`}
               className="hover:underline"
             >
-              <Badge tone="info"><span>#{iss.number}</span><span className="max-w-[220px] truncate">{iss.title}</span></Badge>
+              <Badge tone="info"><span>{iss.key || `#${iss.number}`}</span><span className="max-w-[220px] truncate">{iss.title}</span></Badge>
             </a>
           ))}
           <button
@@ -775,9 +776,19 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                 <Badge tone="accent">{activeLearnings.length} persistent rule{activeLearnings.length === 1 ? "" : "s"}</Badge>
               )}
             </div>
-            <a href="/settings/repos" className="text-xs font-medium text-brand hover:underline">
-              Manage rules in Settings →
-            </a>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                disabled={!r.agentPrompts?.all}
+                onClick={() => handleCopySuggestion("prompt:all", r.agentPrompts!.all)}
+                className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2.5 py-1 text-xs font-medium text-neutral-800 hover:bg-accent disabled:opacity-50"
+              >
+                <span>{copiedFixKey === "prompt:all" ? "✓ Copied prompt" : "Copy prompt for all"}</span>
+              </button>
+              <a href="/settings/repos" className="text-xs font-medium text-brand hover:underline">
+                Manage rules in Settings →
+              </a>
+            </div>
           </div>
 
           {learningNotice && (
@@ -795,6 +806,7 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                 const postingSug = postingSuggestionKey === fKey;
                 const postedSug = !!postedSuggestionKeys[fKey];
                 const copiedFix = copiedFixKey === fKey;
+                const fixPrompt = r.agentPrompts?.findings?.[idx] || "";
                 const sevTone = f.severity === "high" ? "bad" : f.severity === "medium" ? "warn" : f.severity === "low" ? "info" : "muted";
                 return (
                   <li key={fKey} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-4 py-2.5 text-sm">
@@ -805,6 +817,7 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                         {f.line ? (
                           <Badge tone="ok" mono>L{f.line}</Badge>
                         ) : null}
+                        {f.analyzer ? <Badge tone="accent" mono>{f.analyzer}</Badge> : null}
                         {typeof f.confidence === "number" ? (
                           <Badge mono title="Self-check score">{Math.round(f.confidence * 10)}/10</Badge>
                         ) : null}
@@ -823,6 +836,14 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                       )}
                     </div>
                     <div className="shrink-0 flex flex-wrap items-center gap-1.5">
+                      <button
+                        type="button"
+                        disabled={!fixPrompt}
+                        onClick={() => handleCopySuggestion(`prompt:${fKey}`, fixPrompt)}
+                        className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2.5 py-1 text-xs font-medium text-neutral-800 hover:bg-accent disabled:opacity-50"
+                      >
+                        <span>{copiedFixKey === `prompt:${fKey}` ? "✓ Copied prompt" : "Copy fix prompt"}</span>
+                      </button>
                       {f.suggestion && (
                         <button
                           type="button"
@@ -945,16 +966,25 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                 ...(r.linkedIssues?.length && !(r.gates ?? []).some((g) => g.id === "issue_requirements")
                   ? [[
                       "Issue requirements",
-                      <>{check(v.verdict !== "request_changes" && v.scores.quality >= 60)} <span className="text-muted-foreground">({r.linkedIssues.map((i) => `#${i.number}`).join(", ")})</span></>,
+                      <>{check(v.verdict !== "request_changes" && v.scores.quality >= 60)} <span className="text-muted-foreground">({r.linkedIssues.map((i) => i.key || `#${i.number}`).join(", ")})</span></>,
                     ] as React.ReactNode[]]
                   : []),
                 ...(r.gates ?? []).map((g) => [
-                  g.label,
-                  <>{check(g.pass)} <span className="text-muted-foreground">({Math.round(g.yes * 100)}% yes{g.id === "issue_requirements" && r.linkedIssues?.length ? ` · ${r.linkedIssues.map((i) => `#${i.number}`).join(", ")}` : ""})</span></>,
+                  <>{g.label}{g.mode === "block" && <Badge className="ml-1.5">blocking</Badge>}</>,
+                  <>{check(g.pass, g.mode === "block")} <span className="text-muted-foreground">({Math.round(g.yes * 100)}% yes{g.id === "issue_requirements" && r.linkedIssues?.length ? ` · ${r.linkedIssues.map((i) => i.key || `#${i.number}`).join(", ")}` : ""})</span></>,
                 ] as React.ReactNode[]),
                 ...(pending?.gates ? [["Merge gates", <InlineLoader key="g" text="Checking policy gates…" />] as React.ReactNode[]] : []),
               ]} />
             </details>
+            {r.analyzers?.length ? (
+              <details className="my-2.5"><summary className="cursor-pointer text-sm font-semibold">Static analysis</summary>
+                <Md head={["Analyzer", "Status", "On changed lines"]} rows={r.analyzers.map((a) => [
+                  a.label,
+                  <Badge key={a.id} tone={a.status === "ok" ? "ok" : a.status === "unavailable" ? "muted" : "warn"} title={a.error || `${Math.round(a.ms / 100) / 10} s`}>{a.status === "ok" ? "Ran" : a.status === "timeout" ? "Timed out" : a.status === "unavailable" ? "Not installed" : "Failed"}</Badge>,
+                  a.status === "ok" ? `${a.kept} of ${a.found}` : <span className="text-muted-foreground">{a.error || ""}</span>,
+                ] as React.ReactNode[])} />
+              </details>
+            ) : null}
           </div>
         </div>
 

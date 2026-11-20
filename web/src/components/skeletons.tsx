@@ -57,6 +57,21 @@ export function ReportSkeleton() {
   );
 }
 
+// Analytics: six stat cards, the volume bars, then the three tables.
+export function AnalyticsSkeleton() {
+  return (
+    <div className="space-y-8" aria-busy="true" aria-label="Loading">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        {Array.from({ length: 6 }, (_, i) => <StatCardSkeleton key={i} />)}
+      </div>
+      <section><SectionHeading w="w-32" /><Skeleton className="h-[186px] w-full rounded-[10px]" /></section>
+      <section><SectionHeading w="w-28" sub={false} /><TableSkeleton rows={2} cols={10} /></section>
+      <section><SectionHeading w="w-36" sub={false} /><TableSkeleton rows={4} widths={["w-16", "w-10", "w-10"]} /></section>
+      <section><SectionHeading w="w-28" sub={false} /><TableSkeleton rows={3} widths={["w-40", "w-10", "w-10", "w-10"]} /></section>
+    </div>
+  );
+}
+
 // Settings: sections of label/control rows with an action row, like the JSON form.
 export function FormSkeleton({ sections = [4, 3] }: { sections?: number[] }) {
   return (

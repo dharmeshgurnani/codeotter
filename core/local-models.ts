@@ -45,7 +45,7 @@ const errMessage = (e: unknown): string => (e as Error).message; // thrown value
 
 // Downloads with progress and resume. One at a time per target; state readable by the settings page.
 export const downloads = new Map<string, DownloadState>();
-async function downloadFile(url: string, dest: string, key: string): Promise<void> {
+export async function downloadFile(url: string, dest: string, key: string): Promise<void> {
   if (downloads.get(key)?.active) return;
   const st: DownloadState = { active: true, done: 0, total: 0, error: "" };
   downloads.set(key, st);
@@ -83,7 +83,7 @@ async function downloadFile(url: string, dest: string, key: string): Promise<voi
   }
 }
 // Runtimes: tried in catalog order per platform (e.g. a GPU build first, a CPU build as fallback).
-const TAR = process.platform === "win32" && existsSync(join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe")) ? join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe") : "tar";
+export const TAR = process.platform === "win32" && existsSync(join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe")) ? join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe") : "tar";
 let pythonFound: string | null = null; // probing up to four interpreters blocks the event loop for seconds; do it once per process
 export function findPython(): string {
   if (pythonFound !== null) return pythonFound;

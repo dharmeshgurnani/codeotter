@@ -1,15 +1,20 @@
 // Pull request comment bodies: scores, review and the blast-radius diagram.
 import { APP_URL } from "./config.ts";
 import { HOTSPOTS } from "./diff.ts";
+import { issueLabel } from "./context.ts";
 import { deriveSuggestionFromDetail, S1_SCORES } from "./engines.ts";
-import { effort, VERDICT } from "./views.ts";
+import { allFindingsPrompt, promptDetails } from "./fix.ts";
+import { effort, gateStatus, repoOf, VERDICT } from "./views.ts";
 import type { BlastRadius, ChangedFile, OutsideImpact } from "./diff.ts";
 import type { ScoreKey } from "./engines.ts";
 import type { ReviewBody, ReviewRecord } from "./review.ts";
 
 export type ScoresCommentInput = Pick<ReviewRecord, "pr" | "blast" | "review"> & Partial<Pick<ReviewRecord, "gates" | "linkedIssues" | "headSha" | "incremental">>;
 type MermaidInput = { pr: ReviewRecord["pr"]; blast?: Partial<BlastRadius>; review?: Partial<ReviewBody>; outsideDiffImpact?: OutsideImpact };
-export type ReviewCommentInput = ScoresCommentInput & MermaidInput;
+export type ReviewCommentInput = ScoresCommentInput & MermaidInput & { guide?: string | null };
+
+// A label in a markdown table cell: custom check names are user text, so no pipes, tags, backticks or line breaks.
+const mdCell = (s: string): string => String(s).replace(/[|<>`\s]+/g, " ").trim();
 
 export function formatScoresComment(r: ScoresCommentInput): string {
   const { pr, blast, review: v, gates = [], linkedIssues = [], headSha, incremental } = r;
@@ -33,7 +38,7 @@ export function formatScoresComment(r: ScoresCommentInput): string {
     `### 🦦 CodeOtter — Review Scores`,
     ...(shaNote ? ["", shaNote] : []),
     ...(linkedIssues.length
-      ? ["", `**Linked issue(s):** ${linkedIssues.map((i) => `[#${i.number} ${i.title}](${i.url})`).join(" · ")}`]
+      ? ["", `**Linked issue(s):** ${linkedIssues.map((i) => (i.url ? `[${issueLabel(i)} ${i.title}](${i.url})` : `${issueLabel(i)} ${i.title}`)).join(" · ")}`]
       : []),
     "",
     `| Metric | Score | Assessment |`,
@@ -41,9 +46,9 @@ export function formatScoresComment(r: ScoresCommentInput): string {
     ...rows.map(([label, score, desc]) => `| **${label}** | **${score}** / 100 | ${desc} |`),
   ];
   const checkRows = [
-    ...gates.map((g) => `| ${g.label} | ${g.pass ? "✅ Passed" : "⚠️ Warning"} (${Math.round(g.yes * 100)}% yes) |`),
+    ...gates.map((g) => `| ${mdCell(g.label)}${g.mode === "block" ? " (blocking)" : ""} | ${gateStatus(g)} (${Math.round(g.yes * 100)}% yes) |`),
     ...(linkedIssues.length && !gates.some((g) => g.id === "issue_requirements")
-      ? [`| Issue requirements | ${v.verdict !== "request_changes" && v.scores.quality >= 60 ? "✅ Passed" : "⚠️ Warning"} (${linkedIssues.map((i) => `#${i.number}`).join(", ")}) |`]
+      ? [`| Issue requirements | ${v.verdict !== "request_changes" && v.scores.quality >= 60 ? "✅ Passed" : "⚠️ Warning"} (${linkedIssues.map(issueLabel).join(", ")}) |`]
       : []),
   ];
   if (checkRows.length) {
@@ -186,13 +191,17 @@ function buildBlastMermaid(r: MermaidInput): string {
   return out.join("\n");
 }
 
-export function formatReviewComment(r: ReviewCommentInput): string {
-  const { pr, blast, review: v, linkedIssues = [], headSha, incremental } = r;
+// agentPrompts: add the collapsed "Prompt for AI agents" block for the actionable findings (a per-repository setting).
+export function formatReviewComment(r: ReviewCommentInput, { agentPrompts = false, repo = "" }: { agentPrompts?: boolean; repo?: string } = {}): string {
+  const { pr, blast, review: v, gates = [], linkedIssues = [], headSha, incremental } = r;
+  const custom = gates.filter((g) => g.mode);
   const appLink = `${APP_URL}/review?pr=${encodeURIComponent(pr.url)}`;
   const [vl] = VERDICT[v.verdict] || ["Commented"];
   const e = effort(blast);
   const actionable = (v.findings || []).filter((f) => !f.dismissed && f.severity !== "nit").map((f) => deriveSuggestionFromDetail(f, ""));
   const resolved = incremental?.resolvedFindings || [];
+  const open = (v.findings || []).filter((f) => !f.dismissed && f.severity !== "nit");
+  const prompt = agentPrompts && open.length ? promptDetails(allFindingsPrompt({ repo: repo || repoOf(pr), pr, guide: r.guide }, open)) : "";
   const lines = [
     `<!-- codeotter:review -->`,
     `### 🦦 CodeOtter — PR Review Summary`,
@@ -210,9 +219,12 @@ export function formatReviewComment(r: ReviewCommentInput): string {
           `#### Linked Issues & Requirements`,
           ...linkedIssues.map((i) => {
             const req = (i.body || "").trim().replace(/\s+/g, " ").slice(0, 220);
-            return `- [#${i.number} ${i.title}](${i.url})${i.state ? ` (${i.state})` : ""}${req ? ` — ${req}${(i.body || "").trim().length > 220 ? "…" : ""}` : ""}`;
+            return `- ${i.url ? `[${issueLabel(i)} ${i.title}](${i.url})` : `${issueLabel(i)} ${i.title}`}${i.state ? ` (${i.state})` : ""}${req ? ` — ${req}${(i.body || "").trim().length > 220 ? "…" : ""}` : ""}`;
           }),
         ]
+      : []),
+    ...(custom.length
+      ? ["", "#### Pre-merge checks", "| Check | Status |", "| :--- | :--- |", ...custom.map((g) => `| ${mdCell(g.label)}${g.mode === "block" ? " (blocking)" : ""} | ${gateStatus(g)} |`)]
       : []),
     "",
     `#### Summary`,
@@ -236,6 +248,7 @@ export function formatReviewComment(r: ReviewCommentInput): string {
                 : []),
             ];
           }),
+          ...(prompt ? ["", prompt] : []),
         ]
       : []),
     ...(resolved.length

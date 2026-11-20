@@ -11,7 +11,8 @@ import { PB_URL, store } from "../store.ts";
 import type { AuthResult } from "../store.ts";
 import { forgetGithubRepos } from "../git.ts";
 import { ENTRA_TENANT_RE, entraTenant, LOGIN_PROVIDERS, oauthFlows } from "../settings-pages.ts";
-import { admit, currentUser, NOT_INVITED } from "../access.ts";
+import { admit, currentUser, NOT_INVITED, SSO_PB, ssoEmail, ssoRequired, userView } from "../access.ts";
+import { actorOf, audit } from "../audit.ts";
 import { cookie, own, session } from "./middleware.ts";
 
 export const auth = new Hono();
@@ -24,7 +25,18 @@ auth.get("/api/login", async (c) => {
   const file = join(import.meta.dirname, "..", "showcase.json");
   const showcase = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : { headline: "Code Otter", sub: "", groups: [] };
   let providers: { id: string; label: string }[] = [];
-  if (PB_URL) { try { const m = await store.authMethods(); providers = Object.entries(LOGIN_PROVIDERS).filter(([, spec]) => m.oauth2?.enabled && m.oauth2.providers.some((p) => p.name === spec.pb)).map(([id, spec]) => ({ id, label: spec.label })); } catch {} }
+  if (PB_URL) {
+    try {
+      const m = await store.authMethods();
+      const only = await ssoRequired();
+      // SSO's button carries the display name the admin gave it (Okta, Google Workspace, ...)
+      providers = Object.entries(LOGIN_PROVIDERS).flatMap(([id, spec]) => {
+        const p = m.oauth2?.enabled ? m.oauth2.providers.find((x) => x.name === spec.pb) : undefined;
+        if (!p || (only && spec.pb !== SSO_PB)) return [];
+        return [{ id, label: spec.pb === SSO_PB ? p.displayName || spec.label : spec.label }];
+      });
+    } catch {}
+  }
   return c.json({ showcase, signInAvailable: !!PB_URL, configured: providers.length > 0, providers });
 });
 
@@ -49,6 +61,7 @@ auth.get("/api/auth/start", async (c) => {
   const id = c.req.query("provider") || "github";
   const spec = own(LOGIN_PROVIDERS, id);
   if (!spec) throw new Error("Unsupported sign-in provider");
+  if (spec.pb !== SSO_PB && (await ssoRequired())) throw new Error("Sign in with SSO");
   const provider = m.oauth2?.enabled && m.oauth2.providers.find((p) => p.name === spec.pb);
   if (!provider) throw new Error(`${spec.label} sign-in is not configured: open Admin / Auth providers`);
   const back = c.req.query("back") || "/";
@@ -75,7 +88,9 @@ auth.get("/auth/callback", async (c) => {
   }
   if (!flow || flow.expires < Date.now() || flow.state !== q.state) return fail("Sign-in state mismatch, try again");
   if (q.error) return fail(q.error_description || q.error);
-  let signedIn: AuthResult;
+  let signedIn: AuthResult | undefined;
+  // the provider's login, or the account's email, for the audit log (a refused sign-in has no account left)
+  const who = () => signedIn?.meta?.username || signedIn?.record.email || "";
   try {
     signedIn = await store.authWithOAuth2({ provider: flow.provider, code: q.code, codeVerifier: flow.codeVerifier, redirectURL: `${APP_URL}/auth/callback` });
     // First account: owner. Later ones need an invite; an uninvited account is deleted again, never left usable.
@@ -85,13 +100,23 @@ auth.get("/auth/callback", async (c) => {
       const p = (await store.getOAuth()).providers.find((x) => x.name === "microsoft");
       if (ENTRA_TENANT_RE.test(entraTenant(p))) entraEmail = String(signedIn.meta?.email || signedIn.meta?.rawUser?.mail || signedIn.meta?.rawUser?.userPrincipalName || "");
     }
+    // SSO: a verified email in an allowed domain. PocketBase links a new OAuth identity to an existing account with the
+    // same email, so an account that also signs in another way is reached through SSO only with such an address.
+    if (flow.provider === SSO_PB) {
+      entraEmail = await ssoEmail(signedIn.record, signedIn.meta?.rawUser);
+      if (!entraEmail && signedIn.record.role && (await store.identities(signedIn.record.id)).some((p) => p !== SSO_PB)) return fail("SSO sign-in needs a verified email in an allowed domain");
+    }
     if (!(await admit(signedIn.record, [flow.provider], signedIn.meta?.username, entraEmail))) {
-      await store.deleteUser(signedIn.record.id).catch((e) => console.error(`Could not delete uninvited account ${signedIn.record.id}: ${e.message}`));
+      const refused = signedIn.record.id;
+      await store.deleteUser(refused).catch((e) => console.error(`Could not delete uninvited account ${refused}: ${e.message}`));
+      await audit({ id: "anonymous", name: who() || "anonymous" }, "signin.refused", who(), { provider: flow.provider, reason: NOT_INVITED });
       return fail(NOT_INVITED);
     }
   } catch (e) {
+    await audit({ id: "anonymous", name: who() || "anonymous" }, "signin.refused", who(), { provider: flow.provider, reason: e instanceof Error ? e.message : String(e) });
     return fail(e instanceof Error ? e.message : String(e));
   }
+  await audit({ id: signedIn.record.id, name: userView(signedIn.record).name }, "signin.success", who(), { provider: flow.provider, role: signedIn.record.role || "" });
   cookie(c, "pr_auth", signedIn.token, 14 * 86400);
   return c.redirect(flow.back || "/", 302);
 });
@@ -130,6 +155,7 @@ auth.get("/github/manifest/callback", async (c) => {
   cookie(c, "pr_manifest", "", 0);
   cookie(c, "pr_manifest_return", "", 0);
   forgetGithubRepos();
+  await audit(actorOf(await currentUser(session(c)).catch(() => null)), "git-provider.app", "github", { slug: app.slug || "" });
   if (app.slug && returnTo.startsWith("/onboarding")) return c.redirect(`https://github.com/apps/${encodeURIComponent(app.slug)}/installations/new`, 302);
   return c.redirect(`${returnTo}?connected=${encodeURIComponent(app.html_url || app.slug || "github")}`, 302);
 });

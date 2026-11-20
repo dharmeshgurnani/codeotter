@@ -6,6 +6,7 @@ import { createHmac, timingSafeEqual, randomBytes } from "node:crypto";
 import { test } from "node:test";
 import { serverBlocks } from "./helpers/server-blocks.ts";
 import { makeForge, secretMatches, type ForgeConfig } from "../core/forges.ts";
+import { skipReason } from "../core/repo-rules.ts";
 
 // What the evaluated blocks return, as far as the tests use it.
 type Headers = Record<string, string | undefined>;
@@ -62,10 +63,14 @@ function load({ scoreFails = false, repos = ["acme/app", "gitea~acme/lib", "bitb
     spawn: () => { throw new Error("no spawn in tests"); },
     fetch: async () => { throw new Error("no network in tests"); },
     createGitHubAppJwt: () => "jwt",
+    AUTO: { id: "auto", name: "auto" },
+    withActor: (_actor: unknown, fn: () => unknown) => fn(),
     forgetGithubRepos: () => {},
     store: { getSetting: async (k: string) => settings.get(k) ?? null, setSetting: async (k: string, v: unknown) => { settings.set(k, v); } },
     triageConfig: async () => ({ auto: false, ...(settings.get("triage") || {}) }),
     reviewConfig: async () => ({ auto: false, commands: false, ...(settings.get("review") || {}) }),
+    effectiveRules: async (_repo: string, ui: object) => ui,
+    skipReason,
     repoOf: (pr: { url: string }) => String(pr.url).replace("https://github.com/", "").split("/pull/")[0],
     ghEnv: () => process.env,
     repos: async () => repos,

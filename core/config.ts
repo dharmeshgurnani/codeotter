@@ -18,6 +18,9 @@ if (existsSync(ENV_FILE) && typeof process.loadEnvFile === "function") {
 }
 
 export const PORT = process.env.PORT || 4747;
+// Audit log retention: the newest AUDIT_MAX entries, none older than AUDIT_DAYS.
+export const AUDIT_MAX = Math.max(100, Number(process.env.CODEOTTER_AUDIT_MAX) || 10000);
+export const AUDIT_DAYS = Math.max(1, Number(process.env.CODEOTTER_AUDIT_DAYS) || 180);
 // Public address of this app, used for the OAuth callback. Set APP_URL when deployed behind a domain.
 // Render and Railway publish the service's own address, so one-click deploys work without setting it.
 export const APP_URL = (process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || (process.env.RAILWAY_PUBLIC_DOMAIN && `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`) || `http://localhost:${PORT}`).replace(/\/+$/, "");
@@ -40,6 +43,7 @@ export const FORGES: Record<string, ForgeConfig> = {
   bitbucket: { kind: "bitbucket", label: "Bitbucket", pb: "bitbucket", fixed: true, url: "https://bitbucket.org", token: process.env.BITBUCKET_TOKEN || "", user: process.env.BITBUCKET_USER || "" },
   bitbucketdc: { kind: "bitbucketdc", label: "Bitbucket Data Center", url: forgeOrigin(process.env.BITBUCKET_DC_URL || ""), token: process.env.BITBUCKET_DC_TOKEN || "" },
   azure: { kind: "azure", label: "Azure DevOps", pb: "microsoft", signInLabel: "Microsoft", fixed: true, url: "https://dev.azure.com", token: process.env.AZURE_DEVOPS_TOKEN || "", orgs: envList(process.env.AZURE_DEVOPS_ORGS) },
+  gitlab: { kind: "gitlab", label: "GitLab", pb: "gitlab", url: forgeOrigin(process.env.GITLAB_URL || ""), token: process.env.GITLAB_TOKEN || "" },
 };
 export const FORGE_IDS = Object.keys(FORGES);
 export const FORGE_API: Record<string, Forge> = Object.fromEntries(FORGE_IDS.map((id) => [id, makeForge(id, FORGES[id])]));
@@ -65,9 +69,10 @@ export function availableUpdate(): { version: string; url: string } | null {
 }
 // Declared before repoFromCwd() runs below: a const used before its declaration throws, and the catch blocks there would hide it.
 // <repo-id>
-// owner/name everywhere, except Azure DevOps: azure~org/project/repo, whose project and repository names may hold spaces.
-export const OWNER_RE = /^(?:(?:forgejo|gitea|bitbucket|bitbucketdc|azure)~)?[\w][\w.-]*$/;
-export const REPO_RE = /^(?:(?:(?:forgejo|gitea|bitbucket|bitbucketdc)~)?[\w][\w.-]*\/[\w][\w.-]*|azure~[\w][\w.-]*\/[\w](?:[\w. -]*[\w.-])?\/[\w](?:[\w. -]*[\w.-])?)$/;
+// owner/name everywhere, except Azure DevOps: azure~org/project/repo, whose project and repository names may hold spaces,
+// and GitLab: gitlab~group[/subgroup...]/project (nested groups, up to 20 segments).
+export const OWNER_RE = /^(?:(?:forgejo|gitea|bitbucket|bitbucketdc|azure|gitlab)~)?[\w][\w.-]*$/;
+export const REPO_RE = /^(?:(?:(?:forgejo|gitea|bitbucket|bitbucketdc)~)?[\w][\w.-]*\/[\w][\w.-]*|azure~[\w][\w.-]*\/[\w](?:[\w. -]*[\w.-])?\/[\w](?:[\w. -]*[\w.-])?|gitlab~[\w][\w.-]*(?:\/[\w][\w.-]*){1,19})$/;
 // </repo-id>
 export const REPO: string = process.env.REPO || (FORGE_IDS.some(forgeActive) ? "" : repoFromCwd());
 function repoFromCwd(): string {

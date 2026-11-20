@@ -5,28 +5,34 @@ import { APP_URL, FORGE_API, FORGE_IDS, forgeOrigin, FORGES, REPO_RE } from "./c
 import { contextNote, listModels, LOCAL, LOCAL_LLM, LOCAL_S1, modelCache, modelIcon, modelPath, modelReady, providerIcon, PROVIDERS, runtimeAssets, runtimeBin, RUNTIMES, S1_PROVIDERS } from "./providers.ts";
 import { downloadModel, downloads, ensureRuntime, findPython, localStatus, sidecars, stopSidecar, venvPython } from "./local-models.ts";
 import { PB_URL, store } from "./store.ts";
-import { applyGithubToken, cleanRepo, forgeApi, forgeId, forgeOf, ghAsync, isForgeRepo, nativeRepo, repoLabel, repos, repositoryChoices } from "./git.ts";
+import { applyGithubToken, appPostingActive, cleanRepo, forgeApi, forgeId, forgeOf, ghAsync, isForgeRepo, nativeRepo, repoLabel, repos, repositoryChoices } from "./git.ts";
 import { askModel, askSystemOne, llmConfig, s1Config } from "./models.ts";
-import { getRepoAccepted, getRepoLearnings, guideCache, guideFiles, normalizeLearningList, normalizeReview, REVIEW_DEFAULTS, reviewConfig } from "./context.ts";
+import { getRepoAccepted, getRepoLearnings, guideCache, guideFiles, normalizeLearningList, repoConfigFile, REVIEW_DEFAULTS, reviewConfig, storedReview } from "./context.ts";
 import { triageConfig } from "./review.ts";
 import { actionSecret, describeDelivery, forwarderStatus, LOCAL_APP_URL, reposChanged, syncForwarders, webhookUrl } from "./queue.ts";
 import { repoOf } from "./views.ts";
-import { accessQueue, allowed, effectiveRole, isRole, onboardedRepo, ROLES, userView } from "./access.ts";
+import { clearTicketCache, jiraBase, LINEAR_API, testJira, testLinear, trackerKeys, trackerSettings } from "./trackers.ts";
+import { accessQueue, allowed, effectiveRole, emailDomainAllowed, isEmailDomain, isRole, onboardedRepo, ROLES, SSO_PB, userView } from "./access.ts";
+import { auditPage, auditRepos } from "./audit.ts";
 import type { Access, Role, SessionUser } from "./access.ts";
 import type { Cell, CellObject, Tone } from "./views.ts";
-import type { OAuthProviderConfig } from "./store.ts";
+import type { OAuthProviderConfig, SsoSetting } from "./store.ts";
 import type { ProviderDef } from "./providers.ts";
 import type { LocalModel } from "./local-models.ts";
 import type { ReviewSettings } from "./context.ts";
+import { CONFIG_FILE, rulesAsText } from "./repo-rules.ts";
+import type { TrackerSettings } from "./trackers.ts";
+import { analyzerAsset, analyzerBin, ANALYZER_IDS, ANALYZERS, canInstall, installAnalyzer, isAnalyzerId, removeAnalyzer } from "./analyzers.ts";
 
 // Page JSON drawn by web/src/components/json-form.tsx (Field, Section, Action, Row there).
 export type Option = { value: string | number; label: string; icon?: string };
-export type FieldType = "text" | "password" | "select" | "multiselect" | "combo" | "picker" | "number" | "range" | "checkbox" | "readonly" | "list" | "table";
+export type FieldType = "text" | "password" | "select" | "multiselect" | "combo" | "picker" | "number" | "range" | "checkbox" | "readonly" | "list" | "table" | "textarea" | "rows";
 export type Field = {
   key: string;
   label: string;
   type: FieldType;
   columns?: { key: string; label: string }[];
+  fields?: Field[]; // rows: sub-fields of each repeatable row
   hint?: string;
   text?: string;
   placeholder?: string;
@@ -58,7 +64,8 @@ export interface SettingsPage {
   title: string;
   group: SettingsGroup;
   access: Access;
-  load(scope?: PageScope, user?: SessionUser | null): Promise<PageData>;
+  // `view`: the body just posted (a page whose Apply only changes what it shows, e.g. the audit log's filter).
+  load(scope?: PageScope, user?: SessionUser | null, view?: Body): Promise<PageData>;
   save(body: Body, scope?: PageScope): Promise<void>;
   test?(): Promise<{ ok: boolean; reply: string; ms?: number }>;
   actions?: Record<string, PageAction>;
@@ -79,10 +86,11 @@ const editedRow = (table: unknown, ok: (r: Record<string, unknown>) => boolean) 
 const mask = (secret: string | undefined) => (secret ? `\u2022\u2022\u2022\u2022${secret.slice(-4)}` : "");
 const byProvider = <T>(pick: (x: ProviderDef) => T) => Object.fromEntries(Object.entries(PROVIDERS).map(([k, x]) => [k, pick(x)]));
 // Sign-in providers: GitHub plus every git server PocketBase has an OAuth2 provider for (Azure DevOps signs in through
-// Microsoft Entra ID, so its row is "Microsoft"; Bitbucket Data Center has no sign-in).
+// Microsoft Entra ID, so its row is "Microsoft"; Bitbucket Data Center has no sign-in), plus generic OpenID Connect SSO.
 export const LOGIN_PROVIDERS: Record<string, LoginProvider> = {
   github: { label: "GitHub", pb: "github" },
   ...Object.fromEntries(FORGE_IDS.filter((id) => FORGES[id].pb).map((id) => [id, { label: FORGES[id].signInLabel || FORGES[id].label, pb: FORGES[id].pb || "" }])),
+  sso: { label: "SSO", pb: SSO_PB },
 };
 export const oauthFlows = new Map<string, OAuthFlow>();
 // Microsoft Entra ID sign-in is pinned to one tenant: its users' email addresses are then set by that directory's admins,
@@ -96,7 +104,7 @@ const OAUTH_APP_LINKS: Record<string, string> = {
   microsoft: "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade",
 };
 // The PocketBase OAuth2 provider entry for a sign-in row. GitHub and Bitbucket use PocketBase's built-in endpoints;
-// Forgejo and Gitea point at their configured server; Microsoft at the one tenant.
+// Forgejo, Gitea and GitLab point at their configured server; Microsoft at the one tenant.
 export function oauthProvider(id: string, current: Partial<OAuthProviderConfig> | undefined, clientId: unknown, clientSecret: unknown, tenant: unknown = ""): OAuthProviderConfig {
   const spec = LOGIN_PROVIDERS[id];
   const base = { ...current, name: spec.pb, clientId: String(clientId || "").trim(), ...(clientSecret ? { clientSecret: String(clientSecret) } : {}) };
@@ -108,8 +116,43 @@ export function oauthProvider(id: string, current: Partial<OAuthProviderConfig> 
   }
   const url = FORGES[id].url;
   if (!url) throw new Error(`Set the ${spec.label} server under Admin / Git providers first`);
+  if (spec.pb === "gitlab") return { ...base, displayName: spec.label, pkce: true, authURL: `${url}/oauth/authorize`, tokenURL: `${url}/oauth/token`, userInfoURL: `${url}/api/v4/user` };
   return { ...base, displayName: spec.label, pkce: true,
     authURL: `${url}/login/oauth/authorize`, tokenURL: `${url}/login/oauth/access_token`, userInfoURL: id === "gitea" ? `${url}/api/v1/user` : `${url}/login/oauth/userinfo` };
+}
+// SSO: any OpenID Connect identity provider (Okta, Entra ID, Google Workspace, Keycloak, Authentik, JumpCloud), set up from
+// its issuer's discovery document. The admin's own server, so plain http is allowed only on this machine.
+const oidcUrl = (value: string, what: string): URL => {
+  let u: URL;
+  try { u = new URL(value); } catch { throw new Error(`${what} is not a URL`); }
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname);
+  if (u.username || u.password || u.hash || !(u.protocol === "https:" || (u.protocol === "http:" && local))) throw new Error(`${what} must be an https URL without credentials`);
+  return u;
+};
+export type OidcEndpoints = { issuer: string; authURL: string; tokenURL: string; userInfoURL: string; jwksURL: string };
+export async function discoverOidc(input: unknown): Promise<OidcEndpoints> {
+  const issuer = String(input || "").trim().replace(/\/\.well-known\/openid-configuration$/, "").replace(/\/+$/, "");
+  if (!issuer) throw new Error("Set the SSO issuer URL");
+  if (oidcUrl(issuer, "Issuer URL").search) throw new Error("Issuer URL must not have a query");
+  const where = `${issuer}/.well-known/openid-configuration`;
+  const res = await fetch(where, { headers: { accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(10000) }).catch((e: Error) => { throw new Error(`OIDC discovery failed at ${where}: ${e.message}`); });
+  if (!res.ok) throw new Error(`OIDC discovery failed at ${where}: ${res.status}`);
+  const d: unknown = await res.json().catch(() => null);
+  if (!isObj(d)) throw new Error(`OIDC discovery failed at ${where}: not JSON`);
+  if (typeof d.issuer !== "string" || d.issuer.replace(/\/+$/, "") !== issuer) throw new Error(`The discovery document names issuer ${String(d.issuer)}, not ${issuer}`);
+  const ep = (k: string) => { const v = d[k]; if (typeof v !== "string" || !v) throw new Error(`The discovery document has no ${k}`); return oidcUrl(v, k).href; };
+  return { issuer: d.issuer, authURL: ep("authorization_endpoint"), tokenURL: ep("token_endpoint"), userInfoURL: ep("userinfo_endpoint"), jwksURL: ep("jwks_uri") };
+}
+// "Allowed email domains" as typed: comma or space separated, an optional leading @.
+export function parseDomains(v: unknown): string[] {
+  const list = [...new Set((Array.isArray(v) ? v : String(v ?? "").split(/[\s,]+/)).map((x) => String(x).trim().toLowerCase().replace(/^@/, "")).filter(Boolean))];
+  for (const d of list) if (!isEmailDomain(d)) throw new Error(`Not an email domain: ${d}`);
+  return list;
+}
+// The PocketBase oidc2 entry: discovered endpoints, and the issuer plus JWKS so PocketBase checks the ID token.
+function ssoProvider(current: Partial<OAuthProviderConfig> | undefined, clientId: string, clientSecret: unknown, displayName: unknown, ep: OidcEndpoints): OAuthProviderConfig {
+  return { ...current, name: SSO_PB, clientId, ...(clientSecret ? { clientSecret: String(clientSecret) } : {}), displayName: String(displayName || "").trim().slice(0, 40) || "SSO", pkce: true,
+    authURL: ep.authURL, tokenURL: ep.tokenURL, userInfoURL: ep.userInfoURL, extra: { ...current?.extra, jwksURL: ep.jwksURL, issuers: [ep.issuer] } };
 }
 export const AZURE_ORG_RE = /^[\w][\w.-]*$/;
 export const FORGE_CONNECTIONS: Record<string, ForgeConnection> = Object.fromEntries(Object.entries(FORGES).map(([id, f]): [string, ForgeConnection] => [id, {
@@ -185,14 +228,14 @@ async function githubManifest(body: Body, http: CookieWriter): Promise<ActionRes
     // false: GitHub then sends the installer to setup_url (onboarding) instead of the sign-in callback
     request_oauth_on_install: false,
     // GitHub refuses a localhost webhook URL; a laptop gets events through the forwarder instead.
-    ...(LOCAL_APP_URL ? {} : { hook_attributes: { url: webhookUrl("github"), active: true }, default_events: ["pull_request", "issue_comment"] }),
+    ...(LOCAL_APP_URL ? {} : { hook_attributes: { url: webhookUrl("github"), active: true }, default_events: ["pull_request", "issue_comment", "pull_request_review_comment"] }),
   };
   return { submit: { url: `https://github.com/settings/apps/new?state=${state}`, fields: { manifest: JSON.stringify(manifest) } } };
 }
 // Admin / Git providers and Admin / Auth providers draw the same table: a row per provider with Provider, Server and Status.
 // Only the row's action differs: Test and a gear for the connection there, a sign-in toggle here.
 const PROVIDER_COLUMNS: { key: string; label: string }[] = [{ key: "provider", label: "Provider" }, { key: "server", label: "Server" }, { key: "status", label: "Status" }];
-const PROVIDER_ICONS: Record<string, string> = { github: "https://github.com/github.png?size=64", forgejo: "https://forgejo.org/favicon.svg", gitea: "https://github.com/go-gitea.png?size=64", bitbucket: "/providers/bitbucket.svg", bitbucketdc: "/providers/bitbucket.svg", azure: "/providers/azure-devops.svg", microsoft: "/providers/microsoft.svg" };
+const PROVIDER_ICONS: Record<string, string> = { github: "https://github.com/github.png?size=64", forgejo: "https://forgejo.org/favicon.svg", gitea: "https://github.com/go-gitea.png?size=64", bitbucket: "/providers/bitbucket.svg", bitbucketdc: "/providers/bitbucket.svg", gitlab: "/providers/gitlab.svg", azure: "/providers/azure-devops.svg", microsoft: "/providers/microsoft.svg", jira: "https://github.com/atlassian.png?size=64", linear: "https://github.com/linear.png?size=64" };
 const providerUrl = (id: string) => (id === "github" ? "https://github.com" : FORGES[id].url);
 // `as` overrides what the row shows (the Auth providers page draws Azure DevOps' sign-in as Microsoft Entra ID).
 function providerRow(id: string, status: CellObject, extra: Pick<Row, "actions" | "settings" | "toggle" | "toggleDisabled">, as: { label?: string; url?: string; icon?: string } = {}): Row {
@@ -208,6 +251,26 @@ function providerRow(id: string, status: CellObject, extra: Pick<Row, "actions" 
     },
     ...extra,
   };
+}
+// The SSO row: its server is the issuer; the dialog also holds the email domains, auto-admission and "Require SSO".
+function ssoRow(id: string, current: Partial<OAuthProviderConfig>, on: boolean, sso: SsoSetting): Row {
+  return providerRow(id, on ? { text: "Enabled", tone: "ok" } : { text: "Off", tone: "muted" }, {
+    toggle: on,
+    settings: {
+      title: "Sign in with OpenID Connect (SSO)",
+      fields: [
+        { key: "issuer", label: "Issuer URL", type: "text", placeholder: "https://acme.okta.com", hint: "Read from <issuer>/.well-known/openid-configuration." },
+        { key: "displayName", label: "Display name", type: "text", placeholder: "Okta" },
+        { key: "clientId", label: "Client ID", type: "text" },
+        { key: "clientSecret", label: "Client secret", type: "password", placeholder: current.clientId ? "Saved" : "", hint: current.clientId ? "Leave blank to keep the stored secret." : "" },
+        { key: "domains", label: "Allowed email domains", type: "text", placeholder: "acme.com, acme.io", hint: "Invites match verified emails in these domains only." },
+        { key: "autoAdmit", label: "Auto-admit", type: "checkbox", text: "Admit users of these domains as developer" },
+        { key: "require", label: "Require SSO", type: "checkbox", text: "Hide other sign-in buttons (owners: PR_SCORER_RECOVERY=1)" },
+        { key: "callback", label: "Redirect URI", type: "readonly" },
+      ],
+      values: { issuer: sso.issuer || "", displayName: current.displayName || "", clientId: current.clientId || "", clientSecret: "", domains: (sso.domains || []).join(", "), autoAdmit: !!sso.autoAdmit, require: !!sso.require, callback: `${APP_URL}/auth/callback` },
+    },
+  }, { label: on && current.displayName ? `${current.displayName} (SSO)` : "OpenID Connect (SSO)", url: sso.issuer || "", icon: "sso" });
 }
 export const SETTINGS_PAGES: Record<string, SettingsPage> = {
   repos: {
@@ -269,6 +332,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
       }
       const before = await repos();
       await store.setSetting("repos", next);
+      await auditRepos(before, next);
       reposChanged(before, next).catch((e) => console.warn(`[repos] ${e.message}`));
       const [guides, repoSettings] = await Promise.all([
         store.getSetting("guides").then((x) => ({ ...(x || {}) })),
@@ -294,7 +358,8 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
     access: "admin",
     async load({ org = "", repo = "" } = {}) {
       await onboardedRepo(repo, org);
-      const [rc, files, guides, learnings, accepted] = await Promise.all([reviewConfig(repo), guideFiles(repo), store.getSetting("guides"), getRepoLearnings(repo), getRepoAccepted(repo)]);
+      const [rc, files, guides, learnings, accepted, configFile] = await Promise.all([reviewConfig(repo), guideFiles(repo), store.getSetting("guides"), getRepoLearnings(repo), getRepoAccepted(repo),
+        repoConfigFile(repo).then((f) => (f ? `${CONFIG_FILE} on the default branch sets ${Object.keys(f).join(", ") || "nothing"}; those keys override the fields below` : `No ${CONFIG_FILE} at the root`), (e: Error) => e.message)]);
       // One section, one Save: review settings, guidelines and learnings are all this repository's.
       const sections: Section[] = [
         {
@@ -302,6 +367,8 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
           title: "Review",
           description: "How much the model reads, how many findings it returns, and what gets posted as PR comments.",
           fields: [
+            { key: "profile", label: "Profile", type: "select", options: [{ value: "chill", label: "Chill: high and medium only" }, { value: "balanced", label: "Balanced" }, { value: "assertive", label: "Assertive: nitpicks included" }] },
+            { key: "minSeverity", label: "Minimum severity to post", type: "select", options: (["nit", "low", "medium", "high"] as const).map((v) => ({ value: v, label: v[0].toUpperCase() + v.slice(1) })) },
             { key: "maxFindings", label: "Max findings", type: "range", min: 3, max: 12, step: 1 },
             { key: "diffChars", label: "Diff sent to the model", type: "select", options: [30000, 60000, 90000, 150000, 300000].map((v) => ({ value: v, label: `${v / 1000}k characters` })), hint: "Larger diffs cost more and may exceed the model's context." },
             { key: "contextLines", label: "Context above a change", type: "select", options: [0, 8, 16, 32].map((v) => ({ value: v, label: v ? `Up to ${v} lines, to the enclosing declaration` : "Off: git's 3 lines" })) },
@@ -310,8 +377,32 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             { key: "postScores", label: "Post scores on PR", type: "checkbox", text: "Add a PR comment with all System One scores after review" },
             { key: "postReview", label: "Add PR review as a comment", type: "checkbox", text: "Add a PR comment with the review summary and link to the full report" },
             { key: "postInlineSuggestions", label: "Post inline suggestions", type: "checkbox", text: "Post inline committable suggestion comments on PR diff lines" },
-            { key: "auto", label: "Auto-review", type: "checkbox", text: "Review every new or updated pull request and post the result (drafts and PRs labelled codeotter:skip are left alone)" },
-            { key: "commands", label: "PR comment commands", type: "checkbox", text: "Run /review, /describe, /improve, /ask, /docs and /changelog from comments by owners, members and collaborators" },
+            { key: "agentPrompts", label: "Prompt for AI agents", type: "checkbox", text: "Add a collapsed fix prompt for coding agents to posted review and inline comments" },
+            { key: "resolveFixed", label: "Resolve fixed comments", type: "checkbox", text: "Resolve CodeOtter's inline comments that a later push fixed" },
+            { key: "auto", label: "Auto-review", type: "checkbox", text: "Review every new or updated pull request and post the result (PRs labelled codeotter:skip are left alone)" },
+            { key: "configFile", label: "Repository config", type: "readonly" },
+            { key: "reviewDrafts", label: "Draft pull requests", type: "checkbox", text: "Auto-review drafts" },
+            { key: "skipAuthors", label: "Skip authors", type: "textarea", placeholder: "dependabot[bot]\nrenovate[bot]", hint: "One login per line, * wildcard." },
+            { key: "skipLabels", label: "Skip labels", type: "textarea", placeholder: "no-review" },
+            { key: "skipTitleKeywords", label: "Skip title keywords", type: "textarea", placeholder: "WIP\n[skip review]" },
+            { key: "skipBaseBranches", label: "Skip base branches", type: "textarea", placeholder: "gh-pages\nrelease/*" },
+            { key: "onlyBaseBranches", label: "Only base branches", type: "textarea", placeholder: "main", hint: "Empty: every base branch." },
+            { key: "pathInclude", label: "Include paths", type: "textarea", placeholder: "src/**", hint: "Globs, one per line. Empty: every file." },
+            { key: "pathExclude", label: "Exclude paths", type: "textarea", placeholder: "**/*.lock\ndist/\n*.min.js" },
+            { key: "pathInstructions", label: "Path instructions", type: "textarea", placeholder: "src/api/**: Every handler checks the session.\n**/*.sql: Migrations must be reversible.", hint: "glob: instructions, one per line. Sent to the language model when a matching file changes." },
+            { key: "commands", label: "PR comment commands", type: "checkbox", text: "Run /review, /describe, /improve, /ask, /docs, /changelog and /fix [n] from comments by owners, members and collaborators, and answer their replies under CodeOtter's inline comments (\"@codeotter remember <rule>\" saves a team learning)" },
+            ...ANALYZER_IDS.map((id): Field => ({ key: id, label: ANALYZERS[id].checks, type: "checkbox", text: `Run ${ANALYZERS[id].label} on the changed files; the language model confirms or rejects each result` })),
+            {
+              key: "checks",
+              label: "Pre-merge checks",
+              type: "rows",
+              fields: [
+                { key: "name", label: "Name", type: "text", placeholder: "Changelog" },
+                { key: "instructions", label: "Question (yes passes)", type: "text", placeholder: "Does a change to a public API come with a CHANGELOG entry?" },
+                { key: "mode", label: "Mode", type: "select", options: [{ value: "warn", label: "Warn" }, { value: "block", label: "Block" }, { value: "off", label: "Off" }] },
+              ],
+              hint: "A failed Block check fails the codeotter/checks commit status; Warn failures pass it with a note.",
+            },
             files.length ? { key: "useGuides", label: "Review guidelines", type: "checkbox", text: `Follow ${files.join(" + ")}` } : { key: "noGuides", label: "Review guidelines", type: "readonly" },
             { key: "learnings", label: "Team learnings", type: "list", hint: "Dismissed findings, kept as rules for this repository." },
             { key: "accepted", label: "Accepted fixes", type: "list" },
@@ -324,6 +415,8 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
         values: {
           repo: {
             ...Object.fromEntries((Object.keys(REVIEW_DEFAULTS) as (keyof ReviewSettings)[]).map((k) => [k, rc[k]])),
+            ...rulesAsText(rc),
+            configFile,
             ...(files.length ? { useGuides: guides?.[repo]?.use ?? true } : { noGuides: "No AGENTS.md or CLAUDE.md at the root" }),
             learnings,
             accepted,
@@ -349,7 +442,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
       };
       const prev = rs0?.[repo] || {};
       const reviewKeys = Object.keys(REVIEW_DEFAULTS).filter((k) => k in v);
-      const next = { ...prev, ...(reviewKeys.length ? { review: normalizeReview({ ...current, ...Object.fromEntries(reviewKeys.map((k) => [k, v[k]])) }) } : {}) };
+      const next = { ...prev, ...(reviewKeys.length ? { review: storedReview(current, Object.fromEntries(reviewKeys.map((k) => [k, v[k]]))) } : {}) };
       const g = { ...(guides0?.[repo] || {}), ...("useGuides" in v ? { use: !!v.useGuides } : {}) };
       if ("learnings" in v) { next.learnings = pruned(await getRepoLearnings(repo), v.loadedLearnings, v.learnings); g.learnings = next.learnings; }
       if ("accepted" in v) next.accepted = pruned(await getRepoAccepted(repo), v.loadedAccepted, v.accepted);
@@ -500,14 +593,15 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             fields: [
               { key: "token", label: "Access token", type: "password", placeholder: mask(githubToken), hint: githubToken ? "Leave blank to keep the stored token." : "Without one, the gh CLI's own login (or GH_TOKEN) is used." },
               ...(githubToken ? ([{ key: "clearToken", label: "Saved token", type: "checkbox", text: "Remove it and use the gh CLI's own login (or GH_TOKEN)" }] satisfies Field[]) : []),
+              { key: "postAs", label: "Posts as", type: "readonly" },
               { key: "webhookUrl", label: "Webhook URL", type: "readonly", ...(app.slug ? { link: { label: "App settings", url: `https://github.com/settings/apps/${app.slug}` } } : {}) },
               { key: "webhookSecret", label: "Webhook secret", type: "password", placeholder: app.webhookSecret ? "Saved" : "", hint: app.webhookSecret ? "Leave blank to keep the stored secret." : "Apps created by Create app carry one. For an existing app, set the URL above and a secret under the app's Webhook settings, then paste the secret here." },
               { key: "webhookStatus", label: "Last delivery", type: "readonly" },
               { key: "actionSecret", label: "Action secret", type: "readonly", hint: "Repository secret CODEOTTER_SECRET for the CodeOtter GitHub Action." },
-              { key: "forward", label: "Forward webhooks here", type: "checkbox", text: "gh webhook forward streams each GitHub repository's pull_request and issue_comment events to this process (local development without a public URL; needs gh extension install cli/gh-webhook)" },
+              { key: "forward", label: "Forward webhooks here", type: "checkbox", text: "gh webhook forward streams each GitHub repository's pull_request, issue_comment and pull_request_review_comment events to this process (local development without a public URL; needs gh extension install cli/gh-webhook)" },
               { key: "forwardStatus", label: "Forwarders", type: "readonly", hideWhen: { field: "forward", in: ["false"] } },
             ],
-            values: { token: "", ...(githubToken ? { clearToken: false } : {}), webhookUrl: webhookUrl("github"), webhookSecret: "", webhookStatus: describeDelivery("github"), actionSecret: await actionSecret(), forward, forwardStatus: forwarderStatus() },
+            values: { token: "", ...(githubToken ? { clearToken: false } : {}), postAs: appPostingActive(app) ? `${app.slug || `GitHub App ${app.id}`}[bot] where installed, else ${githubToken ? "the saved token" : "the gh login"}` : githubToken ? "The saved token" : "The gh login", webhookUrl: webhookUrl("github"), webhookSecret: "", webhookStatus: describeDelivery("github"), actionSecret: await actionSecret(), forward, forwardStatus: forwarderStatus() },
           },
         }),
         ...Object.entries(FORGES).map(([id, f]) => providerRow(id, f.token ? { text: "Token saved", tone: "ok" } : { text: "No token", tone: "muted" }, {
@@ -587,6 +681,99 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
       for (const connection of Object.values(FORGE_CONNECTIONS)) await connection.save(body);
     },
   },
+  // Jira and Linear: tickets named by a pull request become linked issues of its review. Same table as Git providers.
+  trackers: {
+    title: "Issue trackers",
+    group: "admin",
+    access: "admin",
+    async load() {
+      const { jira = {}, linear = {} } = await trackerSettings();
+      const status = (ready: boolean, keys: string[] | undefined): CellObject => (ready ? (keys?.length ? { text: keys.join(", "), tone: "ok" } : { text: "No keys", tone: "warn" }) : { text: "Not connected", tone: "muted" });
+      const jiraReady = !!(jira.url && jira.token);
+      const rows: Row[] = [
+        {
+          id: "jira",
+          label: "Jira",
+          cells: {
+            provider: { text: "Jira", icon: PROVIDER_ICONS.jira },
+            server: jira.url ? { text: jira.url.replace(/^https?:\/\//, ""), mono: true } : { text: "Not set", tone: "muted" },
+            status: status(jiraReady, jira.projects),
+          },
+          actions: [{ id: "testjira", label: "Test", ...(jiraReady ? {} : { disabled: true }) }],
+          settings: {
+            title: "Jira connection",
+            fields: [
+              { key: "url", label: "Jira URL", type: "text", placeholder: "https://example.atlassian.net" },
+              { key: "email", label: "Account email", type: "text", placeholder: "you@example.com", hint: "Jira Cloud, with an API token. Leave empty for a Data Center personal access token." },
+              { key: "token", label: "API token", type: "password", placeholder: mask(jira.token), hint: jira.token ? "Leave blank to keep the stored token." : "" },
+              { key: "projects", label: "Project keys", type: "text", placeholder: "ABC, OPS" },
+              ...(jiraReady ? ([{ key: "clear", label: "Saved connection", type: "checkbox", text: "Remove it" }] satisfies Field[]) : []),
+            ],
+            values: { url: jira.url || "", email: jira.email || "", token: "", projects: (jira.projects || []).join(", "), ...(jiraReady ? { clear: false } : {}) },
+          },
+        },
+        {
+          id: "linear",
+          label: "Linear",
+          cells: {
+            provider: { text: "Linear", icon: PROVIDER_ICONS.linear },
+            server: { text: new URL(LINEAR_API).host, mono: true },
+            status: status(!!linear.apiKey, linear.teams),
+          },
+          actions: [{ id: "testlinear", label: "Test", ...(linear.apiKey ? {} : { disabled: true }) }],
+          settings: {
+            title: "Linear connection",
+            fields: [
+              { key: "apiKey", label: "API key", type: "password", placeholder: mask(linear.apiKey), hint: linear.apiKey ? "Leave blank to keep the stored key." : "", link: { label: "Get a key", url: "https://linear.app/settings/account/security" } },
+              { key: "teams", label: "Team keys", type: "text", placeholder: "ENG, OPS", hint: "linear.app issue links count without one." },
+              ...(linear.apiKey ? ([{ key: "clear", label: "Saved connection", type: "checkbox", text: "Remove it" }] satisfies Field[]) : []),
+            ],
+            values: { apiKey: "", teams: (linear.teams || []).join(", "), ...(linear.apiKey ? { clear: false } : {}) },
+          },
+        },
+      ];
+      return {
+        sections: [{
+          id: "trackers",
+          title: "Issue trackers",
+          description: "Tickets named in a pull request's title, branch or description are read into its review.",
+          fields: [{ key: "rows", label: "Trackers", type: "table", columns: PROVIDER_COLUMNS }],
+        }],
+        values: { trackers: { rows } },
+      };
+    },
+    actions: {
+      testjira: async () => ({ message: await testJira(await trackerSettings()) }),
+      testlinear: async () => ({ message: await testLinear(await trackerSettings()) }),
+    },
+    async save(body) {
+      // The table posts its rows with the edited one marked; also accepted directly as { jira | linear: { ... } }.
+      const edited = editedRow(body.trackers, (r) => r.id === "jira" || r.id === "linear");
+      if (edited) body = { [String(edited.id)]: rec(rec(edited.settings).values) };
+      const current = await trackerSettings();
+      const next: TrackerSettings = { ...current };
+      if (body.jira) {
+        const v = rec(body.jira);
+        if (v.clear) delete next.jira;
+        else {
+          const url = jiraBase(v.url ?? current.jira?.url);
+          const token = String(v.token || "").trim() || current.jira?.token || "";
+          const email = String(v.email ?? current.jira?.email ?? "").trim();
+          if (/[:\s]/.test(email)) throw new Error("Jira account email must not contain spaces or a colon");
+          // a new server never inherits the token saved for the old one
+          if (url !== (current.jira?.url || "") && !String(v.token || "").trim() && current.jira?.token) throw new Error("Enter the API token for the new Jira URL");
+          next.jira = { url, email, token, projects: trackerKeys(v.projects ?? current.jira?.projects) };
+        }
+      }
+      if (body.linear) {
+        const v = rec(body.linear);
+        if (v.clear) delete next.linear;
+        else next.linear = { apiKey: String(v.apiKey || "").trim() || current.linear?.apiKey || "", teams: trackerKeys(v.teams ?? current.linear?.teams) };
+      }
+      await store.setSetting("issueTrackers", next);
+      clearTicketCache();
+    },
+  },
   oauth: {
     title: "Auth providers",
     group: "admin",
@@ -596,8 +783,10 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
     async load(): Promise<PageData> {
       if (!PB_URL) return { sections: [{ id: "signin", title: "Sign-in", description: "Sign-in requires PocketBase (PB_URL).", fields: [] }], values: {} };
       const o = await store.getOAuth();
+      const sso: SsoSetting = (await store.getSetting("sso")) || {};
       const rows = Object.entries(LOGIN_PROVIDERS).map(([id, spec]) => {
         const current: Partial<OAuthProviderConfig> = o.providers.find((p) => p.name === spec.pb) || {};
+        if (spec.pb === SSO_PB) return ssoRow(id, current, !!o.enabled && !!current.clientId, sso);
         const tenant = spec.pb === "microsoft" ? entraTenant(current) : "";
         const url = spec.pb === "microsoft" ? `${ENTRA}${tenant ? `/${tenant}` : ""}` : providerUrl(id);
         const on = !!o.enabled && !!current.clientId;
@@ -608,7 +797,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             title: `Sign in with ${spec.label}`,
             fields: [
               ...(spec.pb === "microsoft" ? ([{ key: "tenant", label: "Tenant", type: "text", placeholder: "contoso.onmicrosoft.com or tenant ID", hint: "One directory: invites match its users by email." }] satisfies Field[]) : []),
-              { key: "clientId", label: spec.pb === "bitbucket" ? "Key" : spec.pb === "microsoft" ? "Application (client) ID" : "Client ID", type: "text", link: { label: spec.pb === "bitbucket" ? "OAuth consumers" : spec.pb === "microsoft" ? "App registrations" : "Create OAuth app", url: OAUTH_APP_LINKS[spec.pb] || `${url}/user/settings/applications` } },
+              { key: "clientId", label: spec.pb === "bitbucket" ? "Key" : spec.pb === "microsoft" ? "Application (client) ID" : "Client ID", type: "text", link: { label: spec.pb === "bitbucket" ? "OAuth consumers" : spec.pb === "microsoft" ? "App registrations" : "Create OAuth app", url: OAUTH_APP_LINKS[spec.pb] || (spec.pb === "gitlab" ? `${url}/-/user_settings/applications` : `${url}/user/settings/applications`) } },
               { key: "clientSecret", label: spec.pb === "bitbucket" ? "Secret" : "Client secret", type: "password", placeholder: current.clientId ? "Saved" : "", hint: current.clientId ? "Leave blank to keep the stored secret." : "" },
               { key: "callback", label: spec.pb === "microsoft" ? "Redirect URI" : "Callback URL", type: "readonly" },
             ],
@@ -639,24 +828,38 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
       const edited = editedRow(body.signin, (r) => !!LOGIN_PROVIDERS[String(r.id)]);
       if (edited) {
         const v = rec(rec(edited.settings).values);
-        body = { [edited.id === "github" ? "oauth" : `${edited.id}oauth`]: { enabled: !!edited.toggle, clientId: v.clientId, clientSecret: v.clientSecret, ...("tenant" in v ? { tenant: v.tenant } : {}) } };
+        body = { [edited.id === "github" ? "oauth" : `${edited.id}oauth`]: { ...v, enabled: !!edited.toggle } };
       }
       if (!Object.keys(LOGIN_PROVIDERS).some((id) => body[id === "github" ? "oauth" : `${id}oauth`])) return;
       if (!PB_URL) throw new Error("Sign-in requires PocketBase (PB_URL)");
       const o = await store.getOAuth();
       let providers = [...o.providers];
+      let sso: SsoSetting | null = null;
       for (const [id, spec] of Object.entries(LOGIN_PROVIDERS)) {
         if (!body[id === "github" ? "oauth" : `${id}oauth`]) continue;
         const v = rec(body[id === "github" ? "oauth" : `${id}oauth`]);
         const current = providers.find((p) => p.name === spec.pb);
         providers = providers.filter((p) => p.name !== spec.pb);
-        if (!v.enabled) continue;
+        const before: SsoSetting = spec.pb === SSO_PB ? (await store.getSetting("sso")) || {} : {};
+        if (!v.enabled) {
+          if (spec.pb === SSO_PB) sso = { ...before, require: false };
+          continue;
+        }
         const clientId = String(v.clientId || "").trim();
         if (!clientId) throw new Error(`${spec.label} client ID is required`);
         if (!current && !v.clientSecret) throw new Error(`${spec.label} client secret is required`);
-        providers.push(oauthProvider(id, current, clientId, v.clientSecret, v.tenant ?? entraTenant(current)));
+        if (spec.pb !== SSO_PB) {
+          providers.push(oauthProvider(id, current, clientId, v.clientSecret, v.tenant ?? entraTenant(current)));
+          continue;
+        }
+        // Another issuer's subjects are not this one's: accounts linked to the old one would be reachable by strangers.
+        const ep = await discoverOidc(v.issuer ?? before.issuer);
+        if (before.issuer && before.issuer !== ep.issuer && (await store.hasForgeIdentities(SSO_PB))) throw new Error("Cannot change the SSO issuer while accounts are linked to it");
+        providers.push(ssoProvider(current, clientId, v.clientSecret, v.displayName ?? current?.displayName, ep));
+        sso = { issuer: ep.issuer, domains: parseDomains(v.domains ?? before.domains), autoAdmit: !!(v.autoAdmit ?? before.autoAdmit), require: !!(v.require ?? before.require) };
       }
       await store.setOAuth({ ...o, enabled: providers.length > 0, providers });
+      if (sso) await store.setSetting("sso", sso);
     },
   },
 };
@@ -729,7 +932,7 @@ const accountsPage: SettingsPage & { invite(v: Body): Promise<void> } = {
         {
           id: "invite",
           title: "Invite",
-          description: providers.length ? "Matched on first sign-in by provider and username, or by verified GitHub email." : "No sign-in provider is enabled: Admin / Auth providers.",
+          description: providers.length ? "Matched on first sign-in by provider and username, or by verified GitHub, Microsoft or SSO email." : "No sign-in provider is enabled: Admin / Auth providers.",
           fields: [
             { key: "login", label: "Username or email", type: "text", placeholder: "octocat or name@example.com" },
             { key: "provider", label: "Provider", type: "select", options: providers },
@@ -781,8 +984,9 @@ const accountsPage: SettingsPage & { invite(v: Body): Promise<void> } = {
     if (!role) throw new Error(`Unknown role ${v.role}`);
     const email = login.includes("@");
     if (email ? !INVITE_EMAIL_RE.test(login) : !INVITE_LOGIN_RE.test(login)) throw new Error("Enter a username or an email address");
-    if (spec.pb === "microsoft" && !email) throw new Error("Microsoft invites match by email address");
-    if (email && !["github", "microsoft"].includes(spec.pb)) throw new Error(`${spec.label} invites match by username`);
+    if ((spec.pb === "microsoft" || spec.pb === SSO_PB) && !email) throw new Error(`${spec.label} invites match by email address`);
+    if (email && !["github", "microsoft", SSO_PB].includes(spec.pb)) throw new Error(`${spec.label} invites match by username`);
+    if (spec.pb === SSO_PB && !emailDomainAllowed(login, (await store.getSetting("sso"))?.domains)) throw new Error("SSO invites need an email in an allowed domain (Admin / Auth providers)");
     const invites = ((await store.getSetting("invites")) || []).filter((i) => !(i.pb === spec.pb && i.login === login));
     invites.push({ id: randomBytes(8).toString("hex"), provider, pb: spec.pb, login, role, repos: role === "developer" ? await assignableRepos(v.repos) : [], at: new Date().toISOString() });
     await store.setSetting("invites", invites);
@@ -798,6 +1002,7 @@ const accountsPage: SettingsPage & { invite(v: Body): Promise<void> } = {
   },
 };
 SETTINGS_PAGES.accounts = accountsPage;
+SETTINGS_PAGES.audit = auditPage;
 // Local models page: what is downloaded, what is available, one action per row. Nothing downloads by itself.
 // What a running sidecar reports as its device, as GPU or CPU: laya and llama.cpp say vulkan:N / VulkanN / cuda /
 // metal, the Python sidecar cuda or cpu.
@@ -930,6 +1135,70 @@ SETTINGS_PAGES.models = {
       if (m.kind === "s1") { const s1 = (await store.getSetting("s1")) || {}; if (s1.provider === m.id) await store.setSetting("s1", { provider: "none" }); }
       else { const l = (await store.getSetting("llm")) || {}; if (l.provider === `local_${m.id}`) await store.setSetting("llm", { provider: "minimax" }); }
       return { message: `${m.label} deleted.` };
+    },
+  },
+};
+
+// Static analyzers: install-wide availability. Each runs from PATH or a pinned download started here; repositories opt in.
+SETTINGS_PAGES.analyzers = {
+  title: "Analyzers",
+  group: "admin",
+  access: "admin",
+  async load() {
+    const rows = ANALYZER_IDS.map((id): Row => {
+      const a = ANALYZERS[id];
+      const { bin, source } = analyzerBin(id);
+      const d = downloads.get(`analyzer:${id}`);
+      const pct = d?.active && d.total ? Math.round((d.done / d.total) * 100) : undefined;
+      const status: CellObject = d?.active
+        ? { text: d.label || `Downloading${pct !== undefined ? ` ${pct}%` : ""}`, tone: "warn", ...(pct !== undefined ? { progress: pct } : {}) }
+        : bin ? { text: "Available", tone: "ok", info: bin }
+        : d?.error ? { text: d.error, tone: "bad" }
+        : canInstall(id) ? { text: "Not installed", tone: "muted" }
+        : { text: a.install.kind === "pip" ? "Needs Python 3.10+" : `No build for ${process.platform}-${process.arch}`, tone: "warn" };
+      return {
+        id,
+        label: a.label,
+        cells: {
+          analyzer: { text: a.label, info: a.license },
+          checks: a.checks,
+          version: { text: a.version, mono: true },
+          source: source === "path" ? "PATH" : source === "download" ? (a.install.kind === "pip" ? "pip (venv)" : "Download") : "",
+          status,
+        },
+        actions: [
+          { id: "download", label: "Download", icon: "download", variant: "default", ...(d?.active ? { loading: true } : bin || !canInstall(id) ? { disabled: true } : {}) },
+          { id: "delete", label: `Delete ${a.label}`, icon: "trash", iconOnly: true, danger: true, variant: "outline", ...(source === "download" && !d?.active ? {} : { disabled: true }) },
+        ],
+        state: d?.active ? "downloading" : bin ? "ready" : "missing",
+      };
+    });
+    return {
+      sections: [{
+        id: "analyzers",
+        title: "Analyzers",
+        description: "Run on the changed files of a pull request; their results go to the language model as evidence. Enable per repository in Repository settings.",
+        fields: [{ key: "rows", label: "Analyzers", type: "table", columns: [{ key: "analyzer", label: "Analyzer" }, { key: "checks", label: "Checks" }, { key: "version", label: "Version" }, { key: "source", label: "Source" }, { key: "status", label: "Status" }] }],
+        poll: rows.some((r) => r.state === "downloading") ? 2000 : 0,
+      }],
+      values: { analyzers: { rows } },
+    };
+  },
+  async save() {},
+  actions: {
+    async download(body) {
+      const id = body?.item;
+      if (!isAnalyzerId(id)) throw new Error("Unknown analyzer");
+      if (!canInstall(id)) throw new Error(ANALYZERS[id].install.kind === "pip" ? "Python 3.10+ is needed" : `No ${ANALYZERS[id].label} build for ${process.platform}-${process.arch}`);
+      installAnalyzer(id).catch(() => {});
+      const asset = analyzerAsset(id);
+      return { message: asset ? `Downloading ${asset.file}…` : `Installing ${ANALYZERS[id].label}…` };
+    },
+    async delete(body) {
+      const id = body?.item;
+      if (!isAnalyzerId(id)) throw new Error("Unknown analyzer");
+      removeAnalyzer(id);
+      return { message: `${ANALYZERS[id].label} deleted.` };
     },
   },
 };

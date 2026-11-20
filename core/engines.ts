@@ -2,11 +2,14 @@
 import { ensureSidecar } from "./local-models.ts";
 import { askModel, askSystemOne } from "./models.ts";
 import { blastRadius, compressDiff, splitHunks } from "./diff.ts";
-import { extractHeadSha, REVIEW_DEFAULTS } from "./context.ts";
+import { extractHeadSha, issueLabel, REVIEW_DEFAULTS } from "./context.ts";
+import { diffFiles, pathInstructionBlock } from "./repo-rules.ts";
+import { analyzerPrompt, isAnalyzerId } from "./analyzers.ts";
+import type { AnalyzerId, AnalyzerResult } from "./analyzers.ts";
 import type { LlmConfig, S1Answers, S1Config, S1Questions } from "./models.ts";
 import type { LocalModel } from "./local-models.ts";
 import type { OutsideImpact } from "./diff.ts";
-import type { GitHistory, Guide, LinkedIssue, PullRequest, ReviewSettings } from "./context.ts";
+import type { CustomCheck, GitHistory, Guide, LinkedIssue, PullRequest, ReviewSettings } from "./context.ts";
 
 // A finding after deriveSuggestionFromDetail(): every field normalised, model text stripped of HTML comments.
 export type Severity = "high" | "medium" | "low" | "nit";
@@ -20,9 +23,12 @@ export interface Finding {
   suggestion?: string;
   dismissed?: boolean;
   confidence?: number; // 0..1, from reflection or System One
+  hunk?: string; // the diff hunk at the finding, attached when the review is stored (for agent prompts)
+  analyzer?: AnalyzerId; // a static analyzer result the language model confirmed
 }
 export type Verdict = "approve" | "comment" | "request_changes";
-export interface Gate { id: string; label: string; yes: number; pass: boolean; }
+// `mode` marks a repository's custom check (id `check_<n>`); built-in gates have none.
+export interface Gate { id: string; label: string; yes: number; pass: boolean; mode?: "warn" | "block"; }
 export interface WalkthroughItem { file: string; change: string; }
 export interface IncrementalCommit { sha: string; message: string; author?: string; }
 // What a re-review knows about the previous one (built in review.ts, read by the prompts).
@@ -58,9 +64,11 @@ export interface Judgement {
   findings: Finding[];
   walkthrough: WalkthroughItem[];
   rawOutput: string;
+  checks?: Gate[]; // custom checks, only when the language model was asked for them (no System One model)
 }
 export interface S1Progress { readyScores: Partial<Record<ScoreKey, number>>; gates: Gate[]; done: boolean; }
-const S1_GATES: { id: string; label: string; q: string; risk: boolean; needsGuide?: boolean; needsIssues?: boolean }[] = [
+type GateDef = { id: string; label: string; q: string; risk: boolean; needsGuide?: boolean; needsIssues?: boolean; mode?: "warn" | "block" };
+const S1_GATES: GateDef[] = [
   { id: "title", label: "Title check", q: "The pull request title accurately describes the change.", risk: false },
   { id: "description", label: "Description check", q: "The pull request description explains what changed and why.", risk: false },
   { id: "security", label: "Security", q: "The change introduces a security risk (injection, auth bypass, secrets, unsafe deserialisation, SSRF, XSS).", risk: true },
@@ -71,6 +79,20 @@ const S1_GATES: { id: string; label: string; q: string; risk: boolean; needsGuid
   { id: "guidelines", label: "Repository guidelines", q: "The change violates the repository's review guidelines.", risk: true, needsGuide: true },
   { id: "issue_requirements", label: "Issue requirements", q: "Does the pull request diff fulfill the requirements and acceptance criteria described in the linked issue(s)?", risk: false, needsIssues: true },
 ];
+// A repository's custom checks as gate definitions: "off" checks are skipped; the id keeps the check's position in the list.
+export function customGates(checks: CustomCheck[] = []): GateDef[] {
+  return checks.flatMap((ch, i): GateDef[] => (ch.mode === "off" ? [] : [{ id: `check_${i}`, label: ch.name, q: ch.instructions, risk: false, mode: ch.mode }]));
+}
+const toGate = (g: GateDef, yes: number): Gate => ({ id: g.id, label: g.label, yes: Math.round(yes * 100) / 100, pass: g.risk ? yes < 0.5 : yes >= 0.5, ...(g.mode ? { mode: g.mode } : {}) });
+// What System One is asked: the score rubrics, the built-in gates that apply, then the custom checks (all noul gates).
+// askSystemOne() chunks these for local runtimes that answer only maxQuestions per request.
+export function s1Questions(c: Pick<S1Config, "local">, guide: Guide | null, linkedIssues: LinkedIssue[] = [], checks: CustomCheck[] = []): { questions: S1Questions; gates: GateDef[] } {
+  const questions: S1Questions = {};
+  for (const [k, levels] of Object.entries(S1_SCORES)) questions[`score_${k}`] = { type: "score", instructions: `Rate the pull request's ${k.replace("_", " ")}.`, criteria: levels };
+  const gates = [...S1_GATES.filter((g) => (!g.needsGuide || (guide && !c.local)) && (!g.needsIssues || (linkedIssues?.length && !c.local))), ...customGates(checks)];
+  for (const g of gates) questions[`gate_${g.id}`] = { type: "noul", instructions: g.q };
+  return { questions, gates };
+}
 function s1State(pr: PullRequest, diff: string, c: S1Config, guide: Guide | null = null, gitHistory: GitHistory | null = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = []): Record<string, unknown> {
   if (c.local) return { pull_request: changeDigest(pr, diff, c.contextChars || 12000) };
   return {
@@ -99,6 +121,7 @@ function s1State(pr: PullRequest, diff: string, c: S1Config, guide: Guide | null
       ? {
           linked_issues: linkedIssues.map((iss) => ({
             number: iss.number,
+            ...(iss.key ? { key: iss.key } : {}),
             repo: iss.repo,
             title: iss.title,
             state: iss.state,
@@ -151,11 +174,9 @@ export function changeDigest(pr: Pick<PullRequest, "title" | "body" | "files" | 
   return out.slice(0, maxChars);
 }
 
-export async function scoreWithSystemOne(pr: PullRequest, diff: string, c: S1Config, guide: Guide | null, onPartial: ((p: S1Progress) => void) | null | undefined, gitHistory: GitHistory | null | undefined, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = []): Promise<{ scores: Record<ScoreKey, number>; gates: Gate[] }> {
+export async function scoreWithSystemOne(pr: PullRequest, diff: string, c: S1Config, guide: Guide | null, onPartial: ((p: S1Progress) => void) | null | undefined, gitHistory: GitHistory | null | undefined, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: CustomCheck[] = []): Promise<{ scores: Record<ScoreKey, number>; gates: Gate[] }> {
   const state = s1State(pr, diff, c, guide, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, accepted);
-  const questions: S1Questions = {};
-  for (const [k, levels] of Object.entries(S1_SCORES)) questions[`score_${k}`] = { type: "score", instructions: `Rate the pull request's ${k.replace("_", " ")}.`, criteria: levels };
-  for (const g of S1_GATES) if ((!g.needsGuide || (guide && !c.local)) && (!g.needsIssues || (linkedIssues?.length && !c.local))) questions[`gate_${g.id}`] = { type: "noul", instructions: g.q };
+  const { questions, gates: gateDefs } = s1Questions(c, guide, linkedIssues, checks);
   let a: S1Answers;
   try {
     a = await askSystemOne(state, questions, c, onPartial ? (partial) => {
@@ -163,10 +184,7 @@ export async function scoreWithSystemOne(pr: PullRequest, diff: string, c: S1Con
       for (const k of Object.keys(S1_SCORES) as ScoreKey[]) {
         if (partial[`score_${k}`] !== undefined) readyScores[k] = Math.max(0, Math.min(100, Math.round((Number(partial[`score_${k}`]?.score) || 0) / 4 * 100)));
       }
-      const gates = S1_GATES.filter((g) => partial[`gate_${g.id}`] !== undefined).map((g) => {
-        const yes = Number(partial[`gate_${g.id}`].noul) || 0;
-        return { id: g.id, label: g.label, yes: Math.round(yes * 100) / 100, pass: g.risk ? yes < 0.5 : yes >= 0.5 };
-      });
+      const gates = gateDefs.filter((g) => partial[`gate_${g.id}`] !== undefined).map((g) => toGate(g, Number(partial[`gate_${g.id}`].noul) || 0));
       onPartial({ readyScores, gates, done: false });
     } : undefined);
   } catch (err) {
@@ -175,7 +193,7 @@ export async function scoreWithSystemOne(pr: PullRequest, diff: string, c: S1Con
   const missing = Object.keys(questions).filter((k) => !Number.isFinite(Number(a?.[k]?.[questions[k].type === "score" ? "score" : "noul"] ?? NaN)));
   if (missing.length) throw new Error(`System One model ${c.provider}/${c.model} did not answer: ${missing.join(", ")}`);
   const scores = Object.fromEntries(Object.keys(S1_SCORES).map((k) => [k, Math.max(0, Math.min(100, Math.round((Number(a[`score_${k}`]?.score) || 0) / 4 * 100)))])) as Record<ScoreKey, number>;
-  const gates = S1_GATES.filter((g) => a[`gate_${g.id}`]).map((g) => { const yes = Number(a[`gate_${g.id}`].noul) || 0; return { id: g.id, label: g.label, yes: Math.round(yes * 100) / 100, pass: g.risk ? yes < 0.5 : yes >= 0.5 }; });
+  const gates = gateDefs.filter((g) => a[`gate_${g.id}`]).map((g) => toGate(g, Number(a[`gate_${g.id}`].noul) || 0));
   onPartial?.({ readyScores: scores, gates, done: true });
   return { scores, gates };
 }
@@ -189,7 +207,7 @@ async function reviewWithCodeReviewer(_pr: PullRequest, diff: string, c: LlmConf
       ? ` Analyzed ${gitHistory.prCommits.length} commit(s) (${gitHistory.prCommits.slice(0, 3).map((x) => x.sha).join(", ")})`
       : "";
   const guideNote = guide?.file ? ` against ${guide.file} guidelines` : "";
-  const issueNote = linkedIssues?.length ? ` Validated against linked issue(s) ${linkedIssues.map((i) => `#${i.number}`).join(", ")}.` : "";
+  const issueNote = linkedIssues?.length ? ` Validated against linked issue(s) ${linkedIssues.map(issueLabel).join(", ")}.` : "";
   const learningNote = learnings?.length ? ` Enforced ${learnings.length} repository team learning(s).` : "";
   const port = await ensureSidecar(c.local as LocalModel); // judge() routes here only for the local CodeReviewer
   const seen = new Set<string>();
@@ -274,6 +292,49 @@ export async function verifyFindingsWithSystemOne(findings: Finding[], s1: S1Con
   return kept.sort((x, y) => y.confidence - x.confidence);
 }
 
+// <fixed-check>
+// Which prior findings the push since the last review fixed. The re-review no longer reporting a finding only makes it a
+// candidate; a model reads each candidate against the delta diff: System One answers yes/no per finding, else the language
+// model answers for all of them in one JSON reply. Only findings judged fixed come back; a failed answer throws.
+const S1_FIXED_CHECK = "The code change fixes the problem the review comment describes.";
+const S1_FIXED_MIN = 0.5;
+const BLANK = "\n\n";
+const fixedCommentText = (f: Finding) => `[${f.severity}] ${f.file}${f.line ? `:${f.line}` : ""}: ${f.title}\n${String(f.detail || "").split(`${BLANK}@@`)[0].slice(0, 800)}`;
+export async function confirmFixedFindings(findings: Finding[], deltaDiff: string, s1: S1Config | null, llm: LlmConfig | null): Promise<Finding[]> {
+  if (!findings.length || !deltaDiff.trim()) return [];
+  if (s1?.enabled) {
+    const fixed: Finding[] = [];
+    for (const f of findings) {
+      const comment = fixedCommentText(f);
+      const room = Math.max(400, (s1.contextChars || 8000) - comment.length - 400);
+      const a = await askSystemOne({ file: f.file, review_comment: comment, code_change: compressDiff(deltaDiff, room).diff }, { fixed: { type: "noul", instructions: S1_FIXED_CHECK } }, s1);
+      const yes = Number(a?.fixed?.noul);
+      if (!Number.isFinite(yes)) throw new Error(`System One model ${s1.provider}/${s1.model} did not answer whether a review comment was fixed`);
+      if (yes >= S1_FIXED_MIN) fixed.push(f);
+    }
+    return fixed;
+  }
+  if (!llm || llm.api === "codereviewer") throw new Error("No model to check fixed comments: configure System One or a language model");
+  const list = findings.map((f, i) => `${i}. ${fixedCommentText(f)}`).join(BLANK);
+  const text = await askModel(`These review comments were posted on a pull request. The diff below is everything pushed since. For each comment, answer whether this diff fixes the problem it describes. Answer true only when the change clearly addresses it; a comment the diff does not touch is not fixed. Reply with ONLY a JSON object: {"fixed":[{"index":0,"fixed":true}]}
+
+Comments:
+${list}
+
+Diff since the comments:
+${compressDiff(deltaDiff, Math.min(60000, llm.contextChars || Infinity)).diff}`, { ...llm, temperature: 0 });
+  let out: { fixed?: unknown };
+  try {
+    out = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1));
+  } catch {
+    throw new Error(`${llm.provider}/${llm.model} did not return valid JSON when checking fixed comments`);
+  }
+  const rows = Array.isArray(out.fixed) ? (out.fixed as ({ index?: unknown; fixed?: unknown } | null)[]) : [];
+  const yes = new Set(rows.filter((x) => x?.fixed === true).map((x) => Number(x?.index)).filter((i) => Number.isInteger(i)));
+  return findings.filter((_, i) => yes.has(i));
+}
+// </fixed-check>
+
 function findFileLineInDiff(file: string, diff: string): number {
   if (!file || !diff) return 0;
   const lines = String(diff).split("\n");
@@ -357,9 +418,11 @@ export function deriveSuggestionFromDetail(raw: unknown, diff = ""): Finding {
   // 2. Determine replacement suggestion snippet (without markdown backticks)
   let suggestion = "";
   if (typeof f?.suggestion === "string" && f.suggestion.trim()) {
+    // leading blank lines and trailing space go; the first line keeps its indentation (the suggestion is committed as is)
     suggestion = f.suggestion
-      .trim()
-      .replace(/^```(?:suggestion|[a-zA-Z0-9_-]*)\r?\n?/i, "")
+      .replace(/^(?:[ \t]*\r?\n)+/, "")
+      .trimEnd()
+      .replace(/^[ \t]*```(?:suggestion|[a-zA-Z0-9_-]*)\r?\n?/i, "")
       .replace(/\r?\n?```$/i, "")
       .replace(/\r?\n$/, "");
   }
@@ -401,14 +464,24 @@ export function deriveSuggestionFromDetail(raw: unknown, diff = ""): Finding {
     ...(suggestion ? { suggestion: str(suggestion, 2000) } : {}),
     ...(f?.dismissed ? { dismissed: true } : {}),
     ...(Number.isFinite(Number(f?.confidence)) && f?.confidence !== null && f?.confidence !== "" ? { confidence: Math.max(0, Math.min(1, Number(f?.confidence))) } : {}),
+    ...(isAnalyzerId(f?.analyzer) ? { analyzer: f.analyzer } : {}),
   };
 }
 
-function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = []): string {
+// Strictness instructions per review profile (Repository settings); balanced is the long-standing behaviour.
+const PROFILE_PROMPT: Record<ReviewSettings["profile"], string> = {
+  chill: "Profile: chill. Report only high and medium severity problems: defects, security issues, data loss, broken contracts. No nitpicks, style, naming or low-severity findings; when unsure, leave it out. Fewer findings is better.",
+  balanced: "",
+  assertive: "Profile: assertive. Report every real problem, including low-severity issues and nitpicks (style, naming, readability, missing tests, docs); use the full findings budget when the diff warrants it.",
+};
+export function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: GateDef[] = [], analyzers: AnalyzerResult[] = []): string {
+  const checksBlock = checks.length
+    ? `\nRepository pre-merge checks (answer each from the diff and description in "checks": true = yes, false = no):\n${checks.map((g) => `- ${g.id}: ${g.q}`).join("\n")}\n`
+    : "";
   const outsideBlock = outsideImpact?.formatted ? `\n${outsideImpact.formatted}\n` : "";
   const issueBlock = linkedIssues?.length
     ? `\nLinked Issues & Requirements (MANDATORY: explicitly verify whether the pull request diff fulfills all requirements and acceptance criteria described in these linked issues, and flag any unfulfilled or partially met requirement in findings):\n${linkedIssues
-        .map((iss) => `Issue #${iss.number} (${iss.repo}, ${iss.state}): ${iss.title}${iss.labels?.length ? ` [${iss.labels.join(", ")}]` : ""}\n${(iss.body || "(no body provided)").slice(0, 1200)}`)
+        .map((iss) => `Issue ${issueLabel(iss)} (${iss.repo}, ${iss.state}): ${iss.title}${iss.labels?.length ? ` [${iss.labels.join(", ")}]` : ""}\n${(iss.body || "(no body provided)").slice(0, 1200)}`)
         .join("\n\n")}\n`
     : "";
   const learningsBlock = learnings?.length
@@ -418,17 +491,18 @@ function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings =
   const acceptedBlock = accepted?.length
     ? `\nFixes this team accepted from earlier reviews (look for the same kinds of problems):\n${accepted.slice(-10).map((a) => `- ${a}`).join("\n")}\n`
     : "";
+  const pathBlock = pathInstructionBlock(r.pathInstructions, diffFiles(diff));
   return `You are CodeOtter, a strict senior staff code reviewer. Review this pull request using the repository's review guidelines (AGENTS.md / CLAUDE.md), the repository team learnings, the linked issues and acceptance criteria, the git commit history, the outside-diff call graph context, and the code diff. Reply with ONLY a JSON object:
 {"summary":"3-5 sentence architectural walkthrough covering what changed, commit progression, fulfillment of linked issue requirements, adherence to repository guidelines, and outside caller safety","verdict":"approve|comment|request_changes",
-${wantScores ? ` "scores":{"quality":0-100,"correctness_risk":0-100 (100 = very risky),"test_coverage":0-100,"readability":0-100,"pr_hygiene":0-100 (title, description, scope, commit focus),"blast_radius":0-100 (100 = system-wide or critical-path impact)},\n` : ""} "findings":[{"severity":"blocker|major|minor|nit|high|medium|low","file":"path","line":42,"title":"short","detail":"specific line/behaviour and fix (cite AGENTS.md/CLAUDE.md rule, linked issue #number requirement, or commit if relevant)","suggestion":"optional exact replacement code"}],
- "walkthrough":[{"file":"path","change":"concise summary of change in this file"}]}
-For each finding, include the integer target \`line\` number in the new file and an optional \`suggestion\` containing the exact replacement code snippet for the target line/block (without markdown backticks) so the fix can be applied in one click. Be concrete; cite exact files and rules. Respect all Repository Team Learnings and never flag dismissed patterns. Max ${r.maxFindings} findings, most severe first. Today is ${new Date().toISOString().slice(0, 10)}.
+${wantScores ? ` "scores":{"quality":0-100,"correctness_risk":0-100 (100 = very risky),"test_coverage":0-100,"readability":0-100,"pr_hygiene":0-100 (title, description, scope, commit focus),"blast_radius":0-100 (100 = system-wide or critical-path impact)},\n` : ""} "findings":[{"severity":"blocker|major|minor|nit|high|medium|low","file":"path","line":42,"title":"short","detail":"specific line/behaviour and fix (cite AGENTS.md/CLAUDE.md rule, linked issue #number or ticket key requirement, or commit if relevant)","suggestion":"optional exact replacement code"}],
+ "walkthrough":[{"file":"path","change":"concise summary of change in this file"}]${checks.length ? `,\n "checks":{${checks.map((g) => `"${g.id}":true|false`).join(",")}}` : ""}}
+For each finding, include the integer target \`line\` number in the new file and an optional \`suggestion\` containing the exact replacement code snippet for the target line/block (without markdown backticks) so the fix can be applied in one click. Be concrete; cite exact files and rules. Respect all Repository Team Learnings and never flag dismissed patterns. Max ${r.maxFindings} findings, most severe first.${PROFILE_PROMPT[r.profile] ? ` ${PROFILE_PROMPT[r.profile]}` : ""} Today is ${new Date().toISOString().slice(0, 10)}.
 
 PR #${pr.number}: ${pr.title}
 Author: ${pr.author.login}  Base: ${pr.baseRefName} <- Head: ${pr.headRefName}${pr.headSha ? ` (${pr.headSha.slice(0, 7)})` : ""}  Files: ${pr.changedFiles}  +${pr.additions} -${pr.deletions}
 Description:
 ${(pr.body || "(none)").slice(0, c.contextChars ? Math.min(3000, Math.floor(c.contextChars / 10)) : 3000)}
-${outsideBlock}${incrementalBlock}${issueBlock}${learningsBlock}${acceptedBlock}${gitHistory?.formatted ? `\nGit Change History (commits in this PR and recent target branch history):\n${gitHistory.formatted.slice(0, 4000)}\n` : ""}${guide ? `\nRepository Review Guidelines from ${guide.file} (MANDATORY: verify all code changes and commits against these rules and flag any violation in findings):\n${guide.text}\n` : ""}
+${outsideBlock}${incrementalBlock}${issueBlock}${checksBlock}${pathBlock}${learningsBlock}${acceptedBlock}${analyzerPrompt(analyzers)}${gitHistory?.formatted ? `\nGit Change History (commits in this PR and recent target branch history):\n${gitHistory.formatted.slice(0, 4000)}\n` : ""}${guide ? `\nRepository Review Guidelines from ${guide.file} (MANDATORY: verify all code changes and commits against these rules and flag any violation in findings):\n${guide.text}\n` : ""}
 Diff${diff.length > Math.min(r.diffChars, c.contextChars || Infinity) ? " (over budget: highest-priority files first, the rest named at the end)" : ""}:
 ${compressDiff(diff, Math.min(r.diffChars, c.contextChars || Infinity)).diff}`;
 }
@@ -460,11 +534,13 @@ ${compressDiff(diff, Math.min(r.diffChars, c.contextChars || Infinity)).diff}`, 
 }
 // </reflect>
 
-export async function judge(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, onProgress: ((partial: Partial<Judgement>) => void) | null = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = []): Promise<Judgement> {
+export async function judge(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, onProgress: ((partial: Partial<Judgement>) => void) | null = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: CustomCheck[] = [], analyzers: AnalyzerResult[] = []): Promise<Judgement> {
+  // CodeReviewer cannot answer checks; it always runs next to System One, which owns them.
   if (c.api === "codereviewer") return reviewWithCodeReviewer(pr, diff, c, guide, gitHistory, onProgress, linkedIssues, learnings, incrementalCtx);
-  const text = await askModel(prompt(pr, diff, c, r, guide, wantScores, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, accepted), { ...c, temperature: r.temperature });
+  const checkDefs = customGates(checks);
+  const text = await askModel(prompt(pr, diff, c, r, guide, wantScores, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, accepted, checkDefs, analyzers), { ...c, temperature: r.temperature });
   // Model output: every field is checked or coerced below before it is stored.
-  let out: { summary?: unknown; verdict?: unknown; scores?: Record<string, unknown> | null; findings?: unknown; walkthrough?: unknown };
+  let out: { summary?: unknown; verdict?: unknown; scores?: Record<string, unknown> | null; findings?: unknown; walkthrough?: unknown; checks?: unknown };
   try {
     out = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1));
   } catch {
@@ -477,7 +553,17 @@ export async function judge(pr: PullRequest, diff: string, c: LlmConfig, r: Revi
     const missing = scoreKeys.filter((k) => out.scores?.[k] === null || out.scores?.[k] === "" || !Number.isFinite(Number(out.scores?.[k])));
     if (missing.length) throw new Error(`${c.provider}/${c.model} returned no usable scores for: ${missing.join(", ")}`);
   }
+  const answers = out.checks && typeof out.checks === "object" ? (out.checks as Record<string, unknown>) : {};
+  const checkGates = checkDefs.map((g) => {
+    const v = answers[g.id];
+    return { g, yes: v === true || v === "true" || v === "yes" ? 1 : v === false || v === "false" || v === "no" ? 0 : NaN };
+  });
+  const unanswered = checkGates.filter((x) => Number.isNaN(x.yes)).map((x) => x.g.label);
+  if (unanswered.length) throw new Error(`${c.provider}/${c.model} did not answer the pre-merge check(s): ${unanswered.join(", ")}`);
   let findings: Finding[] = (Array.isArray(out.findings) ? (out.findings as unknown[]) : []).slice(0, 20).map((f) => deriveSuggestionFromDetail(f, diff));
+  if (r.profile === "chill") findings = findings.filter((f) => f.severity === "high" || f.severity === "medium");
+  // an analyzer tag only for a tool that reported on this file
+  findings = findings.map(({ analyzer, ...f }) => (analyzer && analyzers.some((a) => a.analyzer === analyzer && a.file === f.file) ? { ...f, analyzer } : f));
   let reflected = "";
   if (r.reflectMin > 0 && findings.length) {
     onProgress?.({ summary: `Checking ${findings.length} finding(s) against the diff…` });
@@ -493,6 +579,7 @@ export async function judge(pr: PullRequest, diff: string, c: LlmConfig, r: Revi
     findings,
     walkthrough: (Array.isArray(out.walkthrough) ? (out.walkthrough as ({ file?: unknown; change?: unknown } | null)[]) : []).slice(0, 100).filter((w): w is { file: string; change?: unknown } => !!w && typeof w.file === "string").map((w) => ({ file: str(w.file, 300), change: str(w.change, 500) })),
     rawOutput: str(text, 20000),
+    ...(checkDefs.length ? { checks: checkGates.map(({ g, yes }) => toGate(g, yes)) } : {}),
   };
 }
 const isVerdict = (v: unknown): v is Verdict => v === "approve" || v === "comment" || v === "request_changes";

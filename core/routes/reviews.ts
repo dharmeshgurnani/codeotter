@@ -13,9 +13,13 @@ import type { Severity } from "../engines.ts";
 import type { InlineTarget } from "../review.ts";
 import { activeReviews, postInlineSuggestionsOnPr, resolvePr, score, startOrPollReview, triagePr } from "../review.ts";
 import { PR_TOOLS, runPrTool } from "../pr-tools.ts";
+import { reviewPrompts } from "../fix.ts";
+import type { ReviewRecord } from "../review.ts";
 import { homeData, renderScore, repoOf } from "../views.ts";
+import { analyticsData, periodOf, recordOutcome } from "../analytics.ts";
 import { settingsPages } from "../settings-pages.ts";
 import { assertRepo, checkRepoScope, requestOrg, seesAll, visibleRepos } from "../access.ts";
+import { audit, orgOfRepo } from "../audit.ts";
 import { gate, jsonBody } from "./middleware.ts";
 import type { Env } from "./middleware.ts";
 
@@ -51,6 +55,9 @@ reviews.get("/home", review, async (c) => {
   return c.json(await homeData(org, c.get("viewer")));
 });
 
+// ?org= and ?days= (7, 30 or 90): the Analytics report, scoped like Home.
+reviews.get("/analytics", review, async (c) => c.json(await analyticsData(requestOrg(c.req.query("org")), periodOf(c.req.query("days")), c.get("viewer"))));
+
 reviews.post("/learnings", review, async (c) => {
   const g = c.get("viewer");
   const body = await jsonBody(c);
@@ -76,6 +83,7 @@ reviews.post("/learnings", review, async (c) => {
     .slice(0, 300);
   const prev = await getRepoLearnings(repo);
   const learnings = await setRepoLearnings(repo, [...prev, ruleText]);
+  if (prUrl && validPrUrl(prUrl)) await recordOutcome("dismissed", prUrl, repo);
   let updatedReview = null;
   if (prUrl && validPrUrl(prUrl)) {
     const stored = await store.get(prUrl).catch(() => null);
@@ -115,7 +123,9 @@ reviews.post("/tools", review, async (c) => {
   if (!validPrUrl(prUrl)) throw new Error("Invalid pull request URL");
   checkRepoScope(repoOf({ url: prUrl }), requestOrg(c.req.query("org")));
   await assertRepo(c.get("viewer"), repoOf({ url: prUrl }));
-  return c.json(await runPrTool(prUrl, String(body.tool || ""), { question: typeof body.question === "string" ? body.question : undefined, action: String(body.action || "run") }));
+  const result = await runPrTool(prUrl, String(body.tool || ""), { question: typeof body.question === "string" ? body.question : undefined, action: String(body.action || "run") });
+  if (body.action === "apply") await audit(null, "pr-tool.run", prUrl, { tool: String(body.tool), action: "apply" }, orgOfRepo(repoOf({ url: prUrl })));
+  return c.json(result);
 });
 
 reviews.post("/review-suggestions", review, async (c) => {
@@ -167,6 +177,8 @@ reviews.post("/review-suggestions", review, async (c) => {
   const resInfo = await postInlineSuggestionsOnPr(target, repo, {
     findingIdx: body.findingIdx !== undefined && body.findingIdx !== null ? Number(body.findingIdx) : null,
   });
+  if (resInfo.posted > 0) await recordOutcome("posted", prUrl, repo, resInfo.posted);
+  if (resInfo.posted > 0) await audit(null, "review.post", prUrl, { posted: [`inline suggestions (${resInfo.posted})`] }, orgOfRepo(repo));
   if (stored && resInfo.posted > 0) {
     const tag = resInfo.comments[0]
       ? `inline suggestion (${resInfo.comments[0].path}:L${resInfo.comments[0].line})`
@@ -207,8 +219,10 @@ export async function scoreResult(c: Context<Env>) {
   const resolved = await resolvePr(ref, repo);
   checkRepoScope(parsed(resolved.urlGuess).repo, requestOrg(c.req.query("org")));
   await assertRepo(c.get("viewer"), parsed(resolved.urlGuess).repo);
-  if (c.req.path === "/api/score" && c.req.query("async") !== undefined) return c.json(await startOrPollReview(ref, force, repo, c.req.query("part") || ""));
+  // the review page's "Copy fix prompt" actions read agentPrompts
+  const withPrompts = (r: ReviewRecord) => ({ ...r, agentPrompts: reviewPrompts(r, parsed(resolved.urlGuess).repo) });
+  if (c.req.path === "/api/score" && c.req.query("async") !== undefined) return c.json(withPrompts(await startOrPollReview(ref, force, repo, c.req.query("part") || "")));
   const result = await score(ref, force, repo);
-  return c.req.path === "/api/score" ? c.json(result) : c.html(renderScore(result));
+  return c.req.path === "/api/score" ? c.json(withPrompts(result)) : c.html(renderScore(result));
 }
 reviews.get("/score", review, scoreResult);

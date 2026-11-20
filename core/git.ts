@@ -15,7 +15,16 @@ interface GhRepo { full_name?: string } // GitHub REST repository (the one field
 // stderr is captured so "gh auth login" / "Not Found" reach the UI instead of the terminal.
 export const ghAsync = async (...rawArgs: string[] | [string[]]): Promise<string> => {
   const args: string[] = Array.isArray(rawArgs[0]) ? rawArgs[0] : (rawArgs as string[]);
-  const env = await ghEnvFor(args);
+  return runGh(args, await ghEnvFor(args));
+};
+// gh for a write on a GitHub repository: as the GitHub App bot when the app is installed on the repository's owner,
+// else with the credential ghAsync would use (saved token, GH_TOKEN, gh login, or the App when nothing else exists).
+export const ghAsApp = async (repo: string, ...rawArgs: string[] | [string[]]): Promise<string> => {
+  const args: string[] = Array.isArray(rawArgs[0]) ? rawArgs[0] : (rawArgs as string[]);
+  const token = await appInstallationToken(repo).catch((e: Error) => { console.warn(`[github-app] ${repo}: ${e.message}`); return ""; });
+  return runGh(args, token ? { ...process.env, GH_TOKEN: token, GITHUB_TOKEN: token } : await ghEnvFor(args));
+};
+function runGh(args: string[], env: NodeJS.ProcessEnv): Promise<string> {
   return new Promise((resolve, reject) => {
     // Two minutes covers a slow diff; a hung gh (proxy, credential helper) would otherwise pin the poll loops forever.
     // Own timer rather than spawn's timeout option: Node leaves that one armed when the binary is missing.
@@ -35,9 +44,9 @@ export const ghAsync = async (...rawArgs: string[] | [string[]]): Promise<string
       else reject(new Error(`gh ${args.slice(0, 2).join(" ")}: ${String(err).trim().split("\n")[0] || "failed"}`));
     });
   });
-};
+}
 // <pr-url>
-const FORGE_PREFIX = /^(forgejo|gitea|bitbucket|bitbucketdc|azure)~/;
+const FORGE_PREFIX = /^(forgejo|gitea|bitbucket|bitbucketdc|azure|gitlab)~/;
 export const forgeId = (repo: string) => FORGE_PREFIX.exec(String(repo))?.[1] || "";
 export const isForgeRepo = (repo: string) => !!forgeId(repo);
 export const nativeRepo = (repo: string) => String(repo).replace(FORGE_PREFIX, "");
@@ -94,7 +103,7 @@ export async function readPr(url: string, spec: string[], diff = false): Promise
 
 export const createPrComment = (url: string, repo: string, number: number, body: string): Promise<unknown> => isForgeRepo(repo)
   ? forgeOf(repo).comment(repo, number, body)
-  : ghAsync("pr", "comment", url, "--body", body);
+  : ghAsApp(repo, "pr", "comment", url, "--body", body);
 
 function base64url(input: string | Buffer) {
   const buf = Buffer.isBuffer(input) ? input : Buffer.from(input);
@@ -116,6 +125,73 @@ export function createGitHubAppJwt(appId: string | number, pem: string): string 
   sign.end();
   const signature = base64url(sign.sign(pem));
   return `${header}.${payload}.${signature}`;
+}
+
+// Installation access tokens, one cache for both uses: writes as the bot (ghAsApp, per repository) and every gh call on
+// an install whose only GitHub credential is the App (ghEnvFor, per owner the call names). The installation is looked up
+// per repository (`repos/{repo}/installation`) or, for an owner or a call naming none, from the app's installation list;
+// an owner-less call uses the only installation, never a guess between several. Installation ids are cached per owner,
+// tokens per installation until five minutes before they expire; a repository the app is not installed on is
+// remembered for ten minutes. Only an app with its private key is used (Create app saves both).
+const APP_TOKEN_MARGIN = 5 * 60_000;
+const APP_MISS_TTL = 10 * 60_000;
+let appTokenKey = "";
+const appInstallations = new Map<string, number>(); // lower-case owner ("" = the only installation) -> installation id
+const appTokens = new Map<number, { token: string; expires: number }>(); // installation id -> token
+const appMisses = new Map<string, number>(); // repository -> retry after (ms)
+export function forgetAppTokens(): void {
+  appInstallations.clear();
+  appTokens.clear();
+  appMisses.clear();
+}
+const appHeaders = (bearer: string) => ({ authorization: `Bearer ${bearer}`, accept: "application/vnd.github+json", "user-agent": "CodeOtter", "x-github-api-version": "2022-11-28" });
+export const appPostingActive = (app: GitHubAppConfig | null | undefined): boolean => !!(app?.id && app.pem);
+type AppInstallation = { id?: unknown; account?: { login?: unknown } };
+const installationId = (v: unknown): number | undefined => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : undefined);
+// `target`: "owner/repo" (a GitHub repository), "owner", or "" (a call that names no owner).
+export async function appInstallationToken(target: string): Promise<string> {
+  const isRepo = target.includes("/");
+  if (isForgeRepo(target) || (isRepo ? !REPO_RE.test(target) : !!target && !OWNER_RE.test(target))) return "";
+  const app = (await store.getSetting("githubApp")) as GitHubAppConfig | null | undefined;
+  if (!app?.id || !app.pem) return "";
+  const key = `${app.id}:${app.pem.length}:${app.pem.slice(-64)}`; // a new or replaced app starts a fresh cache
+  if (key !== appTokenKey) { forgetAppTokens(); appTokenKey = key; }
+  const now = Date.now();
+  if (isRepo && (appMisses.get(target) || 0) > now) return "";
+  const owner = target.split("/")[0].toLowerCase();
+  let installation = appInstallations.get(owner);
+  const cached = installation ? appTokens.get(installation) : undefined;
+  if (cached && cached.expires - APP_TOKEN_MARGIN > now) return cached.token;
+  const jwt = createGitHubAppJwt(app.id, app.pem);
+  if (!installation && isRepo) {
+    const res = await fetch(`https://api.github.com/repos/${target}/installation`, { headers: appHeaders(jwt), redirect: "error", signal: AbortSignal.timeout(10000) });
+    if (res.status === 404) { appMisses.set(target, now + APP_MISS_TTL); return ""; }
+    if (!res.ok) throw new Error(`installation lookup answered ${res.status}`);
+    const body: unknown = await res.json();
+    installation = installationId(body && typeof body === "object" && "id" in body ? body.id : undefined);
+    if (!installation) throw new Error("installation lookup returned no id");
+    appInstallations.set(owner, installation);
+  } else if (!installation) {
+    const res = await fetch("https://api.github.com/app/installations?per_page=100", { headers: appHeaders(jwt), redirect: "error", signal: AbortSignal.timeout(10000) });
+    if (!res.ok) throw new Error(`installation list answered ${res.status}`);
+    const list: unknown = await res.json();
+    const installs = (Array.isArray(list) ? (list as AppInstallation[]) : []).filter((i) => installationId(i?.id));
+    for (const i of installs) if (typeof i.account?.login === "string") appInstallations.set(i.account.login.toLowerCase(), i.id as number);
+    if (!owner && installs.length === 1) appInstallations.set("", installs[0].id as number);
+    installation = appInstallations.get(owner);
+    if (!installation) return "";
+  }
+  const res = await fetch(`https://api.github.com/app/installations/${installation}/access_tokens`, { method: "POST", headers: appHeaders(jwt), redirect: "error", signal: AbortSignal.timeout(10000) });
+  if (res.status === 404) { appInstallations.delete(owner); if (isRepo) appMisses.set(target, now + APP_MISS_TTL); return ""; } // uninstalled since
+  if (!res.ok) throw new Error(`installation token answered ${res.status}`);
+  const data: unknown = await res.json();
+  const field = (k: string): unknown => (data && typeof data === "object" && k in data ? (data as Record<string, unknown>)[k] : undefined);
+  const token = field("token");
+  if (typeof token !== "string" || !token) throw new Error("installation token missing from GitHub's reply");
+  const expiresAt = field("expires_at");
+  const expires = (typeof expiresAt === "string" && Date.parse(expiresAt)) || now + 60 * 60_000;
+  appTokens.set(installation, { token, expires });
+  return token;
 }
 
 async function getGitHubAppRepos(appConfig: GitHubAppConfig | null | undefined): Promise<string[]> {
@@ -183,7 +259,7 @@ export const repos = async (): Promise<string[]> => {
   return Array.isArray(saved) ? (saved as string[]) : REPO ? [REPO] : [];
 };
 let ghReposCache: Map<string, string[]> | null | undefined;
-export const forgetGithubRepos = () => { ghReposCache = null; appTokens.clear(); };
+export const forgetGithubRepos = () => { ghReposCache = null; forgetAppTokens(); };
 // A GitHub token saved in the app (Settings / Git providers, or onboarding) goes to gh calls only, as GH_TOKEN in that
 // child's environment, and takes precedence over one from the server's environment; without one, gh uses its own login.
 // It is never written to process.env, so model sidecars, pip and other children do not inherit it.
@@ -216,30 +292,7 @@ const ghHasLogin = () => (ghLoggedIn ||= new Promise<boolean>((resolve) => {
   p.on("close", (code) => resolve(code === 0));
 }));
 // With no token anywhere (a fresh hosted install that only created a GitHub App in onboarding), gh calls run as the
-// App: an installation token for the owner the call names, cached until five minutes before it expires (one hour).
-const appTokens = new Map<string, { token: string; expires: number }>();
-type AppInstallation = { id?: number; account?: { login?: string } };
-export async function appInstallationToken(owner: string): Promise<string> {
-  const app = (await store.getSetting("githubApp")) as GitHubAppConfig | null | undefined;
-  if (!app?.id || !app?.pem) return "";
-  const key = owner.toLowerCase();
-  const hit = appTokens.get(key);
-  if (hit && hit.expires - 300000 > Date.now()) return hit.token;
-  const headers = { authorization: `Bearer ${createGitHubAppJwt(app.id, app.pem)}`, accept: "application/vnd.github+json", "user-agent": "CodeOtter" };
-  const res = await fetch("https://api.github.com/app/installations?per_page=100", { headers, redirect: "error", signal: AbortSignal.timeout(10000) });
-  if (!res.ok) return "";
-  const list: unknown = await res.json();
-  const installs = Array.isArray(list) ? (list as AppInstallation[]) : [];
-  // a call that names no owner (gh api user, repo list) uses the only installation, never a guess between several
-  const inst = key ? installs.find((i) => i.account?.login?.toLowerCase() === key) : installs.length === 1 ? installs[0] : undefined;
-  if (!inst?.id) return "";
-  const tok = await fetch(`https://api.github.com/app/installations/${inst.id}/access_tokens`, { method: "POST", headers, redirect: "error", signal: AbortSignal.timeout(10000) });
-  if (!tok.ok) return "";
-  const data = (await tok.json()) as { token?: string; expires_at?: string };
-  if (!data.token) return "";
-  appTokens.set(key, { token: data.token, expires: Date.parse(data.expires_at || "") || Date.now() + 3600000 });
-  return data.token;
-}
+// App: an installation token for the owner the call names (appInstallationToken above).
 // The environment for one gh call: the saved token, else GH_TOKEN / GITHUB_TOKEN, else gh's own login, else the App.
 async function ghEnvFor(args: string[]): Promise<NodeJS.ProcessEnv> {
   if (savedGithubToken || process.env.GH_TOKEN || process.env.GITHUB_TOKEN || await ghHasLogin()) return ghEnv();
@@ -429,7 +482,7 @@ export async function openPrs(repo: string, { strict = false } = {}): Promise<Pu
   // a git server's error (bad token, server down) reaches the page instead of looking like "no pull requests"
   if (isForgeRepo(repo)) return forgeOf(repo).openPrs(repo);
   try {
-    return JSON.parse(await ghAsync("pr", "list", "-R", repo, "--json", "number,title,author,url,updatedAt,additions,deletions,changedFiles,headRefOid,isDraft,labels", "--limit", "200"));
+    return JSON.parse(await ghAsync("pr", "list", "-R", repo, "--json", "number,title,author,url,updatedAt,additions,deletions,changedFiles,headRefOid,isDraft,labels,baseRefName", "--limit", "200"));
   } catch (e) {
     if (strict) throw e;
     return [];

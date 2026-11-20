@@ -4,7 +4,9 @@
 //   bitbucket    Bitbucket Cloud (api.bitbucket.org/2.0)
 //   bitbucketdc  Bitbucket Data Center (<origin>/rest/api/latest)
 //   azure        Azure DevOps Services (dev.azure.com/<org>/<project>/_apis/git)
-// Repository ids are "<forge>~<native>"; the native part is owner/name, workspace/slug, PROJECT/slug or org/project/repo.
+//   gitlab       GitLab, gitlab.com or self-managed (<origin>/api/v4)
+// Repository ids are "<forge>~<native>"; the native part is owner/name, workspace/slug, PROJECT/slug, org/project/repo
+// or group[/subgroup...]/project.
 // Every method takes the full id and strips the prefix itself. Standard library and fetch only.
 //
 // Credentials only ever go to the operator-configured origin. Redirects are refused, except the one Bitbucket Cloud
@@ -15,8 +17,8 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 // ---------------------------------------------------------------------------------------------------------------------
 // Types. The normalized shapes below are what every caller sees; the raw API shapes further down are what each server
 // is documented to answer. Server JSON is untrusted: raw fields are optional unless the code already relies on them.
-export type ForgeKind = "gitea" | "bitbucket" | "bitbucketdc" | "azure";
-export type ForgeId = "forgejo" | "gitea" | "bitbucket" | "bitbucketdc" | "azure";
+export type ForgeKind = "gitea" | "bitbucket" | "bitbucketdc" | "azure" | "gitlab";
+export type ForgeId = "forgejo" | "gitea" | "bitbucket" | "bitbucketdc" | "azure" | "gitlab";
 // One git server's settings (config.ts FORGES). `auth` is set by the adapter.
 export interface ForgeConfig {
   kind: ForgeKind;
@@ -93,9 +95,13 @@ export interface BaseCommit { sha: string; message: string; author: string }
 // A commit status, in GitHub's terms (state: success | failure | error | pending).
 export interface CommitStatus { state: string; context: string; description?: string; target_url?: string }
 export interface InlineComment { path: string; line: number; startLine?: number; body: string }
+// One comment of an inline review thread (root first). `line` is the new-file line, negative for an old-file line.
+// `thread`: the server's id for the conversation when replies address it rather than a comment (GitLab discussions).
+export interface ThreadComment { id: number | string; body: string; created_at: string; user: { id: number | string; login: string }; bot: boolean; path: string; line: number; hunk: string; author_association?: string; thread?: string }
 export type HookHeaders = Record<string, string | undefined>;
 export interface HookMeta { event: string; delivery: string; signature: string | undefined }
-export interface RoutedHook { repo: string; pr?: PullRequest; comment?: ForgeComment }
+// `inThread`: the comment was posted in an inline review conversation (a candidate reply under CodeOtter's comment).
+export interface RoutedHook { repo: string; pr?: PullRequest; comment?: ForgeComment; inThread?: boolean }
 export interface FileDiffInput { oldPath: string; newPath: string; oldText: string | null; newText: string | null; binary?: boolean }
 export type DiffOp = ["=" | "+" | "-", string];
 // One adapter. Payload parameters (`normalize`, `hookBody`, `route`) take untrusted server JSON; each adapter declares
@@ -127,12 +133,18 @@ export interface Forge {
   comment(repo: string, n: number, body: string): Promise<unknown>;
   editComment(repo: string, n: number, cid: number | string, body: string): Promise<unknown>;
   inline<C extends InlineComment>(repo: string, n: number, comments: C[], sha?: string): Promise<C[]>;
+  // Resolve the still-open inline comments this token wrote whose body `ours` accepts; where the server cannot resolve
+  // one, reply `note` instead. Returns how many were resolved or answered.
+  resolveInline(repo: string, n: number, ours: (body: string) => boolean, note: string): Promise<number>;
   singleLineSuggestions?: boolean;
   multiLineSuggestions?: boolean;
   setBody(repo: string, n: number, body: string): Promise<unknown>;
   commentsSince(repo: string, since: string): Promise<ForgeComment[]>;
   trusted(repo: string, c: ForgeComment): Promise<boolean>;
   react(repo: string, c: ForgeComment): Promise<unknown> | null;
+  // Inline review threads, each oldest first, and a reply in one. Adapters without thread replies leave them out.
+  reviewThreads?(repo: string, n: number): Promise<ThreadComment[][]>;
+  replyInThread?(repo: string, n: number, root: ThreadComment, body: string): Promise<unknown>;
   ensureHook(repo: string, url: string, secret: string): Promise<boolean>;
   removeHook(repo: string, url: string): Promise<void>;
   secretHeader?: string;
@@ -327,6 +339,8 @@ interface GiteaPull {
 interface GiteaFile { filename: string; additions?: number; deletions?: number }
 interface GiteaCommit { sha: string; commit?: { message?: string; author?: { name?: string; date?: string } }; author?: { login?: string } }
 interface GiteaComment { id: number; body?: string; created_at?: string; html_url?: string; user?: GiteaUser }
+interface GiteaReview { id?: number; state?: string; user?: GiteaUser }
+interface GiteaReviewComment { id: number; body?: string; created_at?: string; html_url?: string; user?: GiteaUser; resolver?: GiteaUser | null; path?: string; position?: number; original_position?: number; diff_hunk?: string }
 interface GiteaContent { encoding?: string; content?: unknown }
 interface GiteaIssue { number?: number; title?: string; body?: string; state?: string; labels?: GiteaLabel[] }
 interface GiteaHook { id?: number; config?: { url?: string } }
@@ -424,6 +438,24 @@ function gitea(id: string, f: AuthedConfig): Forge {
         return list0;
       }
     },
+    // The API cannot resolve a conversation: one PR comment names every fixed one instead.
+    async resolveInline(repo, n, ours, note) {
+      const me = await api<GiteaUser | null>("user");
+      const open: GiteaReviewComment[] = [];
+      for (const rv of await list<GiteaReview>(`${r(repo)}/pulls/${n}/reviews`)) {
+        if (!me?.id || rv.user?.id !== me.id || !Number.isSafeInteger(Number(rv.id))) continue;
+        const rows = await api<GiteaReviewComment[] | null>(`${r(repo)}/pulls/${n}/reviews/${Number(rv.id)}/comments`);
+        open.push(...(Array.isArray(rows) ? rows : []).filter((c) => c.user?.id === me.id && !c.resolver && ours(String(c.body || ""))));
+      }
+      if (!open.length) return 0;
+      const item = (c: GiteaReviewComment) => {
+        const where = `\`${c.path || "comment"}\``;
+        const title = firstLine(String(c.body || "").replace(/<!--[\s\S]*?-->/g, "").trim()).slice(0, 160);
+        return `- ${c.html_url ? `[${where}](${c.html_url})` : where}: ${title}`;
+      };
+      await api(`${r(repo)}/issues/${n}/comments`, { method: "POST", body: { body: [note, "", ...open.map(item)].join("\n") } });
+      return open.length;
+    },
     singleLineSuggestions: true,
     setBody: (repo, n, body) => api(`${r(repo)}/pulls/${n}`, { method: "PATCH", body: { body } }),
     commentsSince: async (repo, since) => (await api<GiteaComment[] | null>(`${r(repo)}/issues/comments?since=${enc(since)}&limit=50`) || []).map(toComment),
@@ -434,10 +466,26 @@ function gitea(id: string, f: AuthedConfig): Forge {
       return ["owner", "admin", "write"].includes(String(p?.permission || "").toLowerCase());
     },
     react: (repo, c) => (Number.isSafeInteger(Number(c.id)) ? api(`${r(repo)}/issues/comments/${Number(c.id)}/reactions`, { method: "POST", body: { content: "eyes" } }) : null),
+    // The API has no reply-to link: the server groups a conversation by file and line, and so does this.
+    async reviewThreads(repo, n) {
+      const reviews = (await list<GiteaReview>(`${r(repo)}/pulls/${n}/reviews`)).filter((v) => Number.isSafeInteger(Number(v?.id)) && v.state !== "PENDING");
+      const rows = (await Promise.all(reviews.map((v) => api<GiteaReviewComment[] | null>(`${r(repo)}/pulls/${n}/reviews/${Number(v.id)}/comments`)))).flatMap((x) => (Array.isArray(x) ? x : []));
+      const threads = new Map<string, ThreadComment[]>();
+      for (const c of rows) {
+        const line = Number(c?.position) > 0 ? Number(c.position) : -Number(c?.original_position || 0);
+        if (!c?.path || !line || !Number.isSafeInteger(Number(c.id))) continue;
+        const key = `${c.path}:${line}`;
+        threads.set(key, [...(threads.get(key) || []), { id: c.id, body: c.body || "", created_at: iso(c.created_at), user: { id: c.user?.id ?? "", login: c.user?.login || "" }, bot: false, path: c.path, line, hunk: c.diff_hunk || "" }]);
+      }
+      return [...threads.values()].map((t) => t.sort((a, b) => a.created_at.localeCompare(b.created_at) || Number(a.id) - Number(b.id)));
+    },
+    replyInThread: (repo, n, root, body) => api(`${r(repo)}/pulls/${n}/reviews`, { method: "POST", body: {
+      event: "COMMENT", body: "", comments: [{ path: root.path, new_position: root.line > 0 ? root.line : 0, old_position: root.line < 0 ? -root.line : 0, body }],
+    } }),
     async ensureHook(repo, url, secret) {
       const hooks = await api<GiteaHook[] | null>(`${r(repo)}/hooks`);
       if ((Array.isArray(hooks) ? hooks : []).some((h) => h?.config?.url === url)) return false;
-      await api(`${r(repo)}/hooks`, { method: "POST", body: { type: "gitea", active: true, events: ["pull_request", "issue_comment", "pull_request_comment"], config: { url, content_type: "json", secret } } });
+      await api(`${r(repo)}/hooks`, { method: "POST", body: { type: "gitea", active: true, events: ["pull_request", "issue_comment", "pull_request_comment", "pull_request_review"], config: { url, content_type: "json", secret } } });
       return true;
     },
     async removeHook(repo, url) {
@@ -462,7 +510,7 @@ interface BbPull {
 interface BbPage<T> { values?: T[]; next?: string }
 interface BbDiffstat { new?: { path?: string }; old?: { path?: string }; lines_added?: number; lines_removed?: number }
 interface BbCommit { hash: string; message?: string; author?: { user?: BbUser; raw?: string }; date?: string }
-interface BbComment { id: number; content?: { raw?: string }; created_on?: string; user?: BbUser; inline?: unknown; parent?: unknown; deleted?: boolean }
+interface BbComment { id: number; content?: { raw?: string }; created_on?: string; user?: BbUser; inline?: unknown; parent?: unknown; deleted?: boolean; resolution?: unknown }
 interface BbRepo { mainbranch?: { name?: string }; workspace?: { slug?: string }; full_name?: string; slug?: string }
 interface BbIssue { id?: number; title?: string; content?: { raw?: string }; state?: string; links?: { html?: { href?: string } }; kind?: string; priority?: string }
 interface BbHook { url?: string; uuid: string }
@@ -567,6 +615,21 @@ function bitbucket(id: string, f: AuthedConfig): Forge {
       }
       return failed;
     },
+    async resolveInline(repo, n, ours, note) {
+      const me = await orNull(api<BbUser | null>("user")).catch(() => null);
+      const meId = me?.account_id || me?.uuid;
+      const open = (await list<BbComment>(`${r(repo)}/pullrequests/${n}/comments`)).filter((c) => c.inline && !c.parent && !c.deleted && !c.resolution
+        && (!meId || (c.user?.account_id || c.user?.uuid) === meId) && ours(String(c.content?.raw || "")) && Number.isSafeInteger(Number(c.id)));
+      for (const c of open) {
+        try {
+          await api(`${r(repo)}/pullrequests/${n}/comments/${Number(c.id)}/resolve`, { method: "POST" });
+        } catch (e) {
+          if (![400, 403, 404, 405].includes(statusOf(e) ?? 0)) throw e;
+          await api(`${r(repo)}/pullrequests/${n}/comments`, { method: "POST", body: { content: { raw: note }, parent: { id: Number(c.id) } } });
+        }
+      }
+      return open.length;
+    },
     async setBody(repo, n, body) {
       const p = await api<BbPull>(`${r(repo)}/pullrequests/${n}`);
       return api(`${r(repo)}/pullrequests/${n}`, { method: "PUT", body: { title: p.title, description: body } });
@@ -625,7 +688,7 @@ interface DcPull {
   state?: string; draft?: boolean; version?: number;
 }
 interface DcPage<T> { values?: T[]; isLastPage?: boolean; nextPageStart: number }
-interface DcComment { id: number; text?: string; createdDate?: number; author?: DcUser; version?: number }
+interface DcComment { id: number; text?: string; createdDate?: number; author?: DcUser; version?: number; threadResolved?: boolean }
 interface DcActivity { action?: string; comment?: DcComment; commentAnchor?: unknown }
 interface DcCommit { id: string; message?: string; author?: DcUser; authorTimestamp?: number }
 interface DcSegment { type?: string; lines?: { line: string }[] }
@@ -736,6 +799,18 @@ function bitbucketdc(id: string, f: AuthedConfig): Forge {
       }
       return failed;
     },
+    // Matched by the CodeOtter marker alone (no me()). Resolving a thread needs Bitbucket 8.9+; older servers get a reply.
+    async resolveInline(repo, n, ours, note) {
+      const open = (await list<DcActivity>(`${r(repo)}/pull-requests/${n}/activities`, 1000))
+        .filter((a): a is DcActivity & { comment: DcComment } => a.action === "COMMENTED" && !!a.comment && !!a.commentAnchor && !a.comment.threadResolved && ours(String(a.comment.text || "")) && Number.isSafeInteger(Number(a.comment.id)));
+      for (const { comment: c } of open) {
+        const path = `${r(repo)}/pull-requests/${n}/comments/${Number(c.id)}`;
+        const now = await api<DcComment>(path);
+        const done = await api<DcComment | null>(path, { method: "PUT", body: { text: now.text, version: now.version, threadResolved: true } }).catch((e: unknown) => { if ([400, 409].includes(statusOf(e) ?? 0)) return null; throw e; });
+        if (!done?.threadResolved) await api(`${r(repo)}/pull-requests/${n}/comments`, { method: "POST", body: { text: note, parent: { id: Number(c.id) } } });
+      }
+      return open.length;
+    },
     async setBody(repo, n, body) {
       const p = await api<DcPull>(`${r(repo)}/pull-requests/${n}`);
       return api(`${r(repo)}/pull-requests/${n}`, { method: "PUT", body: { version: p.version, title: p.title, description: body } });
@@ -806,7 +881,7 @@ interface AzComment {
   id: number; parentCommentId?: number; isDeleted?: boolean; commentType?: string; content?: string; publishedDate: string;
   author?: AzIdentity; _links?: { threads?: { href?: string } };
 }
-interface AzThread { id: number; isDeleted?: boolean; threadContext?: unknown; comments?: AzComment[] }
+interface AzThread { id: number; isDeleted?: boolean; threadContext?: unknown; comments?: AzComment[]; status?: string }
 interface AzGitRepo { id?: string; name: string; isDisabled?: boolean; project: { id?: string; name: string } }
 interface AzWorkItem { id: number; fields?: { "System.Title"?: string; "System.Description"?: string; "System.State"?: string; "System.Tags"?: string } }
 interface AzSubscription { id?: string; eventType?: string; consumerInputs?: { url?: string }; publisherInputs?: { repository?: string } }
@@ -904,6 +979,7 @@ function azure(id: string, f: AuthedConfig): Forge {
     .filter((t): t is AzThread & { comments: AzComment[] } => !t.isDeleted && !t.threadContext && !!t.comments?.length)
     .map((t) => { const c = t.comments.find((x) => !x.parentCommentId) || t.comments[0]; return c.isDeleted || c.commentType === "system" ? null : toComment(t.id, c, n); })
     .filter((c): c is ForgeComment => Boolean(c));
+  const me = async (repo: string): Promise<ForgeUser | null> => { const d = await api<{ authenticatedUser?: { id?: string } } | null>(`${enc(parts(repo)[0])}/_apis/connectionData?api-version=7.1-preview`).catch(() => null); return d?.authenticatedUser ? { id: d.authenticatedUser.id, login: "" } : null; };
   const ids = async (repo: string) => { const x = await api<AzGitRepo>(g(repo)); return { repositoryId: x.id, projectId: x.project?.id }; };
   const EVENTS = ["git.pullrequest.created", "git.pullrequest.updated", "ms.vss-code.git-pullrequest-comment-event"];
   return {
@@ -929,7 +1005,7 @@ function azure(id: string, f: AuthedConfig): Forge {
       for (const org of f.orgs) await api(`${enc(org)}/_apis/projects?$top=1`);
       return `Connected to Azure DevOps (${f.orgs.join(", ")})`;
     },
-    me: async (repo) => { const d = await api<{ authenticatedUser?: { id?: string } } | null>(`${enc(parts(repo)[0])}/_apis/connectionData?api-version=7.1-preview`).catch(() => null); return d?.authenticatedUser ? { id: d.authenticatedUser.id, login: "" } : null; },
+    me,
     async listRepos() {
       const out: string[] = [];
       for (const org of f.orgs || []) {
@@ -1005,6 +1081,21 @@ function azure(id: string, f: AuthedConfig): Forge {
       return failed;
     },
     multiLineSuggestions: true,
+    // An inline thread whose first comment this token wrote gets the note as a reply and moves from active to fixed.
+    async resolveInline(repo, n, ours, note) {
+      const self = await me(repo);
+      const open = (await threads(repo, n)).flatMap((t) => {
+        const c = t.comments?.find((x) => !x.parentCommentId);
+        const mine = !t.isDeleted && !!t.threadContext && ["active", "pending"].includes(String(t.status || "")) && !!c && !c.isDeleted
+          && (!self?.id || c.author?.id === self.id) && ours(String(c.content || "")) && Number.isSafeInteger(Number(t.id)) && Number.isSafeInteger(Number(c.id));
+        return mine && c ? [{ thread: Number(t.id), first: Number(c.id) }] : [];
+      });
+      for (const { thread, first } of open) {
+        await api(`${g(repo)}/pullRequests/${n}/threads/${thread}/comments`, { method: "POST", body: { parentCommentId: first, content: note, commentType: 1 } });
+        await api(`${g(repo)}/pullRequests/${n}/threads/${thread}`, { method: "PATCH", body: { status: "fixed" } });
+      }
+      return open.length;
+    },
     async setBody(repo, n, body) {
       if (body.length > AZURE_MAX_DESCRIPTION) throw new Error(`Azure DevOps limits a pull request description to ${AZURE_MAX_DESCRIPTION} characters (this one is ${body.length})`);
       return api(`${g(repo)}/pullrequests/${n}`, { method: "PATCH", body: { description: body } });
@@ -1075,6 +1166,246 @@ function azure(id: string, f: AuthedConfig): Forge {
 }
 
 // =====================================================================================================================
+// GitLab (gitlab.com or self-managed, /api/v4). A personal, group or project access token (Bearer). Projects live under
+// nested groups, so the native part is group[/subgroup...]/project and goes to the API URL-encoded as one :id segment.
+interface GlUser { id?: number; username?: string; name?: string }
+interface GlMr {
+  iid: number; title?: string; description?: string; author?: GlUser; updated_at?: string; web_url?: string;
+  target_branch?: string; source_branch?: string; sha?: string; last_commit?: { id?: string };
+  source_project_id?: number; target_project_id?: number; state?: string; draft?: boolean; work_in_progress?: boolean;
+  labels?: (string | { title?: string; name?: string })[]; diff_refs?: { base_sha?: string; start_sha?: string; head_sha?: string };
+}
+interface GlDiff { old_path?: string; new_path?: string; diff?: string; new_file?: boolean; deleted_file?: boolean; renamed_file?: boolean }
+interface GlCommit { id: string; message?: string; title?: string; author_name?: string; committed_date?: string; authored_date?: string }
+interface GlNote {
+  id: number; body?: string; note?: string; created_at?: string; author?: GlUser; author_id?: number; system?: boolean; type?: string | null; noteable_type?: string; noteable_iid?: number;
+  resolvable?: boolean; resolved?: boolean; position?: { new_path?: string; old_path?: string; new_line?: number | null; old_line?: number | null };
+}
+interface GlDiscussion { id?: string; notes?: GlNote[] }
+const GL_DISCUSSION = /^[0-9a-f]{8,64}$/i;
+interface GlProject { path_with_namespace?: string; default_branch?: string }
+interface GlIssue { iid?: number; title?: string; description?: string; state?: string; web_url?: string; labels?: string[] }
+interface GlHook { id?: number; url?: string }
+interface GlEvent { object_kind?: string; project?: GlProject; user?: GlUser; object_attributes?: GlMr & GlNote & { action?: string }; merge_request?: GlMr }
+const GL_SEG = "[\\w][\\w.-]*";
+const GL_PATH = new RegExp(`^${GL_SEG}(?:/${GL_SEG}){1,19}$`);
+// Webhook payloads date things "2026-11-20 10:00:00 UTC"; the REST API answers ISO 8601.
+const glDate = (s: string | undefined) => String(s || "").replace(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) UTC$/, "$1T$2Z");
+const GL_STATE: Record<string, string> = { success: "success", failure: "failed", error: "failed", pending: "running" };
+function gitlab(id: string, f: AuthedConfig): Forge {
+  f.auth = () => `Bearer ${f.token}`;
+  const api = <T = unknown>(path: string, opts: ApiOptions = {}): Promise<T> => {
+    if (!f.url) throw new Error(`Set the ${f.label} server under Admin / Git providers`);
+    if (!/^(?:user$|projects(?:\/|\?|$))/.test(path) || path.split(/[/?]/).some((p) => p === "." || p === "..")) throw new Error("Invalid git server API path");
+    if (!f.token) throw new Error(`Configure an access token in Admin / Git providers / ${f.label}`);
+    return http(f, `${f.url}/api/v4/${path}`, { ...opts, what: path.split("?")[0] }) as Promise<T>;
+  };
+  const list = async <T = unknown>(path: string, max = 2000): Promise<T[]> => {
+    const rows: T[] = [];
+    for (let page = 1; rows.length < max; page++) {
+      const batch = await api<T[]>(`${path}${path.includes("?") ? "&" : "?"}per_page=100&page=${page}`);
+      if (!Array.isArray(batch)) throw new Error("Invalid git server list response");
+      rows.push(...batch);
+      if (batch.length < 100) break;
+    }
+    return rows.slice(0, max);
+  };
+  const p = (repo: string) => `projects/${enc(native(repo))}`;
+  const web = (repo: string) => `${f.url}/${native(repo)}`;
+  const label = (l: string | { title?: string; name?: string }) => (typeof l === "string" ? l : l?.title || l?.name || "");
+  const normalize = (m: GlMr, repo: string, files?: PrFile[], commits?: PrCommit[]) => pullRequest({
+    number: m.iid, title: m.title, body: m.description, url: `${web(repo)}/-/merge_requests/${m.iid}`,
+    author: m.author?.username, updatedAt: glDate(m.updated_at),
+    baseRefName: m.target_branch, headRefName: m.source_branch, headRefOid: m.sha || m.last_commit?.id,
+    headRepo: repo, files, commits,
+    state: ({ opened: "OPEN", merged: "MERGED", closed: "CLOSED", locked: "OPEN" } as Record<string, string>)[String(m.state)] || "OPEN",
+    isDraft: !!(m.draft || m.work_in_progress), labels: (m.labels || []).map(label).filter(Boolean).map((name) => ({ name })),
+  });
+  const toComment = (c: GlNote, n: number, author?: GlUser) => comment({ id: c.id, body: c.body ?? c.note, created_at: glDate(c.created_at), prNumber: n, userId: c.author?.id ?? author?.id ?? c.author_id, login: c.author?.username || author?.username });
+  // GitLab's per-file diffs (the hunks without headers) -> unified text
+  const unified = (diffs: GlDiff[]) => diffs.map((d) => {
+    const a = d.old_path || d.new_path || "", b = d.new_path || d.old_path || "";
+    const head = [`diff --git a/${a} b/${b}`, ...(d.new_file ? ["new file mode 100644"] : []), ...(d.deleted_file ? ["deleted file mode 100644"] : []), ...(d.renamed_file && a !== b ? [`rename from ${a}`, `rename to ${b}`] : [])];
+    const body = String(d.diff || "").replace(/\n$/, "");
+    if (!body) return head.join("\n");
+    return [...head, `--- ${d.new_file ? "/dev/null" : `a/${a}`}`, `+++ ${d.deleted_file ? "/dev/null" : `b/${b}`}`, body].join("\n");
+  }).join("\n");
+  // merge_requests/:iid/diffs (GitLab 15.7+), else the older /changes
+  const prDiffs = async (repo: string, n: number) => {
+    const path = `${p(repo)}/merge_requests/${n}`;
+    try { return await list<GlDiff>(`${path}/diffs`, 3000); } catch (e) {
+      if (statusOf(e) !== 404) throw e;
+      return (await api<{ changes?: GlDiff[] } | null>(`${path}/changes`))?.changes || [];
+    }
+  };
+  const notes = async (repo: string, n: number) => (await list<GlNote>(`${p(repo)}/merge_requests/${n}/notes?sort=asc&order_by=created_at`))
+    .filter((c) => !c.system);
+  const discussions = (repo: string, n: number) => list<GlDiscussion>(`${p(repo)}/merge_requests/${n}/discussions`, 1000);
+  // Developer (30) or higher on the project, directly or through a group.
+  const DEVELOPER = 30;
+  return {
+    id, kind: "gitlab", api, list, normalize,
+    prUrl: (repo, n) => `${web(repo)}/-/merge_requests/${n}`,
+    issueUrl: (repo, n) => `${web(repo)}/-/issues/${n}`,
+    repoUrl: web,
+    parsePr(u) {
+      const m = u.pathname.match(new RegExp(`^/(${GL_SEG}(?:/${GL_SEG}){1,19})/-/merge_requests/([1-9]\\d*)$`));
+      return m ? { native: m[1], number: Number(m[2]) } : null;
+    },
+    parseRepo(rest) { const s = rest.replace(/\/-(?:\/.*)?$/, "").replace(/\.git$/, ""); return GL_PATH.test(s) ? s : null; },
+    async test() {
+      const u = await api<GlUser | null>("user");
+      return `Connected to ${f.label}${u?.username ? ` as ${u.username}` : ""}`;
+    },
+    me: async () => { const u = await api<GlUser | null>("user"); return { id: u?.id, login: u?.username || "" }; },
+    listRepos: async () => (await list<GlProject>(`projects?membership=true&min_access_level=${DEVELOPER}&archived=false&simple=true`, 5000))
+      .map((x) => String(x.path_with_namespace || "")).filter((x) => GL_PATH.test(x)).map((x) => `${id}~${x}`),
+    repoExists: (repo) => api(p(repo)).then(() => true),
+    async pr(repo, n) {
+      const path = `${p(repo)}/merge_requests/${n}`;
+      const [m, diffs, commits] = await Promise.all([api<GlMr>(path), prDiffs(repo, n), list<GlCommit>(`${path}/commits`, 500)]);
+      if (commits.length && m.sha && !commits.some((c) => c.id === m.sha)) throw new Error("GitLab is updating this merge request after a push. Retry the review shortly.");
+      const pr = normalize(m, repo, diffStats(unified(diffs)),
+        // newest first from the server; the incremental engine expects oldest first
+        commits.reverse().map((c) => commit(c.id, c.message || c.title, c.author_name, c.committed_date || c.authored_date)));
+      // A fork's content is read from the fork.
+      if (m.source_project_id && m.target_project_id && m.source_project_id !== m.target_project_id) {
+        const src = await api<GlProject | null>(`projects/${Number(m.source_project_id)}`).catch(() => null);
+        if (src?.path_with_namespace && GL_PATH.test(src.path_with_namespace)) pr.headRepo = `${id}~${src.path_with_namespace}`;
+      }
+      return pr;
+    },
+    diff: async (repo, n) => unified(await prDiffs(repo, n)),
+    openPrs: async (repo) => (await list<GlMr>(`${p(repo)}/merge_requests?state=opened`, 200)).map((m) => normalize(m, repo)),
+    async file(repo, path, ref = "") {
+      if (!safeFile(path)) return null;
+      const at = ref || (await api<GlProject>(p(repo))).default_branch;
+      if (!at) return null;
+      return orNull(api<string>(`${p(repo)}/repository/files/${enc(path)}/raw?ref=${enc(at)}`, { as: "text" }));
+    },
+    async baseCommits(repo, branch, n = 8) {
+      const rows = await api<GlCommit[]>(`${p(repo)}/repository/commits?ref_name=${enc(branch)}&per_page=${n}`);
+      return (Array.isArray(rows) ? rows : []).map((c) => ({ sha: String(c.id || "").slice(0, 7), message: firstLine(c.title || c.message).trim(), author: c.author_name || "" }));
+    },
+    compare: async (repo, from, to) => unified((await api<{ diffs?: GlDiff[] } | null>(`${p(repo)}/repository/compare?from=${enc(from)}&to=${enc(to)}`))?.diffs || []),
+    async issue(repo, n) {
+      const i = await orNull(api<GlIssue | null>(`${p(repo)}/issues/${n}`)).catch((e: unknown) => { if (statusOf(e) === 403) return null; throw e; });
+      return i?.iid ? { number: i.iid, title: i.title, body: i.description, state: i.state, url: `${web(repo)}/-/issues/${n}`, labels: (i.labels || []).map(String) } : null;
+    },
+    status(repo, sha, s) {
+      if (!isSha(sha)) throw new Error("Invalid commit SHA");
+      return api(`${p(repo)}/statuses/${sha}`, { method: "POST", body: { state: GL_STATE[s.state] || "failed", name: s.context, description: s.description, target_url: s.target_url } });
+    },
+    comments: async (repo, n) => (await notes(repo, n)).filter((c) => c.type !== "DiffNote" && c.type !== "DiscussionNote").map((c) => toComment(c, n)),
+    comment: (repo, n, body) => api(`${p(repo)}/merge_requests/${n}/notes`, { method: "POST", body: { body } }),
+    editComment: (repo, n, cid, body) => api(`${p(repo)}/merge_requests/${n}/notes/${Number(cid)}`, { method: "PUT", body: { body } }),
+    // One discussion per finding, anchored on the new line against the MR's diff refs. A multi-line fix is GitLab's
+    // ```suggestion:-N+0``` (N lines above the anchor). A line GitLab cannot anchor (400) goes to the fallback comment.
+    async inline(repo, n, list0) {
+      const refs = (await api<GlMr>(`${p(repo)}/merge_requests/${n}`)).diff_refs;
+      if (!refs?.base_sha || !refs.head_sha) return list0;
+      const failed: typeof list0 = [];
+      for (const c of list0) {
+        const above = c.startLine && c.startLine < c.line ? c.line - c.startLine : 0;
+        const body = c.body.replace(/^```suggestion$/m, `\`\`\`suggestion:-${above}+0`);
+        try {
+          await api(`${p(repo)}/merge_requests/${n}/discussions`, { method: "POST", body: { body, position: {
+            position_type: "text", base_sha: refs.base_sha, start_sha: refs.start_sha || refs.base_sha, head_sha: refs.head_sha,
+            old_path: c.path, new_path: c.path, new_line: c.line,
+          } } });
+        } catch (e) {
+          if (![400, 422].includes(statusOf(e) ?? 0)) throw e;
+          failed.push(c);
+        }
+      }
+      return failed;
+    },
+    multiLineSuggestions: true,
+    // Diff discussions CodeOtter opened: resolved when the token may (Developer and up), else answered with the note.
+    async resolveInline(repo, n, ours, note) {
+      const me = await api<GlUser | null>("user");
+      if (!me?.id) return 0;
+      let done = 0;
+      for (const d of await discussions(repo, n)) {
+        const first = d.notes?.[0];
+        if (!first || !GL_DISCUSSION.test(String(d.id)) || first.author?.id !== me.id || !first.resolvable || first.resolved || !ours(String(first.body || ""))) continue;
+        const at = `${p(repo)}/merge_requests/${n}/discussions/${String(d.id)}`;
+        try {
+          await api(at, { method: "PUT", body: { resolved: true } });
+        } catch (e) {
+          if (statusOf(e) !== 403) throw e;
+          await api(`${at}/notes`, { method: "POST", body: { body: note } });
+        }
+        done++;
+      }
+      return done;
+    },
+    // Diff discussions as review threads, oldest note first; a reply goes into the discussion.
+    async reviewThreads(repo, n) {
+      return (await discussions(repo, n)).filter((d) => GL_DISCUSSION.test(String(d.id)) && d.notes?.[0]?.type === "DiffNote").map((d) => (d.notes || [])
+        .filter((c) => !c.system && Number.isSafeInteger(Number(c.id)))
+        .map((c): ThreadComment => {
+          const pos = c.position || d.notes?.[0]?.position || {};
+          return {
+            id: c.id, body: String(c.body ?? c.note ?? ""), created_at: glDate(c.created_at), user: { id: c.author?.id ?? "", login: c.author?.username || "" }, bot: false,
+            path: String(pos.new_path || pos.old_path || ""), line: Number(pos.new_line) > 0 ? Number(pos.new_line) : -Number(pos.old_line || 0), hunk: "", thread: String(d.id),
+          };
+        })
+        .sort((a, b) => a.created_at.localeCompare(b.created_at) || Number(a.id) - Number(b.id)));
+    },
+    replyInThread(repo, n, root, body) {
+      if (!GL_DISCUSSION.test(String(root.thread || ""))) throw new Error("Invalid discussion id");
+      return api(`${p(repo)}/merge_requests/${n}/discussions/${String(root.thread)}/notes`, { method: "POST", body: { body } });
+    },
+    setBody: (repo, n, body) => api(`${p(repo)}/merge_requests/${n}`, { method: "PUT", body: { description: body } }),
+    async commentsSince(repo, since) {
+      const t = Date.parse(since);
+      const mrs = await list<GlMr>(`${p(repo)}/merge_requests?state=opened&updated_after=${enc(new Date(t).toISOString())}&order_by=updated_at`, 30);
+      const out: ForgeComment[] = [];
+      for (const m of mrs) out.push(...(await notes(repo, m.iid)).filter((c) => Date.parse(glDate(c.created_at)) > t).map((c) => toComment(c, m.iid)));
+      return out;
+    },
+    async trusted(repo, c) {
+      const uid = Number(c.user?.id);
+      if (!Number.isSafeInteger(uid) || uid <= 0) return false;
+      const m = await api<{ access_level?: number; state?: string } | null>(`${p(repo)}/members/all/${uid}`).catch((e: unknown) => { if ([401, 403, 404].includes(statusOf(e) ?? 0)) return null; throw e; });
+      return Number(m?.access_level) >= DEVELOPER && (m?.state ?? "active") === "active";
+    },
+    react: (repo, c) => (Number.isSafeInteger(Number(c.id)) && c.prNumber ? api(`${p(repo)}/merge_requests/${c.prNumber}/notes/${Number(c.id)}/award_emoji`, { method: "POST", body: { name: "eyes" } }) : null),
+    async ensureHook(repo, url, secret) {
+      const hooks = await list<GlHook>(`${p(repo)}/hooks`, 200);
+      if (hooks.some((h) => h?.url === url)) return false;
+      await api(`${p(repo)}/hooks`, { method: "POST", body: { url, token: secret, merge_requests_events: true, note_events: true, push_events: false, enable_ssl_verification: true } });
+      return true;
+    },
+    async removeHook(repo, url) {
+      const hooks = await list<GlHook>(`${p(repo)}/hooks`, 200).catch((): GlHook[] => []);
+      for (const h of hooks) if (h?.url === url && Number.isSafeInteger(Number(h.id))) await api(`${p(repo)}/hooks/${Number(h.id)}`, { method: "DELETE" }).catch(() => {});
+    },
+    // GitLab sends the hook's secret token as X-Gitlab-Token (compared in constant time). Idempotency-Key (17.4+) stays
+    // the same across retries; X-Gitlab-Event-UUID identifies the event on older servers.
+    secretHeader: "x-gitlab-token",
+    hookMeta: (h) => ({ event: String(h["x-gitlab-event"] || ""), delivery: String(h["idempotency-key"] || h["x-gitlab-event-uuid"] || ""), signature: "" }),
+    route(event: string, x: GlEvent | null | undefined) {
+      const path = String(x?.project?.path_with_namespace || "");
+      if (!GL_PATH.test(path)) return null;
+      const repo = `${id}~${path}`;
+      const a = x?.object_attributes;
+      if (event === "Merge Request Hook" && x?.object_kind === "merge_request") {
+        if (!a?.iid || a.state !== "opened" || !["open", "reopen", "update"].includes(String(a.action))) return null;
+        return { repo, pr: normalize(a, repo) };
+      }
+      if (event === "Note Hook" && x?.object_kind === "note") {
+        const iid = Number(x.merge_request?.iid);
+        if (a?.noteable_type !== "MergeRequest" || !a.id || a.system || !Number.isSafeInteger(iid) || iid <= 0) return null;
+        return { repo, comment: toComment(a, iid, x.user), ...(a.type === "DiffNote" ? { inThread: true } : {}) };
+      }
+      return null;
+    },
+  };
+}
+
+// =====================================================================================================================
 // A pull request URL's repository id, given the configured origins (provider id -> origin). For clients that only hold
 // the board's forgeUrls (the TUI); web/src/types.ts carries the same rules.
 export function repoFromUrl(url: string, origins: Record<string, string> = {}): string {
@@ -1085,14 +1416,15 @@ export function repoFromUrl(url: string, origins: Record<string, string> = {}): 
     const seg = u.pathname.split("/").slice(1);
     if (id === "bitbucketdc") return seg[0] === "projects" && seg[2] === "repos" ? `${id}~${seg[1]}/${seg[3]}` : "";
     if (id === "azure") return seg[2] === "_git" ? `${id}~${[seg[0], seg[1], seg[3]].map(decodeURIComponent).join("/")}` : "";
+    if (id === "gitlab") return seg.indexOf("-") >= 2 ? `${id}~${seg.slice(0, seg.indexOf("-")).join("/")}` : "";
     return `${id ? `${id}~` : ""}${seg.slice(0, 2).join("/")}`;
   } catch { return ""; }
 }
 
-const KINDS: Record<ForgeKind, (id: string, f: AuthedConfig) => Forge> = { gitea, bitbucket, bitbucketdc, azure };
+const KINDS: Record<ForgeKind, (id: string, f: AuthedConfig) => Forge> = { gitea, bitbucket, bitbucketdc, azure, gitlab };
 // Each adapter sets f.auth on entry, before anything calls http().
 export const makeForge = (id: string, f: ForgeConfig): Forge => KINDS[f.kind](id, f as AuthedConfig);
-// Shared-secret header check (Azure): constant time, never a prefix or empty match.
+// Shared-secret header check (Azure, GitLab): constant time, never a prefix or empty match.
 export function secretMatches(secret: unknown, given: unknown): boolean {
   if (!secret || !given) return false;
   const a = createHmac("sha256", "codeotter").update(String(secret)).digest(), b = createHmac("sha256", "codeotter").update(String(given)).digest();

@@ -5,24 +5,26 @@ import { secretMatches } from "./forges.ts";
 import { APP_URL, FORGE_API, FORGES, IS_SERVER, PORT, REPO_RE } from "./config.ts";
 import { store } from "./store.ts";
 import { createGitHubAppJwt, forgeId, forgeOf, forgetGithubRepos, ghEnv, isForgeRepo, nativeRepo, normalizeForgePr, openPrs, repos } from "./git.ts";
-import { reviewConfig } from "./context.ts";
+import { effectiveRules, reviewConfig } from "./context.ts";
+import { skipReason } from "./repo-rules.ts";
 import { score, SHA_RE, syncPrComments, triageConfig, triagePr } from "./review.ts";
-import { commenterTrusted, commentPrNumber, oneLine, parseCommand, runCommand } from "./pr-tools.ts";
+import { answerReplies, commenterTrusted, commentPrNumber, oneLine, parseCommand, runCommand } from "./pr-tools.ts";
 import { repoOf } from "./views.ts";
+import { AUTO, withActor } from "./audit.ts";
 import type { ChildProcess } from "node:child_process";
 import type { HookHeaders } from "./forges.ts";
 import type { WebhookDelivery } from "./store.ts";
 import type { PrComment } from "./pr-tools.ts";
 
 // A pull request as the queue sees it: openPrs() rows, a forge adapter's normalized PR, or normalizeGitHubPr().
-export interface QueuedPr { url: string; number?: number; headRefOid: string; isDraft?: boolean; labels?: ({ name?: string } | null)[] }
+export interface QueuedPr { url: string; number?: number; headRefOid: string; isDraft?: boolean; labels?: ({ name?: string } | null)[]; title?: string; author?: { login?: string }; baseRefName?: string }
 // The parts of a GitHub webhook payload routeWebhook() reads. Untrusted: every field is checked before use.
 interface GitHubPullPayload {
   number: number; title?: string; body?: string; html_url: string; user?: { login?: string }; updated_at?: string;
   base?: { ref?: string }; head?: { ref?: string; sha?: string }; additions?: number; deletions?: number; changed_files?: number;
   draft?: boolean; labels?: ({ name?: string } | null)[];
 }
-interface GitHubPayload { action?: string; repository?: { full_name?: string }; pull_request?: GitHubPullPayload; comment?: PrComment; issue?: { pull_request?: unknown }; is_pull?: boolean }
+interface GitHubPayload { action?: string; number?: number; repository?: { full_name?: string }; pull_request?: GitHubPullPayload; comment?: PrComment & { in_reply_to_id?: unknown; user?: { type?: string } }; issue?: { number?: number; pull_request?: unknown }; is_pull?: boolean }
 interface GitHubDelivery { id: number | string; event?: string; redelivery?: boolean; delivered_at: string; status_code: number }
 export type WebhookReply = { status: 202 | 400 | 401 | 404 | 503; body: { ok: true } | { error: string } };
 interface Forwarder { proc: ChildProcess | null; state: string; error: string; restarts: number }
@@ -35,10 +37,18 @@ const PR_QUEUE = new Map<string, { repo: string; p: QueuedPr }>(); // url -> { r
 let prDraining = false;
 const MAX_REVIEW_TRIES = 3;
 const RETRY_AFTER = 10 * 60e3;
-const skipReview = (p: QueuedPr) => !!p.isDraft || (p.labels || []).some((l) => (l?.name || l) === "codeotter:skip");
 function enqueuePr(repo: string, p: QueuedPr | null | undefined) {
   if (!p?.url || !SHA_RE.test(p.headRefOid || "")) return false;
   PR_QUEUE.set(p.url, { repo, p });
+  drainPrQueue();
+  return true;
+}
+// Replies under CodeOtter's inline comments share the queue: keyed by PR and comment (empty: scan the PR's threads),
+// run before the next review because each is one model call.
+const REPLY_QUEUE = new Map<string, { repo: string; number: number; commentId: string }>();
+function enqueueReplies(repo: string, number: number, commentId = "") {
+  if (!Number.isSafeInteger(number) || number < 1) return false;
+  REPLY_QUEUE.set(`${repo}#${number}#${commentId}`, { repo, number, commentId });
   drainPrQueue();
   return true;
 }
@@ -46,10 +56,17 @@ async function drainPrQueue() {
   if (prDraining) return;
   prDraining = true;
   try {
-    while (PR_QUEUE.size) {
+    while (PR_QUEUE.size || REPLY_QUEUE.size) {
+      if (REPLY_QUEUE.size) {
+        const [key, { repo, number, commentId }] = REPLY_QUEUE.entries().next().value!; // the map is not empty
+        REPLY_QUEUE.delete(key);
+        await answerReplies(repo, number, commentId).catch((e: Error) => console.warn(`[replies] ${repo}#${number}: ${e.message}`));
+        continue;
+      }
       const [url, { repo, p }] = PR_QUEUE.entries().next().value!; // the map is not empty
       PR_QUEUE.delete(url);
-      await handlePr(repo, p).catch((e: Error) => console.warn(`[pr-events] ${url}: ${e.message}`));
+      // queued work is the automation's, whichever request happened to start the drain
+      await withActor(AUTO, () => handlePr(repo, p)).catch((e: Error) => console.warn(`[pr-events] ${url}: ${e.message}`));
     }
   } finally {
     prDraining = false;
@@ -59,7 +76,9 @@ async function handlePr(repo: string, p: QueuedPr) {
   const [tc, rc] = await Promise.all([triageConfig(), reviewConfig(repo)]);
   const done = (await store.getSetting("triageResults")) || {};
   if (tc.auto && done[p.url]?.headSha !== p.headRefOid) await triagePr(p.url, repo).catch((e: Error) => console.warn(`[triage] ${p.url}: ${e.message}`));
-  if (!rc.auto || skipReview(p)) return;
+  if (!rc.auto) return;
+  // skip rules: Repository settings, overridden by .codeotter.json on the base branch (repo-rules.ts)
+  if (skipReason(p, await effectiveRules(repo, rc, p))) return;
   const reviewed = (await store.getSetting("autoReviewed")) || {};
   if (reviewed[p.url] === p.headRefOid) return;
   const failed = (await store.getSetting("autoReviewFailed")) || {};
@@ -209,11 +228,13 @@ export async function handleWebhook(src: string, h: HookHeaders, body: Buffer): 
 async function routeWebhook(src: string, event: string, x: GitHubPayload | null) {
   if (event === "ping") return;
   if (event === "installation" || event === "installation_repositories") { forgetGithubRepos(); return; }
-  // Bitbucket and Azure DevOps payloads have their own shapes; their adapter turns them into a PR or a comment.
+  // Bitbucket, Azure DevOps and GitLab payloads have their own shapes; their adapter turns them into a PR or a comment.
   const routed = FORGE_API[src]?.route?.(event, x);
   if (FORGE_API[src]?.route) {
     if (!routed || !REPO_RE.test(routed.repo) || !(await repos()).includes(routed.repo)) return;
     if (routed.pr) return enqueuePr(routed.repo, routed.pr);
+    // a comment in an inline review conversation that is not a command: maybe a reply under one of CodeOtter's comments
+    if (routed.comment && routed.inThread && !parseCommand(routed.comment.body) && (await reviewConfig(routed.repo)).commands) return void enqueueReplies(routed.repo, routed.comment.prNumber, String(routed.comment.id));
     return routed.comment && handleComment(routed.repo, routed.comment);
   }
   const full = String(x?.repository?.full_name || "");
@@ -228,7 +249,17 @@ async function routeWebhook(src: string, event: string, x: GitHubPayload | null)
   if (event === "issue_comment" || event === "pull_request_comment") {
     const c = x?.comment;
     if (x?.action !== "created" || !c || !(x.issue?.pull_request || x.is_pull)) return;
+    // Forgejo/Gitea may deliver a review-thread reply as a PR comment: scan that PR's threads
+    if (src !== "github" && !parseCommand(c.body) && (await reviewConfig(repo)).commands) return void enqueueReplies(repo, Number(x.issue?.number));
     return handleComment(repo, c);
+  }
+  // A reply in an inline review thread. GitHub names the comment; Forgejo/Gitea review events do not, so the PR is scanned.
+  if (event === "pull_request_review_comment" || (src !== "github" && event.startsWith("pull_request_review"))) {
+    if (!(await reviewConfig(repo)).commands) return;
+    if (src !== "github") return void enqueueReplies(repo, Number(x?.pull_request?.number || x?.number));
+    const c = x?.comment;
+    if (x?.action !== "created" || !c?.in_reply_to_id || c.user?.type === "Bot" || String(c.body || "").includes("<!-- codeotter:")) return;
+    enqueueReplies(repo, Number(x.pull_request?.number), String(c.id ?? ""));
   }
 }
 // A comment command from a webhook: once per comment, only when commands are on and the commenter may write.
@@ -269,7 +300,7 @@ export async function redeliverGitHubFailures() {
 
 // <forwarder>
 // Local development: `gh webhook forward` (extension cli/gh-webhook) streams a repository's webhooks to this process, so a
-// laptop without a public URL still gets pull_request and issue_comment events. These are repository webhooks signed with
+// laptop without a public URL still gets pull_request, issue_comment and pull_request_review_comment events. These are repository webhooks signed with
 // our own secret; GitHub calls the feature dev-only and allows one forwarder per repository. Admin / Git providers / GitHub.
 const FORWARDERS = new Map<string, Forwarder>(); // repo -> { proc, state, error, restarts }
 export async function syncForwarders() {
@@ -289,7 +320,7 @@ function startForwarder(repo: string, secret: string) {
   FORWARDERS.set(repo, f);
   const run = () => {
     if (FORWARDERS.get(repo) !== f) return;
-    const p = spawn("gh", ["webhook", "forward", `--repo=${repo}`, "--events=pull_request,issue_comment", `--url=http://localhost:${PORT}/webhooks/github`, `--secret=${secret}`], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: ghEnv() });
+    const p = spawn("gh", ["webhook", "forward", `--repo=${repo}`, "--events=pull_request,issue_comment,pull_request_review_comment", `--url=http://localhost:${PORT}/webhooks/github`, `--secret=${secret}`], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: ghEnv() });
     f.proc = p;
     f.state = "running";
     let err = "";

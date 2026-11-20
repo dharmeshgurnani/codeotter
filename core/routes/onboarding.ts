@@ -11,6 +11,7 @@ import { applyGithubToken, ghAsync, repoLabel, repos, repositoryChoices } from "
 import { llmConfig, s1Config } from "../models.ts";
 import { reposChanged } from "../queue.ts";
 import { AZURE_ORG_RE, entraTenant, FORGE_CONNECTIONS, LOGIN_PROVIDERS, oauthProvider } from "../settings-pages.ts";
+import { audit, auditRepos, settingsChanges } from "../audit.ts";
 import { errorMessage, gate, isRecord, jsonBody, own } from "./middleware.ts";
 import type { Env } from "./middleware.ts";
 
@@ -106,6 +107,7 @@ onboarding.post("/save-provider", async (c) => {
       await store.setOAuth({ ...o, enabled: true, providers });
     }
   }
+  await audit(null, "git-provider.update", provider, { page: "onboarding", fields: settingsChanges({ [provider]: body }) });
   return c.json({ ok: true });
 });
 
@@ -132,6 +134,7 @@ onboarding.post("/save-models", async (c) => {
     }
   }
   modelCache.clear();
+  await audit(null, "model-provider.update", [isRecord(body.llm) && "llm", isRecord(body.s1) && "s1"].filter(Boolean).join(", "), { page: "onboarding", fields: settingsChanges(body) });
   return c.json({ ok: true });
 });
 
@@ -141,6 +144,7 @@ onboarding.post("/save-repos", async (c) => {
   if (!nextRepos.length) throw new Error("Please select at least one repository");
   const before = await repos();
   await store.setSetting("repos", nextRepos);
+  await auditRepos(before, nextRepos);
   reposChanged(before, nextRepos).catch((e) => console.warn(`[repos] ${e.message}`));
   return c.json({ ok: true, repos: nextRepos });
 });

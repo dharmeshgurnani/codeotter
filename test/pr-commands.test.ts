@@ -36,10 +36,15 @@ function load({ forgePermission = "write", forgeStatus = 0, toolFails = false } 
     prUrlFor: (repo: string, n: number) => (repo.startsWith("forgejo~") ? `https://git.example/${repo.slice(8)}/pulls/${n}` : `https://github.com/${repo}/pull/${n}`),
     oneLine: (x: unknown, max: number) => String(x).replace(/\s+/g, " ").slice(0, max),
     ghAsync: async (...a: string[]) => { calls.push(["gh", ...a]); return "[]"; },
+    ghAsApp: async (_repo: string, ...a: string[]) => { calls.push(["gh", ...a]); return "[]"; },
     score: async (url: string, force: boolean, repo: string) => { calls.push(["score", url, force, repo]); return { pr: { url } }; },
     syncPrComments: async (r: { pr: { url: string } }, repo: string, opts: unknown) => { calls.push(["sync", r.pr.url, repo, opts]); return []; },
     runPrTool: async (url: string, id: string, opts: unknown) => { calls.push(["tool", url, id, opts]); if (toolFails) throw new Error("model said no"); return {}; },
     createPrComment: async (url: string, _repo: string, n: number, body: string) => { calls.push(["comment", url, n, body]); },
+    fixFindings: async (url: string, repo: string, arg: string) => { calls.push(["fix", url, repo, arg]); return "posted 1 suggestion checked against `abc1234`. Nothing was pushed."; },
+    audit: async () => {},
+    orgOfRepo: (r: string) => r.split("/")[0],
+    withActor: (_actor: unknown, fn: () => unknown) => fn(),
   };
   const names = Object.keys(stubs);
   const api = new Function(...names, `${block}; return { parseCommand, commentPrNumber, commenterTrusted, commentsSince, runCommand };`)(...names.map((n) => stubs[n])) as Commands;
@@ -54,6 +59,9 @@ assert.strictEqual(parseCommand("please /review"), null);
 assert.strictEqual(parseCommand("/deploy prod"), null);
 assert.strictEqual(parseCommand("/reviewer"), null);
 assert.strictEqual(parseCommand(""), null);
+assert.deepStrictEqual(parseCommand("/fix"), { cmd: "fix", arg: "" });
+assert.deepStrictEqual(parseCommand("/Fix 2"), { cmd: "fix", arg: "2" });
+assert.strictEqual(parseCommand("/fixit"), null);
 ctx.diagnostic("parses commands on the first line only");
 
 assert.strictEqual(commentPrNumber({ html_url: "https://github.com/acme/shop/pull/7#issuecomment-1" }), 7);
@@ -90,6 +98,15 @@ assert.deepStrictEqual(t.calls.slice(1).map((c) => [c[0], c[1], c[2], c[3]]), [
   ["tool", "https://git.example/acme/shop/pulls/12", "ask", { action: "comment" }],
 ]);
 ctx.diagnostic("tools run, then post");
+
+// /fix: suggestions from the patch, then a reply naming what was posted.
+const fx = load();
+await fx.runCommand("acme/shop", { id: 3, html_url: "https://github.com/acme/shop/pull/7#issuecomment-3" }, { cmd: "fix", arg: "2" });
+assert.deepStrictEqual(fx.calls.slice(1), [
+  ["fix", "https://github.com/acme/shop/pull/7", "acme/shop", "2"],
+  ["comment", "https://github.com/acme/shop/pull/7", 7, "🦦 CodeOtter `/fix 2`: posted 1 suggestion checked against `abc1234`. Nothing was pushed."],
+]);
+ctx.diagnostic("/fix posts suggestions and replies");
 
 // Failures are reported on the PR and rethrown for the log.
 const f = load({ toolFails: true });

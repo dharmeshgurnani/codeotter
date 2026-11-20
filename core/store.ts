@@ -1,14 +1,16 @@
 // Storage: PocketBase when PB_URL is set (started here when its binary is present), else JSON files.
 import { execFileSync, spawn } from "node:child_process";
+import type { TrackerSettings } from "./trackers.ts";
 import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, renameSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { CODEOTTER_HOME, IS_SERVER } from "./config.ts";
 import { repoOf } from "./views.ts";
 import type { Role } from "./access.ts";
 import type { ReviewRecord } from "./review.ts";
 import type { ReviewSettings } from "./context.ts";
+import type { AnalyticsEvent } from "./analytics.ts";
 
 // Settings: one JSON value per key. The types are what this app writes; a missing key reads as null. Keys not listed
 // here (dynamic ones such as a forge id) read as unknown and the caller narrows.
@@ -21,6 +23,9 @@ export interface ReviewFailure { sha: string; at: number; tries: number; error: 
 export interface WebhookDelivery { at: number; event: string; delivery: string }
 export interface GuideSetting { use?: boolean; learnings?: string[] }
 export interface RepoSetting { review?: Partial<ReviewSettings>; learnings?: string[]; accepted?: string[] }
+// Generic OpenID Connect sign-in (PocketBase provider oidc2): the issuer it was discovered from, the email domains whose
+// verified addresses are trusted, auto-admission and whether the other sign-in buttons are hidden.
+export interface SsoSetting { issuer?: string; domains?: string[]; autoAdmit?: boolean; require?: boolean }
 export interface SettingsMap {
   access: Record<string, string[]>;
   invites: Invite[];
@@ -43,6 +48,8 @@ export interface SettingsMap {
   primaryProvider: string;
   onboardingComplete: boolean;
   runtimeDevices: Record<string, { device: string; model: string }>;
+  issueTrackers: TrackerSettings;
+  sso: SsoSetting;
   [webhook: `${string}Webhook`]: { secret?: string };
   [origin: `${string}Origin`]: string;
 }
@@ -50,9 +57,9 @@ export type SettingKey = keyof SettingsMap;
 export type SettingValue<K extends string> = K extends SettingKey ? SettingsMap[K] : unknown;
 // PocketBase records and auth payloads this app reads.
 export interface UserRecord { id: string; name?: string; username?: string; email?: string; role?: Role | ""; avatar?: string; verified?: boolean; created?: string }
-export interface OAuthProviderConfig { name: string; clientId?: string; clientSecret?: string; displayName?: string; authURL?: string; tokenURL?: string; userInfoURL?: string; pkce?: boolean }
+export interface OAuthProviderConfig { name: string; clientId?: string; clientSecret?: string; displayName?: string; authURL?: string; tokenURL?: string; userInfoURL?: string; pkce?: boolean; extra?: Record<string, unknown> }
 export interface OAuthConfig { enabled?: boolean; providers: OAuthProviderConfig[] }
-export interface AuthMethodProvider { name: string; state?: string; codeVerifier?: string; authURL?: string }
+export interface AuthMethodProvider { name: string; displayName?: string; state?: string; codeVerifier?: string; authURL?: string }
 export interface AuthMethods { oauth2?: { enabled?: boolean; providers: AuthMethodProvider[] } }
 export interface AuthResult { token: string; record: UserRecord; meta?: { email?: string; username?: string; rawUser?: Record<string, unknown> } }
 export interface OAuth2Body { provider: string; code: string; codeVerifier?: string; redirectURL: string }
@@ -65,6 +72,9 @@ export interface BaseStore {
   setSetting<K extends string>(key: K, value: SettingValue<K>): Promise<void>;
   all(): Promise<ReviewRecord[]>;
   reviews(): Promise<ReviewRecord[]>;
+  // Analytics events (core/analytics.ts), appended; `since` is an ISO time, events at or after it come back newest first.
+  addEvent(e: AnalyticsEvent): Promise<void>;
+  events(since: string): Promise<AnalyticsEvent[]>;
 }
 export interface PbStore extends BaseStore {
   getOAuth(): Promise<OAuthConfig>;
@@ -80,6 +90,16 @@ export interface PbStore extends BaseStore {
   setOAuth(oauth2: OAuthConfig): Promise<unknown>;
 }
 export type Store = PbStore;
+// Audit log entries (core/audit.ts writes them): append-only, newest first when listed, trimmed by count and age.
+export interface AuditEntry { at: string; actor: string; actorName: string; action: string; target: string; org: string; detail: Record<string, unknown> }
+// `org` lists that organization's entries plus instance-wide ones (org "").
+export interface AuditQuery { action?: string; actor?: string; org?: string; page: number; perPage: number }
+export interface AuditStore {
+  add(e: AuditEntry): Promise<void>;
+  list(q: AuditQuery): Promise<{ items: AuditEntry[]; total: number }>;
+  // Keeps the newest `max` entries at or after `before` (ISO time); returns how many were dropped.
+  trim(max: number, before: string): Promise<number>;
+}
 
 // Store: PocketBase when PB_URL is set (the Docker image sets it, or auto-detected locally), plain JSON files in scores/ otherwise.
 function findPocketBase() {
@@ -104,8 +124,13 @@ const pbBinAvailable = findPocketBase();
 export const PB_URL = process.env.PB_URL || (pbBinAvailable ? "http://127.0.0.1:8090" : "");
 export const SCORES = join(CODEOTTER_HOME, "scores");
 const CONFIG = join(CODEOTTER_HOME, "config.json");
+const ANALYTICS = join(CODEOTTER_HOME, "analytics.jsonl");
 // <file-store>
 const isObj = (x: unknown): x is Record<string, unknown> => !!x && typeof x === "object" && !Array.isArray(x);
+// Stored events are this app's own JSON; the shape check only skips foreign or damaged rows.
+const isEvent = (x: unknown): x is AnalyticsEvent => isObj(x) && typeof x.kind === "string" && typeof x.repo === "string" && typeof x.at === "string";
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+const isoSince = (since: string) => { if (!ISO_RE.test(since)) throw new Error("Invalid time"); return since; };
 const readConfig = (): Record<string, unknown> => (existsSync(CONFIG) ? JSON.parse(readFileSync(CONFIG, "utf8")) : {});
 // Write to a sibling file and rename: a crash mid-write never leaves half a JSON document behind.
 const writeJsonAtomic = (file: string, value: unknown) => { const tmp = `${file}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify(value, null, 2)); renameSync(tmp, file); };
@@ -134,6 +159,16 @@ const fileStore: BaseStore = {
       .sort((a, b) => b.at.localeCompare(a.at)),
   reviews() {
     return this.all();
+  },
+  // One JSON line per event: appends never rewrite earlier events.
+  addEvent: async (e) => { mkdirSync(CODEOTTER_HOME, { recursive: true }); appendFileSync(ANALYTICS, `${JSON.stringify(e)}\n`); },
+  events: async (since) => {
+    isoSince(since);
+    if (!existsSync(ANALYTICS)) return [];
+    return readFileSync(ANALYTICS, "utf8").split("\n").flatMap((line) => {
+      if (!line.trim()) return [];
+      try { const e: unknown = JSON.parse(line); return isEvent(e) && e.at >= since ? [e] : []; } catch { return []; }
+    }).sort((a, b) => b.at.localeCompare(a.at));
   },
 };
 // </file-store>
@@ -288,6 +323,18 @@ const pbStore: PbStore = {
   reviews() {
     return this.all();
   },
+  addEvent: async (e) => { await pb("collections/analytics/records", { method: "POST", body: JSON.stringify({ kind: e.kind, repo: e.repo, url: e.url, at: e.at, data: e }) }); },
+  // PocketBase keeps dates as "YYYY-MM-DD HH:MM:SS.sssZ"; the filter compares in that form.
+  async events(since) {
+    const filter = encodeURIComponent(`at>="${isoSince(since).replace("T", " ")}"`);
+    const out: AnalyticsEvent[] = [];
+    for (let page = 1; page <= 100; page++) {
+      const r = await pb(`collections/analytics/records?perPage=500&page=${page}&sort=-at&filter=${filter}`);
+      out.push(...pbItems(r).map((i) => i.data).filter(isEvent));
+      if (page >= (Number(isObj(r) && r.totalPages) || 1)) break;
+    }
+    return out;
+  },
   getOAuth: async () => {
     const c = await pb("collections/users");
     if (!isObj(c) || !isOAuthConfig(c.oauth2)) throw new Error("Storage: the users collection has no OAuth2 settings");
@@ -317,7 +364,7 @@ const pbStore: PbStore = {
   userFile: (id, file) => fetch(`${PB_URL}/api/files/users/${id}/${file}`, { signal: AbortSignal.timeout(10000) }),
   users: async () => pbItems(await pb("collections/users/records?perPage=200&sort=created")).flatMap((x) => (isUserRecord(x) ? [x] : [])),
   setRole: (id, role) => pb(`collections/users/records/${id}`, { method: "PATCH", body: JSON.stringify({ role }) }),
-  // PocketBase provider names (github, oidc, gitea) linked to an account, from its OAuth identities.
+  // PocketBase provider names (github, oidc, gitea, gitlab) linked to an account, from its OAuth identities.
   identities: async (id) => pbItems(await pb(`collections/_externalAuths/records?perPage=50&filter=${pbFilterEq("recordRef", String(id))}`)).map((i) => String(i.provider)),
   deleteUser: (id) => pb(`collections/users/records/${encodeURIComponent(id)}`, { method: "DELETE" }),
   setOAuth: async (oauth2) => pb("collections/users", { method: "PATCH", body: JSON.stringify({ oauth2 }) }),
@@ -328,5 +375,61 @@ const pbStore: PbStore = {
     await pb(hit ? `collections/settings/records/${hit.id}` : "collections/settings/records", { method: hit ? "PATCH" : "POST", body: JSON.stringify({ key, value }) });
   }),
 };
+// <audit-store>
+const isAuditEntry = (x: unknown): x is AuditEntry => isObj(x) && ["at", "actor", "actorName", "action", "target", "org"].every((k) => typeof x[k] === "string") && isObj(x.detail);
+const AUDIT = join(CODEOTTER_HOME, "audit.jsonl");
+let auditChain: Promise<unknown> = Promise.resolve();
+const withAuditLock = <T>(fn: () => Promise<T>): Promise<T> => { const run = auditChain.then(fn, fn); auditChain = run.catch(() => {}); return run; };
+const readAudit = (): AuditEntry[] => (existsSync(AUDIT) ? readFileSync(AUDIT, "utf8").split("\n") : []).flatMap((line) => { try { const e: unknown = line ? JSON.parse(line) : null; return isAuditEntry(e) ? [e] : []; } catch { return []; } });
+const auditMatch = (q: AuditQuery) => (e: AuditEntry) => (!q.action || e.action === q.action) && (!q.actor || e.actor === q.actor) && (!q.org || !e.org || e.org === q.org);
+const fileAudit: AuditStore = {
+  add: (e) => withAuditLock(async () => appendFileSync(AUDIT, `${JSON.stringify(e)}\n`)),
+  async list(q) {
+    const all = readAudit().filter(auditMatch(q)).reverse();
+    return { items: all.slice((q.page - 1) * q.perPage, q.page * q.perPage), total: all.length };
+  },
+  trim: (max, before) => withAuditLock(async () => {
+    const all = readAudit();
+    const keep = all.filter((e) => e.at >= before).slice(-max);
+    if (keep.length === all.length) return 0;
+    const tmp = `${AUDIT}.${process.pid}.tmp`;
+    writeFileSync(tmp, keep.map((e) => `${JSON.stringify(e)}\n`).join(""));
+    renameSync(tmp, AUDIT);
+    return all.length - keep.length;
+  }),
+};
+// A filter value never holds a quote or backslash (pbFilterEq refuses them); the joined filter is encoded once.
+const pbAuditFilter = (q: AuditQuery) => {
+  const parts = [q.action && ["action", q.action], q.actor && ["actor", q.actor]].filter((x): x is string[] => Array.isArray(x)).map(([k, v]) => decodeURIComponent(pbFilterEq(k, v)));
+  if (q.org) parts.push(`(${decodeURIComponent(pbFilterEq("org", q.org))} || org="")`);
+  return parts.length ? `&filter=${encodeURIComponent(parts.join(" && "))}` : "";
+};
+const pbAudit: AuditStore = {
+  add: async (e) => { await pb("collections/audit/records", { method: "POST", body: JSON.stringify(e) }); },
+  async list(q) {
+    const r = await pb(`collections/audit/records?perPage=${q.perPage}&page=${q.page}&sort=-at,-created${pbAuditFilter(q)}`);
+    const items = pbItems(r).flatMap((x): AuditEntry[] => (isAuditEntry(x) ? [{ at: x.at, actor: x.actor, actorName: x.actorName, action: x.action, target: x.target, org: x.org, detail: x.detail }] : []));
+    return { items, total: Number(isObj(r) && r.totalItems) || 0 };
+  },
+  async trim(max, before) {
+    let dropped = 0;
+    const drop = async (ids: unknown[]) => { for (const id of ids) { await pb(`collections/audit/records/${encodeURIComponent(String(id))}`, { method: "DELETE" }); dropped++; } };
+    // bounded: a trim never runs away; the next one continues
+    for (let i = 0; i < 50; i++) {
+      const old = pbItems(await pb(`collections/audit/records?perPage=200&fields=id&filter=${encodeURIComponent(`at<"${before.replace(/["\\]/g, "")}"`)}`));
+      if (!old.length) break;
+      await drop(old.map((x) => x.id));
+    }
+    for (let i = 0; i < 50; i++) {
+      const r = await pb("collections/audit/records?perPage=1&fields=id");
+      const total = Number(isObj(r) && r.totalItems) || 0;
+      if (total <= max) break;
+      await drop(pbItems(await pb(`collections/audit/records?perPage=${Math.min(200, total - max)}&sort=at,created&fields=id`)).map((x) => x.id));
+    }
+    return dropped;
+  },
+};
+export const auditStore: AuditStore = PB_URL ? pbAudit : fileAudit;
+// </audit-store>
 // Typed as the full store: the file store lacks the PocketBase-only methods, which callers reach only when PB_URL is set.
 export const store: Store = PB_URL ? pbStore : (fileStore as Store);

@@ -9,6 +9,7 @@ import { AppSidebar } from "./app-sidebar";
 const ReviewPage = lazy(() => import("./review-page").then((m) => ({ default: m.ReviewPage })));
 import { SettingsPage } from "./settings-page";
 import { HomePage } from "./home-page";
+import { AnalyticsPage } from "./analytics-page";
 import { LoginPage, ProviderMark } from "./login-page";
 const OnboardingPage = lazy(() => import("./onboarding-page").then((m) => ({ default: m.OnboardingPage })));
 import { FormSkeleton, ReviewSkeleton, TableSkeleton } from "@/components/skeletons";
@@ -103,16 +104,16 @@ export default function App() {
 
   const reviewUrl = (url: string) => `/review?pr=${encodeURIComponent(url)}`;
   useEffect(() => {
-    if (["/settings/forgejo", "/settings/gitea", "/settings/bitbucket", "/settings/azure"].includes(path)) go("/settings/git", true);
+    if (["/settings/forgejo", "/settings/gitea", "/settings/bitbucket", "/settings/azure", "/settings/gitlab"].includes(path)) go("/settings/git", true);
   }, [path]);
   const settingsPage = path.startsWith("/settings/") ? path.slice("/settings/".length) : "";
   // /repo/owner/name -> reviews for that repo, /repo/owner/name/open -> its open pull requests (Azure: /repo/azure~org/project/repo)
   const repoParts = path.startsWith("/repo/") ? path.slice("/repo/".length).split("/") : [];
-  const repoLen = repoSegments(repoParts[0] ?? "");
+  const repoLen = repoSegments(repoParts[0] ?? "", repoParts, board?.repos ?? []);
   const repoPage = repoParts.slice(0, repoLen).join("/");
   const repoView = repoParts[repoLen] === "open" ? "open" : repoParts[repoLen] === "settings" ? "settings" : "reviews";
   const repoViewTitle = repoView === "open" ? "Open pull requests" : repoView === "settings" ? "Repository settings" : "Reviews";
-  const known = path === "/" || path === "/login" || path === "/onboarding" || path === "/review" || !!settingsPage || repoParts.length >= repoLen;
+  const known = path === "/" || path === "/login" || path === "/onboarding" || path === "/review" || path === "/analytics" || !!settingsPage || repoParts.length >= repoLen;
   useEffect(() => { if (!known) go("/", true); }, [known]);
 
   useEffect(() => {
@@ -132,7 +133,9 @@ export default function App() {
     ? `${board?.settingsPages.find((p) => p.id === settingsPage)?.group === "workspace" ? "Workspace" : "System"} / ${board?.settingsPages.find((p) => p.id === settingsPage)?.title ?? settingsPage}`
     : path === "/review"
       ? `Reviews / #${query.get("pr")?.split("/").pop() ?? ""}`
-      : repoPage
+      : path === "/analytics"
+        ? (org ? `Analytics / ${repoLabel(org)}` : "Analytics")
+        : repoPage
         ? `${repoLabel(repoPage)} / ${repoViewTitle}${repoView !== "settings" && scopedBoard ? ` · ${repoView === "open" ? scopedBoard.open.filter((p) => repoOf(p.url, scopedBoard.forgeUrls) === repoPage && !scopedBoard.reviewed.some((r) => r.pr.url === p.url)).length : scopedBoard.reviewed.filter((r) => repoOf(r.pr.url, scopedBoard.forgeUrls) === repoPage).length}` : ""}`
         : org ? `Home / ${repoLabel(org)}` : "Home";
 
@@ -215,7 +218,9 @@ export default function App() {
             <SettingsPage forgeUrls={board?.forgeUrls ?? {}} page={settingsPage} org={org} setOrg={setOrg} user={me.user} onLogin={() => { sessionSet("code-otter.back", location.pathname); go("/login"); }} onSaved={load} />
           ) : (
             <>
-              {!repoPage ? (
+              {path === "/analytics" ? (
+                <AnalyticsPage go={go} version={version} org={org} />
+              ) : !repoPage ? (
                 <HomePage go={go} version={version} org={org} />
               ) : repoView === "settings" ? (
                 <SettingsPage key={repoPage} forgeUrls={board?.forgeUrls ?? {}} page="repo" repo={repoPage} org={org} setOrg={setOrg} user={me.user} onLogin={() => { sessionSet("code-otter.back", location.pathname); go("/login"); }} onSaved={load} />

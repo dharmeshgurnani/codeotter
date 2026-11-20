@@ -5,7 +5,7 @@ import { bodyLimit } from "hono/body-limit";
 import { handleWebhook } from "../queue.ts";
 
 export const webhooks = new Hono();
-const SOURCE = "/:source{github|forgejo|gitea|bitbucket|bitbucketdc|azure}";
+const SOURCE = "/:source{github|forgejo|gitea|bitbucket|bitbucketdc|azure|gitlab}";
 
 webhooks.post(SOURCE, bodyLimit({ maxSize: 2e6, onError: (c) => c.json({ error: "Request body too large" }, 413) }), async (c) => {
   const { status, body } = await handleWebhook(c.req.param("source"), c.req.header(), Buffer.from(await c.req.arrayBuffer()));
