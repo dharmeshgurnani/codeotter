@@ -15,6 +15,7 @@ import { clearTicketCache, jiraBase, LINEAR_API, testJira, testLinear, trackerKe
 import { accessQueue, allowed, effectiveRole, emailDomainAllowed, isEmailDomain, isRole, onboardedRepo, ROLES, SSO_PB, userView } from "./access.ts";
 import { auditPage, auditRepos } from "./audit.ts";
 import type { Access, Role, SessionUser } from "./access.ts";
+import { RELATED_MAX, relatedChoices, validateRelated } from "./related.ts";
 import type { Cell, CellObject, Tone } from "./views.ts";
 import type { OAuthProviderConfig, SsoSetting } from "./store.ts";
 import type { ProviderDef } from "./providers.ts";
@@ -358,7 +359,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
     access: "admin",
     async load({ org = "", repo = "" } = {}) {
       await onboardedRepo(repo, org);
-      const [rc, files, guides, learnings, accepted, configFile] = await Promise.all([reviewConfig(repo), guideFiles(repo), store.getSetting("guides"), getRepoLearnings(repo), getRepoAccepted(repo),
+      const [rc, files, guides, learnings, accepted, onboarded, configFile] = await Promise.all([reviewConfig(repo), guideFiles(repo), store.getSetting("guides"), getRepoLearnings(repo), getRepoAccepted(repo), repos(),
         repoConfigFile(repo).then((f) => (f ? `${CONFIG_FILE} on the default branch sets ${Object.keys(f).join(", ") || "nothing"}; those keys override the fields below` : `No ${CONFIG_FILE} at the root`), (e: Error) => e.message)]);
       // One section, one Save: review settings, guidelines and learnings are all this repository's.
       const sections: Section[] = [
@@ -403,6 +404,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
               ],
               hint: "A failed Block check fails the codeotter/checks commit status; Warn failures pass it with a note.",
             },
+            { key: "related", label: "Related repositories", type: "multiselect", options: relatedChoices(repo, onboarded).map((value) => ({ value, label: repoLabel(value) })), hint: `Up to ${RELATED_MAX}, same organization and provider. Reviews search them for usages of changed exported symbols.` },
             files.length ? { key: "useGuides", label: "Review guidelines", type: "checkbox", text: `Follow ${files.join(" + ")}` } : { key: "noGuides", label: "Review guidelines", type: "readonly" },
             { key: "learnings", label: "Team learnings", type: "list", hint: "Dismissed findings, kept as rules for this repository." },
             { key: "accepted", label: "Accepted fixes", type: "list" },
@@ -431,6 +433,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
       await onboardedRepo(repo, org);
       if (!body.repo) return;
       const v = rec(body.repo);
+      if ("related" in v) v.related = validateRelated(repo, v.related, await repos());
       const [guides0, rs0, current] = await Promise.all([store.getSetting("guides"), store.getSetting("repoSettings"), reviewConfig(repo)]);
       // Only what was sent changes. Review keys merge over the current values. Lists apply removals only: items the
       // page loaded (`loadedLearnings` / `loadedAccepted`) and no longer sends are dropped from the current list, so a

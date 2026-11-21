@@ -246,7 +246,52 @@ export function buildBlastMermaid(r: Review) {
     });
   }
 
+  // callers in related repositories: outside-repository nodes labelled with their repository
+  const related = r.outsideDiffImpact?.relatedCallers ?? [];
+  const hidden = r.outsideDiffImpact?.relatedHidden ?? 0;
+  if (related.length || hidden) {
+    out.push("  classDef related fill:#1e1033,stroke:#a855f7,stroke-width:1.5px,color:#f3e8ff");
+    related.slice(0, 6).forEach((c, idx) => {
+      const base = c.file.split("/").pop() || c.file;
+      out.push(`  RC${idx}["🔗 ${cleanMermaidText(repoLabel(c.repo || ""), 26)}<br/>${cleanMermaidText(base, 18)}${c.line ? `:${c.line}` : ""} uses ${cleanMermaidText(c.symbol, 16)}"]:::related`);
+      out.push(`  PR -.->|${cleanMermaidText(c.symbol, 14)}| RC${idx}`);
+    });
+    if (hidden) {
+      out.push(`  RCH["🔗 ${hidden} usage(s) in repositories not assigned to you"]:::related`);
+      out.push("  PR -.-> RCH");
+    }
+  }
+
   return out.join("\n");
+}
+
+const RELATED_TONE = { ok: "ok", unsupported: "muted", failed: "bad", timeout: "warn", skipped: "muted" } as const;
+const RELATED_TEXT = { ok: "Searched", unsupported: "No code search", failed: "Failed", timeout: "Timed out", skipped: "Skipped" } as const;
+// Related repositories searched for usages of the changed symbols: one row per repository, then the usages found.
+// The server already dropped repositories this viewer cannot see; only their count arrives.
+export function RelatedRepos({ o }: { o: Review["outsideDiffImpact"] }) {
+  const repos = o?.related ?? [];
+  const usages = o?.relatedCallers ?? [];
+  const hidden = o?.relatedHidden ?? 0;
+  if (!repos.length && !hidden) return null;
+  return (
+    <div className="mt-3 space-y-2">
+      <div className="text-sm font-semibold">Related repositories</div>
+      {repos.length ? (
+        <DataTable
+          columns={[{ key: "repo", label: "Repository" }, { key: "status", label: "Status" }, { key: "usages", label: "Usages", align: "right" }]}
+          rows={repos.map((x) => ({ id: x.repo, cells: { repo: repoLabel(x.repo), status: <Badge tone={RELATED_TONE[x.status]} title={x.error}>{RELATED_TEXT[x.status]}</Badge>, usages: x.callers } }))}
+        />
+      ) : null}
+      {usages.length ? (
+        <DataTable
+          columns={[{ key: "repo", label: "Repository" }, { key: "file", label: "File" }, { key: "symbol", label: "Symbol" }, { key: "snippet", label: "Usage" }]}
+          rows={usages.map((c, i) => ({ id: String(i), cells: { repo: repoLabel(c.repo || ""), file: <code>{c.file}{c.line ? `:${c.line}` : ""}</code>, symbol: <code>{c.symbol}</code>, snippet: <code className="text-xs">{c.snippet}</code> } }))}
+        />
+      ) : null}
+      {hidden ? <Badge tone="muted">{hidden} usage(s) in repositories not assigned to you</Badge> : null}
+    </div>
+  );
 }
 
 function buildAiReviewMarkdown(r: Review) {
@@ -956,8 +1001,10 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
               <p className="my-2 text-sm">
                 {b.files} files · {b.lines} lines · {b.dirs} areas · {b.testFiles} test files
                 {b.outsideCallers ? ` · 🌐 ${b.outsideCallers} outside caller(s) across ${b.outsideFiles || 1} un-modified file(s)` : ""}
+                {b.relatedCallers ? ` · 🔗 ${b.relatedCallers} usage(s) in ${b.relatedRepos || 1} related repositor${b.relatedRepos === 1 ? "y" : "ies"}` : ""}
               </p>
               {b.hotspots.length ? b.hotspots.map((h) => <Badge key={h} tone="warn" className="mr-1.5">{h}</Badge>) : <span className="text-sm text-muted-foreground">No hotspots touched.</span>}
+              <RelatedRepos o={r.outsideDiffImpact} />
             </details>
             <details className="my-2.5"><summary className="cursor-pointer text-sm font-semibold">Pre-merge checks</summary>
               <Md head={["Check", "Status"]} rows={[

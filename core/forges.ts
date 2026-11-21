@@ -97,6 +97,8 @@ export interface CommitStatus { state: string; context: string; description?: st
 export interface InlineComment { path: string; line: number; startLine?: number; body: string }
 // One comment of an inline review thread (root first). `line` is the new-file line, negative for an old-file line.
 // `thread`: the server's id for the conversation when replies address it rather than a comment (GitLab discussions).
+// One code search hit in a repository's default branch: a path, the matching line when the server reports it, a snippet.
+export interface CodeHit { path: string; line: number; snippet: string }
 export interface ThreadComment { id: number | string; body: string; created_at: string; user: { id: number | string; login: string }; bot: boolean; path: string; line: number; hunk: string; author_association?: string; thread?: string }
 export type HookHeaders = Record<string, string | undefined>;
 export interface HookMeta { event: string; delivery: string; signature: string | undefined }
@@ -127,6 +129,8 @@ export interface Forge {
   file(repo: string, path: string, ref?: string): Promise<string | null>;
   baseCommits(repo: string, branch: string, n?: number): Promise<BaseCommit[]>;
   compare(repo: string, from: string, to: string): Promise<string>;
+  // Code search in one repository's default branch (related-repository context). null: the server has no code search API.
+  searchCode(repo: string, term: string, limit?: number): Promise<CodeHit[] | null>;
   issue(repo: string, n: number): Promise<ForgeIssue | null>;
   status(repo: string, sha: string, s: CommitStatus, n?: number): Promise<unknown>;
   comments(repo: string, n: number): Promise<ForgeComment[]>;
@@ -413,6 +417,7 @@ function gitea(id: string, f: AuthedConfig): Forge {
       const rows = await api<GiteaCommit[]>(`${r(repo)}/commits?sha=${enc(branch)}&limit=${n}`);
       return (Array.isArray(rows) ? rows : []).map((c) => ({ sha: String(c.sha || "").slice(0, 7), message: firstLine(c.commit?.message).trim(), author: c.author?.login || c.commit?.author?.name || "" }));
     },
+    searchCode: async () => null, // Forgejo/Gitea expose no code search API
     async compare(repo, from, to) {
       const cmp = await api<{ files?: { filename?: string; patch?: string }[] } | null>(`${r(repo)}/compare/${enc(from)}...${enc(to)}`);
       return (cmp?.files || []).filter((x) => x?.filename && x?.patch).map((x) => `diff --git a/${x.filename} b/${x.filename}\n--- a/${x.filename}\n+++ b/${x.filename}\n${x.patch}`).join("\n\n");
@@ -515,6 +520,7 @@ interface BbRepo { mainbranch?: { name?: string }; workspace?: { slug?: string }
 interface BbIssue { id?: number; title?: string; content?: { raw?: string }; state?: string; links?: { html?: { href?: string } }; kind?: string; priority?: string }
 interface BbHook { url?: string; uuid: string }
 interface BbEvent { pullrequest?: BbPull; repository?: BbRepoRef; comment?: BbComment }
+interface BbCodeHit { file?: { path?: string }; content_matches?: { lines?: { line?: number; segments?: { text?: string; match?: boolean }[] }[] }[] }
 function bitbucket(id: string, f: AuthedConfig): Forge {
   f.auth = () => (f.user ? `Basic ${Buffer.from(`${f.user}:${f.token}`).toString("base64")}` : `Bearer ${f.token}`);
   const api = <T = unknown>(path: string, opts: ApiOptions = {}): Promise<T> => {
@@ -594,6 +600,15 @@ function bitbucket(id: string, f: AuthedConfig): Forge {
     },
     // "a..b" is what a has that b lacks, from their merge base
     compare: (repo, from, to) => api<string>(`${r(repo)}/diff/${enc(to)}..${enc(from)}`, { as: "text" }),
+    // Workspace code search, narrowed to the one repository
+    async searchCode(repo, term, limit = 5) {
+      const [ws, slug] = native(repo).split("/");
+      const page = await api<{ values?: BbCodeHit[] } | null>(`workspaces/${enc(ws)}/search/code?search_query=${enc(`"${term}" repo:${slug}`)}&pagelen=${Math.min(20, limit)}`);
+      return (page?.values || []).slice(0, limit).map((v): CodeHit => {
+        const m = v.content_matches?.[0]?.lines?.find((l) => l.segments?.some((x) => x.match)) || v.content_matches?.[0]?.lines?.[0];
+        return { path: String(v.file?.path || ""), line: Number(m?.line) || 0, snippet: (m?.segments || []).map((x) => String(x.text || "")).join("") };
+      }).filter((h) => safeFile(h.path));
+    },
     async issue(repo, n) {
       const i = await orNull(api<BbIssue | null>(`${r(repo)}/issues/${n}`)).catch((e: unknown) => { if (statusOf(e) === 403) return null; throw e; });
       return i?.id ? { number: i.id, title: i.title, body: i.content?.raw, state: i.state, url: i.links?.html?.href || `https://bitbucket.org/${native(repo)}/issues/${n}`, labels: [i.kind, i.priority].filter((x): x is string => Boolean(x)) } : null;
@@ -772,6 +787,7 @@ function bitbucketdc(id: string, f: AuthedConfig): Forge {
       const page = await api<DcPage<DcCommit> | null>(`${r(repo)}/commits?until=${enc(branch)}&limit=${n}`);
       return (page?.values || []).map((c) => ({ sha: String(c.id || "").slice(0, 7), message: firstLine(c.message).trim(), author: login(c.author) || c.author?.name || "" }));
     },
+    searchCode: async () => null, // code search is a separate, optional Data Center plugin API
     compare: async (repo, from, to) => unified(await api<DcDiff | null>(`${r(repo)}/compare/diff?from=${enc(to)}&to=${enc(from)}&contextLines=3`)),
     issue: async () => null, // issues live in Jira
     status: (_repo, sha, s) => api(`build-status/1.0/commits/${enc(sha)}`, { method: "POST", body: { state: STATE.bitbucket[s.state] || "FAILED", key: s.context, name: s.context, url: s.target_url, description: s.description } }),
@@ -1034,6 +1050,7 @@ function azure(id: string, f: AuthedConfig): Forge {
       const rows = (await api<AzList<AzCommit> | null>(`${g(repo)}/commits?searchCriteria.itemVersion.version=${enc(b)}&searchCriteria.$top=${n}`))?.value || [];
       return rows.map((c) => ({ sha: String(c.commitId || "").slice(0, 7), message: firstLine(c.comment).trim(), author: c.author?.name || "" }));
     },
+    searchCode: async () => null, // Azure DevOps code search lives on almsearch.dev.azure.com, not the configured origin
     async compare(repo, from, to) {
       const d = await api<{ changes?: AzChange[] } | null>(`${g(repo)}/diffs/commits?baseVersion=${enc(from)}&baseVersionType=commit&targetVersion=${enc(to)}&targetVersionType=commit&diffCommonCommit=true&$top=1000`);
       // the diffs endpoint lists items with objectIds; the changes shape matches the iteration one
@@ -1192,6 +1209,7 @@ const GL_PATH = new RegExp(`^${GL_SEG}(?:/${GL_SEG}){1,19}$`);
 // Webhook payloads date things "2026-11-20 10:00:00 UTC"; the REST API answers ISO 8601.
 const glDate = (s: string | undefined) => String(s || "").replace(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) UTC$/, "$1T$2Z");
 const GL_STATE: Record<string, string> = { success: "success", failure: "failed", error: "failed", pending: "running" };
+interface GlBlob { path?: string; filename?: string; startline?: number; data?: string }
 function gitlab(id: string, f: AuthedConfig): Forge {
   f.auth = () => `Bearer ${f.token}`;
   const api = <T = unknown>(path: string, opts: ApiOptions = {}): Promise<T> => {
@@ -1286,6 +1304,14 @@ function gitlab(id: string, f: AuthedConfig): Forge {
     async baseCommits(repo, branch, n = 8) {
       const rows = await api<GlCommit[]>(`${p(repo)}/repository/commits?ref_name=${enc(branch)}&per_page=${n}`);
       return (Array.isArray(rows) ? rows : []).map((c) => ({ sha: String(c.id || "").slice(0, 7), message: firstLine(c.title || c.message).trim(), author: c.author_name || "" }));
+    },
+    async searchCode(repo, term, limit = 5) {
+      const rows = await api<GlBlob[] | null>(`${p(repo)}/search?scope=blobs&search=${enc(term)}&per_page=${Math.min(20, limit)}`);
+      return (Array.isArray(rows) ? rows : []).slice(0, limit).map((b): CodeHit => {
+        const lines = String(b.data || "").split("\n");
+        const at = Math.max(0, lines.findIndex((l) => l.includes(term)));
+        return { path: String(b.path || b.filename || ""), line: (Number(b.startline) || 1) + at, snippet: lines[at] || "" };
+      }).filter((h) => safeFile(h.path));
     },
     compare: async (repo, from, to) => unified((await api<{ diffs?: GlDiff[] } | null>(`${p(repo)}/repository/compare?from=${enc(from)}&to=${enc(to)}`))?.diffs || []),
     async issue(repo, n) {
