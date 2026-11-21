@@ -194,6 +194,32 @@ export async function appInstallationToken(target: string): Promise<string> {
   return token;
 }
 
+// GitHub REST as the App installation on `repo`, for the endpoints only an App may call (the Checks API). `path` is
+// from the API root; callers check appInstallationToken(repo) first and fall back when it is "".
+export async function appApi(repo: string, method: "GET" | "POST" | "PATCH", path: string, body?: unknown): Promise<unknown> {
+  if (isForgeRepo(repo) || !REPO_RE.test(repo)) throw new Error(`Not a GitHub repository: ${repo}`);
+  const token = await appInstallationToken(repo);
+  if (!token) throw new Error(`The GitHub App is not installed on ${repo}`);
+  const res = await fetch(`https://api.github.com/${path}`, {
+    method,
+    headers: { ...appHeaders(token), ...(body === undefined ? {} : { "content-type": "application/json" }) },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    redirect: "error",
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) {
+    const reply: unknown = await res.json().catch(() => null);
+    const message = reply && typeof reply === "object" && "message" in reply && typeof reply.message === "string" ? `: ${reply.message.slice(0, 200)}` : "";
+    throw Object.assign(new Error(`GitHub ${method} ${path.split("?")[0]} answered ${res.status}${message}`), { status: res.status });
+  }
+  return res.status === 204 ? null : res.json();
+}
+// A GitHub REST read about `repo`: as the App where it is installed there, else through gh (ghAsync's credential).
+export async function githubGet(repo: string, path: string): Promise<unknown> {
+  if (await appInstallationToken(repo).catch(() => "")) return appApi(repo, "GET", path);
+  return JSON.parse(await ghAsync("api", path));
+}
+
 async function getGitHubAppRepos(appConfig: GitHubAppConfig | null | undefined): Promise<string[]> {
   if (!appConfig?.id || !appConfig?.pem) return [];
   try {

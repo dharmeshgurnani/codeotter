@@ -268,6 +268,7 @@ test("GitLab adapter and webhooks", async (ctx) => {
         normalizeForgePr: () => { throw new Error("GitLab routes through its adapter"); },
         parseCommand: (body: unknown) => { const m = String(body || "").match(/^\/(review|ask)(?:\s+(.*))?$/); return m ? { cmd: m[1], arg: m[2] || "" } : null; },
         commentPrNumber: (c: { prNumber?: unknown }) => Number(c?.prNumber) || 0,
+        commandEnabled: (cmd: string, rc: { commands?: boolean; overrides?: boolean }) => (cmd === "override" ? !!rc.overrides : !!rc.commands),
         commenterTrusted: async (_r: string, c: ForgeComment) => c.user.id === 42,
         runCommand: async (repo: string, c: { id: unknown }, cmd: { cmd: string }) => { calls.push(["command", repo, c.id, cmd.cmd]); },
         answerReplies: async (repo: string, n: number, commentId: string) => { calls.push(["replies", repo, n, commentId]); return 1; },

@@ -85,6 +85,7 @@ function load({ scoreFails = false, repos = ["acme/app", "gitea~acme/lib", "bitb
     normalizeForgePr: (p: { number: number; head?: { sha?: string }; draft?: boolean }, repo: string) => ({ url: `https://git.example/${repo.slice(6)}/pulls/${p.number}`, headRefOid: p.head?.sha, isDraft: !!p.draft, labels: [] }),
     parseCommand: (body: unknown) => { const m = String(body || "").match(/^\/(review|ask)(?:\s+(.*))?$/); return m ? { cmd: m[1], arg: m[2] || "" } : null; },
     commentPrNumber: (c: { prNumber?: unknown; html_url?: unknown } | undefined) => Number(c?.prNumber) || Number((String(c?.html_url || "").match(/\/pulls?\/(\d+)/) || [])[1]) || 0,
+    commandEnabled: (cmd: string, rc: { commands?: boolean; overrides?: boolean }) => (cmd === "override" ? !!rc.overrides : !!rc.commands),
     commenterTrusted: async () => trusted,
     runCommand: async (repo: string, c: { id: unknown }, cmd: { cmd: string }) => { calls.push(["command", repo, c.id, cmd.cmd]); },
   };

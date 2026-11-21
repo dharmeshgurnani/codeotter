@@ -3,6 +3,8 @@ import { APP_URL, REPO_RE } from "./config.ts";
 import { PROVIDERS } from "./providers.ts";
 import { store } from "./store.ts";
 import { createPrComment, forgeOf, ghAsApp, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, readPr, repos, validPrUrl } from "./git.ts";
+import { CHECKS_CONTEXT, checksFailed, checksFinished, checksStarted, keptOverrides, postCommitStatus, SHA_RE } from "./merge-checks.ts";
+import type { CheckOverride, StatusState } from "./merge-checks.ts";
 import { askSystemOne, llmConfig, metered, newUsage, s1Config } from "./models.ts";
 import { estimateCost, recordEvent, reviewEvent } from "./analytics.ts";
 import { acceptedSuggestions, blastRadius, dynamicContextFiles, extendDiffContext, parseDiff, sliceOutsideDiffImpact } from "./diff.ts";
@@ -54,6 +56,7 @@ export interface ReviewRecord {
   commentError?: string;
   commentsPosted?: string[];
   analyzers?: AnalyzerRun[];
+  overrides?: CheckOverride[]; // /override on failing custom checks, for the head commit they were given on (merge-checks.ts)
 }
 export interface ActiveReview { state: ReviewRecord; error: string | null; promise: Promise<ReviewRecord> | null; done: boolean; }
 export interface TriageConfig { auto: boolean; stopAt: number; }
@@ -71,17 +74,9 @@ export interface InlineResult { posted: number; mode: "none" | "inline_review" |
 // published at once as a commit status (codeotter/triage) and an updatable PR comment, so a pipeline can stop or continue
 // within minutes. The deep review (language model / CodeReviewer) stays on demand. Fails loudly: status "error".
 const TRIAGE_CONTEXT = "codeotter/triage";
-export const SHA_RE = /^[0-9a-f]{7,40}$/i;
 export const triageConfig = async (): Promise<TriageConfig> => ({ auto: false, stopAt: 75, ...((await store.getSetting("triage")) || {}) });
 const triageRuns = new Map<string, Promise<TriageResult>>();
-type StatusState = "pending" | "success" | "failure" | "error";
 const postTriageStatus = (repo: string, sha: string, state: StatusState, description: string, url: string): Promise<unknown> => postCommitStatus(repo, sha, TRIAGE_CONTEXT, state, description, url);
-async function postCommitStatus(repo: string, sha: string, context: string, state: StatusState, description: string, url: string): Promise<unknown> {
-  if (!SHA_RE.test(sha || "")) return;
-  const fields = { state, context, description: description.slice(0, 140), target_url: `${APP_URL}/review?pr=${encodeURIComponent(url)}` };
-  if (isForgeRepo(repo)) return forgeOf(repo).status(repo, sha, fields, parsePrUrl(url)?.number);
-  return ghAsApp(repo, ["api", "--method", "POST", `repos/${repo}/statuses/${sha}`, ...Object.entries(fields).flatMap(([k, v]) => ["-f", `${k}=${v}`])]);
-}
 function formatTriageComment(t: TriageResult): string {
   const level = S1_SCORES.correctness_risk[Math.min(4, Math.round(t.risk / 25))];
   return [
@@ -143,20 +138,8 @@ export async function triagePr(ref: string, repoHint = ""): Promise<TriageResult
   return run;
 }
 
-// Custom pre-merge checks publish one commit status, codeotter/checks: failure when a "block" check fails, success otherwise
-// (warn-only failures are named in the description). No custom check answered, no status.
-const CHECKS_CONTEXT = "codeotter/checks";
-export function checksStatus(gates: Gate[]): { state: "success" | "failure"; description: string } | null {
-  const custom = gates.filter((g) => g.mode);
-  if (!custom.length) return null;
-  const names = (list: Gate[]) => list.map((g) => g.label).join(", ");
-  const blocked = custom.filter((g) => !g.pass && g.mode === "block");
-  const warned = custom.filter((g) => !g.pass && g.mode === "warn");
-  if (blocked.length) return { state: "failure", description: `Failed: ${names(blocked)}${warned.length ? `; warning: ${names(warned)}` : ""}` };
-  if (warned.length) return { state: "success", description: `${custom.length - warned.length}/${custom.length} passed; warning: ${names(warned)}` };
-  return { state: "success", description: `All ${custom.length} check${custom.length === 1 ? "" : "s"} passed` };
-}
-
+// The review result goes to codeotter/checks: a check run where the GitHub App is installed, else a commit status when
+// custom checks ran (merge-checks.ts).
 export const activeReviews = new Map<string, ActiveReview>();
 
 export async function resolvePr(ref: string | number | null | undefined, repo = ""): Promise<{ urlGuess: string; spec: string[] }> {
@@ -288,7 +271,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
     try {
       // Refresh PR metadata in background if we started from cached.pr
       if (cached?.pr) live.pr = JSON.parse(await readPr(urlGuess, spec));
-      if (publish && checksRun) await postCommitStatus(repoOf(live.pr), live.pr.headRefOid || "", CHECKS_CONTEXT, "pending", `Running ${customCount(checks)} check(s)`, live.pr.url).catch((e) => console.warn(`[checks] ${(e as Error).message}`));
+      if (publish) await checksStarted(repoOf(live.pr), live.pr.headRefOid || "", live.pr.url, checksRun ? customCount(checks) : 0).catch((e) => console.warn(`[checks] ${(e as Error).message}`));
       const [rawDiff, guide, learnings] = await Promise.all([
         readPr(urlGuess, spec, true),
         Promise.resolve().then(() => guideFor(repoOf(live.pr), isForgeRepo(repoOf(live.pr)) ? live.pr.headRefOid : live.pr.headRefName, live.pr.headRepo || repoOf(live.pr))),
@@ -534,12 +517,14 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
         at: new Date().toISOString(),
         ...(live.analyzers ? { analyzers: live.analyzers } : !runLlm && cached?.analyzers ? { analyzers: cached.analyzers } : {}),
       };
-      const st = publish && checksRun ? checksStatus(finalGates) : null;
-      if (st) {
+      // overrides given (possibly while this run was going) on the commit this result reviewed
+      const overrides = keptOverrides(((await store.get(live.pr.url)) as ReviewRecord | null)?.overrides, live.pr.headRefOid || "");
+      if (overrides) result.overrides = overrides;
+      if (publish) {
         try {
-          await postCommitStatus(repoOf(live.pr), live.pr.headRefOid || "", CHECKS_CONTEXT, st.state, st.description, live.pr.url);
+          await checksFinished(repoOf(live.pr), result, checksRun);
         } catch (e) {
-          result.commentError = `Commit status ${CHECKS_CONTEXT}: ${(e as Error).message}`;
+          result.commentError = `${CHECKS_CONTEXT}: ${(e as Error).message}`;
         }
       }
       // Inline comments a later push fixed: the re-review dropped them, and a model confirms the delta fixes each one.
@@ -573,7 +558,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
     } catch (e) {
       entry.error = (e as Error).message;
       entry.done = true;
-      if (publish && checksRun) await postCommitStatus(repoOf(live.pr), live.pr.headRefOid || "", CHECKS_CONTEXT, "error", `Checks not run: ${entry.error}`, live.pr.url).catch(() => {});
+      if (publish) await checksFailed(repoOf(live.pr), live.pr.headRefOid || "", live.pr.url, entry.error, checksRun).catch((err: Error) => console.warn(`[checks] ${err.message}`));
       // The next poll reports the error; without a poller the entry (and its live state) would stay in memory for good.
       setTimeout(() => { if (activeReviews.get(live.pr.url) === entry) activeReviews.delete(live.pr.url); }, 120000).unref?.();
       throw e;

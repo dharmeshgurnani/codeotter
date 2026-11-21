@@ -7,8 +7,9 @@ import { store } from "./store.ts";
 import { createGitHubAppJwt, forgeId, forgeOf, forgetGithubRepos, ghEnv, isForgeRepo, nativeRepo, normalizeForgePr, openPrs, repos } from "./git.ts";
 import { effectiveRules, reviewConfig } from "./context.ts";
 import { skipReason } from "./repo-rules.ts";
-import { score, SHA_RE, syncPrComments, triageConfig, triagePr } from "./review.ts";
-import { answerReplies, commenterTrusted, commentPrNumber, oneLine, parseCommand, runCommand } from "./pr-tools.ts";
+import { score, syncPrComments, triageConfig, triagePr } from "./review.ts";
+import { SHA_RE } from "./merge-checks.ts";
+import { answerReplies, commandEnabled, commenterTrusted, commentPrNumber, oneLine, parseCommand, runCommand } from "./pr-tools.ts";
 import { repoOf } from "./views.ts";
 import { AUTO, withActor } from "./audit.ts";
 import type { ChildProcess } from "node:child_process";
@@ -264,9 +265,8 @@ async function routeWebhook(src: string, event: string, x: GitHubPayload | null)
 }
 // A comment command from a webhook: once per comment, only when commands are on and the commenter may write.
 async function handleComment(repo: string, c: PrComment) {
-  if (!(await reviewConfig(repo)).commands) return;
   const command = parseCommand(c.body);
-  if (!command || !commentPrNumber(c)) return;
+  if (!command || !commentPrNumber(c) || !commandEnabled(command.cmd, await reviewConfig(repo))) return;
   if (!remember(HANDLED_COMMENTS, `${repo}#${c.id}`)) return;
   // move the command poll's bookmark past this comment so it is not listed again
   const seen = (await store.getSetting("commandsSeen")) || {};
@@ -275,7 +275,8 @@ async function handleComment(repo: string, c: PrComment) {
     seen[repo] = new Date(at).toISOString();
     await store.setSetting("commandsSeen", seen);
   }
-  if (!(await commenterTrusted(repo, c).catch(() => false))) return;
+  // /override is authorised when it runs (requested reviewers, never the author)
+  if (command.cmd !== "override" && !(await commenterTrusted(repo, c).catch(() => false))) return;
   await runCommand(repo, c, command);
 }
 // GitHub does not retry a failed delivery on its own. After a restart, the pull_request deliveries that failed while this

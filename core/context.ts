@@ -33,6 +33,7 @@ export interface ReviewSettings extends RepoRules {
   postInlineSuggestions: boolean;
   resolveFixed: boolean; // resolve our inline comments a later push fixed (only while inline suggestions are posted)
   commands: boolean;
+  overrides: boolean; // requested reviewers may override failing custom checks with /override (merge-checks.ts)
   auto: boolean;
   profile: ReviewProfile;
   minSeverity: Severity;
@@ -57,7 +58,7 @@ export interface GitHistory { prCommits: GitCommit[]; baseCommits: BaseCommit[];
 export interface LinkedIssue { number: number; key?: string; repo: string; title: string; body: string; state: string; url: string; labels: string[]; }
 export const issueLabel = (i: Pick<LinkedIssue, "number" | "key">): string => i.key || `#${i.number}`;
 
-export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, resolveFixed: true, commands: true, auto: true, agentPrompts: true, gitleaks: false, semgrep: false, trivy: false, profile: "balanced", minSeverity: "nit", checks: [], ...RULE_DEFAULTS };
+export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, resolveFixed: true, commands: true, overrides: false, auto: true, agentPrompts: true, gitleaks: false, semgrep: false, trivy: false, profile: "balanced", minSeverity: "nit", checks: [], ...RULE_DEFAULTS };
 // Review strictness: a profile supplies the defaults for maxFindings and reflectMin (values set explicitly still win)
 // and the tone of the language-model instructions (engines.ts).
 export type ReviewProfile = "chill" | "balanced" | "assertive";
@@ -113,6 +114,7 @@ export const normalizeReview = (v: { [K in keyof ReviewSettings]?: unknown }): R
   resolveFixed: v.resolveFixed === undefined ? REVIEW_DEFAULTS.resolveFixed : !!v.resolveFixed,
   auto: !!v.auto,
   commands: !!v.commands,
+  overrides: !!v.overrides,
   profile: isProfile(v.profile) ? v.profile : REVIEW_DEFAULTS.profile,
   minSeverity: isSeverity(v.minSeverity) ? v.minSeverity : REVIEW_DEFAULTS.minSeverity,
   ...normalizeRules(v),
