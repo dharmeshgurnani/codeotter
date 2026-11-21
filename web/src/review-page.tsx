@@ -480,6 +480,7 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
   const [learningNotice, setLearningNotice] = useState<string>("");
   const [copiedFixKey, setCopiedFixKey] = useState<string>("");
   const [postingSuggestionKey, setPostingSuggestionKey] = useState<string>("");
+  const [fixPr, setFixPr] = useState<{ busy: boolean; url: string }>({ busy: false, url: "" });
   const [postedSuggestionKeys, setPostedSuggestionKeys] = useState<Record<string, boolean>>({});
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const terminalScrollRef = useRef<HTMLDivElement>(null);
@@ -716,6 +717,25 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
     }
   };
 
+  const handleOpenFixPr = async () => {
+    setFixPr({ busy: true, url: "" });
+    setLearningNotice("");
+    try {
+      const res = await fetch(`/api/fix-stacked?org=${encodeURIComponent(org)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prUrl: p.url }),
+      });
+      const d = await res.json().catch(() => ({ error: `${res.status}` }));
+      if (!res.ok || d.error) throw new Error(d.error || `${res.status}`);
+      setFixPr({ busy: false, url: String(d.url || "") });
+      setLearningNotice(`${d.updated ? "Updated" : "Opened"} fix PR with ${d.applied} fix${d.applied === 1 ? "" : "es"}${d.skipped ? `, ${d.skipped} skipped` : ""}.`);
+    } catch (e) {
+      setFixPr({ busy: false, url: "" });
+      setLearningNotice(`Could not open fix PR: ${(e as Error).message}`);
+    }
+  };
+
   const reviewedSha = (r.headSha || p.headSha || prCommits.at(-1)?.sha || "").slice(0, 7);
 
   return (
@@ -866,6 +886,18 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
               >
                 <span>{copiedFixKey === "prompt:all" ? "✓ Copied prompt" : "Copy prompt for all"}</span>
               </button>
+              <button
+                type="button"
+                disabled={fixPr.busy || !activeFindings.some((f) => f.suggestion && f.line && f.severity !== "nit")}
+                onClick={handleOpenFixPr}
+                className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2.5 py-1 text-xs font-medium text-neutral-800 hover:bg-accent disabled:opacity-50"
+              >
+                {fixPr.busy && <Loader2 className="size-3 animate-spin" />}
+                <span>Open fix PR</span>
+              </button>
+              {fixPr.url && fixPr.url.startsWith("https://") && (
+                <a href={fixPr.url} target="_blank" rel="noreferrer" className="text-xs font-medium text-brand hover:underline">Fix PR →</a>
+              )}
               <a href="/settings/repos" className="text-xs font-medium text-brand hover:underline">
                 Manage rules in Settings →
               </a>

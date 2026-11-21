@@ -9,7 +9,7 @@ import { deriveSuggestionFromDetail, reflectFindings } from "./engines.ts";
 import { postInlineSuggestionsOnPr, resolvePr, score, syncPrComments } from "./review.ts";
 import { CATCH_UP_EVERY, HANDLED_COMMENTS, lastCatchUp, remember, webhookHealthy } from "./queue.ts";
 import { repoOf } from "./views.ts";
-import { fixFindings, hunkAt } from "./fix.ts";
+import { fixFindings, fixStacked, hunkAt } from "./fix.ts";
 import { overrideChecks } from "./merge-checks.ts";
 import { countReactions } from "./forges.ts";
 import type { ForgeComment, ThreadComment } from "./forges.ts";
@@ -240,7 +240,7 @@ export async function runPrTool(prUrl: string, id: string, { question = "", acti
 
 // <pr-commands>
 // PR comment commands: a comment whose first line is /review, /describe, /improve, /docs, /changelog, /ask <question> or
-// /fix [n] runs that action and replies on the pull request. Off unless enabled in Settings, and only the repository's owner,
+// /fix [n | stacked] runs that action and replies on the pull request. Off unless enabled in Settings, and only the repository's owner,
 // members and collaborators can trigger one: anyone can comment on a public repository and spend its model budget.
 // /override <check|all> <reason> has its own switch and rule (merge-checks.ts: requested reviewers, never the author),
 // checked when it runs; the queue neither requires comment commands nor write access for it.
@@ -277,6 +277,8 @@ export async function runCommand(repo: string, c: PrComment, { cmd, arg }: PrCom
         await syncPrComments(await score(prUrl, true, repo), repo, { postScores: true, postReview: true });
       } else if (cmd === "override") {
         await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/override\`: ${await overrideChecks(repo, number, c.user || {}, arg)}`);
+      } else if (cmd === "fix" && arg.toLowerCase() === "stacked") {
+        await fixStacked(prUrl, repo); // a fix branch and pull request; it comments the link itself
       } else if (cmd === "fix") {
         // suggestions only: nothing is pushed to the branch
         await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/fix${arg ? ` ${oneLine(arg, 20)}` : ""}\`: ${await fixFindings(prUrl, repo, arg)}`);
@@ -286,7 +288,7 @@ export async function runCommand(repo: string, c: PrComment, { cmd, arg }: PrCom
       }
     });
   } catch (e) {
-    await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/${cmd}\` failed: ${oneLine((e as Error).message, 500)}`).catch(() => {});
+    await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/${cmd}${cmd === "fix" && arg.toLowerCase() === "stacked" ? " stacked" : ""}\` failed: ${oneLine((e as Error).message, 500)}`).catch(() => {});
     throw e;
   }
 }

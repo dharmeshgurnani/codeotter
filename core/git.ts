@@ -1,9 +1,13 @@
 // Repository ids, pull request URLs, the gh CLI and the GitHub App; other providers route to forges.ts.
 import { execFileSync, spawn } from "node:child_process";
 import { createSign } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { FORGE_API, FORGE_IDS, FORGES, OWNER_RE, REPO, REPO_RE } from "./config.ts";
 import { PB_URL, store } from "./store.ts";
-import type { ApiOptions, GitFetch, PullRequest } from "./forges.ts";
+import { FIX_BRANCH_RE } from "./forges.ts";
+import type { ApiOptions, GitFetch, PullRequest, StackedOps } from "./forges.ts";
 
 // A pull request URL's repository and number; selfHosted: a git server other than github.com.
 export interface ParsedPr { repo: string; number: number; selfHosted: boolean }
@@ -529,3 +533,62 @@ export async function prFetchSource(pr: { url: string; number: number; headRepo?
     || (await runGh(["auth", "token", "--hostname", "github.com"], process.env).then((t) => t.trim(), () => ""));
   return { url: `https://github.com/${repo}.git`, header: token ? `Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}` : "", ref: `refs/pull/${number}/head` };
 }
+// gh api as the repository's writer (the GitHub App bot, else the configured credential), JSON in and out. The body goes
+// through a temp file (--input): file text can be larger than a command line.
+export async function ghApi<T = unknown>(repo: string, method: string, path: string, body?: unknown): Promise<T> {
+  if (!REPO_RE.test(repo) || isForgeRepo(repo) || !path.startsWith(`repos/${repo}/`) || path.split(/[/?]/).some((x) => x === "." || x === "..")) throw new Error("Invalid GitHub API path");
+  let dir = "";
+  try {
+    const args = ["api", "-X", method, path, "-H", "Accept: application/vnd.github+json"];
+    if (body !== undefined) {
+      dir = mkdtempSync(join(tmpdir(), "codeotter-gh-"));
+      writeFileSync(join(dir, "body.json"), JSON.stringify(body));
+      args.push("--input", join(dir, "body.json"));
+    }
+    const out = await ghAsApp(repo, args);
+    return (out.trim() ? JSON.parse(out) : null) as T;
+  } finally {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+}
+// <github-stacked>
+// /fix stacked on GitHub: the git data API builds one commit on the head commit's tree; the fix branch is created at it,
+// or force-moved there on a re-run. File modes come from the head tree (an executable stays executable).
+interface GhPull { number: number; html_url?: string; head?: { ref?: string; repo?: { full_name?: string } | null }; base?: { ref?: string; repo?: { full_name?: string } } }
+const ghEnc = (s: string) => s.split("/").map(encodeURIComponent).join("/");
+export const githubStacked: StackedOps = {
+  async fork(repo, n) {
+    const p = await ghApi<GhPull>(repo, "GET", `repos/${repo}/pulls/${n}`);
+    return !p.head?.repo?.full_name || p.head.repo.full_name.toLowerCase() !== repo.toLowerCase();
+  },
+  async findFixPr(repo, base, prefix) {
+    const rows = await ghApi<GhPull[]>(repo, "GET", `repos/${repo}/pulls?state=open&base=${encodeURIComponent(base)}&per_page=100`);
+    const p = (Array.isArray(rows) ? rows : []).find((x) => x.base?.ref === base && String(x.head?.ref || "").startsWith(prefix) && FIX_BRANCH_RE.test(String(x.head?.ref)) && x.head?.repo?.full_name?.toLowerCase() === repo.toLowerCase());
+    return p ? { number: p.number, url: p.html_url || `https://github.com/${repo}/pull/${p.number}`, branch: String(p.head?.ref) } : null;
+  },
+  async commit(repo, c) {
+    if (!/^[0-9a-f]{40}$/i.test(c.headSha) || !FIX_BRANCH_RE.test(c.branch)) throw new Error("Invalid head commit or branch");
+    const head = await ghApi<{ tree?: { sha?: string } }>(repo, "GET", `repos/${repo}/git/commits/${c.headSha}`);
+    const treeSha = String(head?.tree?.sha || "");
+    if (!/^[0-9a-f]{40}$/i.test(treeSha)) throw new Error("Could not read the head commit");
+    const full = await ghApi<{ tree?: { path?: string; mode?: string }[] }>(repo, "GET", `repos/${repo}/git/trees/${treeSha}?recursive=1`).catch(() => null);
+    const modes = new Map((full?.tree || []).map((x) => [String(x.path), String(x.mode)]));
+    const tree = await ghApi<{ sha?: string }>(repo, "POST", `repos/${repo}/git/trees`, {
+      base_tree: treeSha,
+      tree: c.files.map((x) => ({ path: x.path, mode: modes.get(x.path) === "100755" ? "100755" : "100644", type: "blob", content: x.content })),
+    });
+    const made = await ghApi<{ sha?: string }>(repo, "POST", `repos/${repo}/git/commits`, { message: c.message, tree: tree?.sha, parents: [c.headSha] });
+    if (!made?.sha) throw new Error("GitHub did not create the fix commit");
+    try {
+      await ghApi(repo, "PATCH", `repos/${repo}/git/refs/heads/${ghEnc(c.branch)}`, { sha: made.sha, force: true });
+    } catch {
+      await ghApi(repo, "POST", `repos/${repo}/git/refs`, { ref: `refs/heads/${c.branch}`, sha: made.sha });
+    }
+  },
+  async openPr(repo, o) {
+    const p = await ghApi<GhPull>(repo, "POST", `repos/${repo}/pulls`, { title: o.title, head: o.branch, base: o.base, body: o.body });
+    return { number: p.number, url: p.html_url || `https://github.com/${repo}/pull/${p.number}`, branch: o.branch };
+  },
+  editPr: (repo, n, o) => ghApi(repo, "PATCH", `repos/${repo}/pulls/${n}`, { title: o.title, body: o.body }),
+};
+// </github-stacked>
