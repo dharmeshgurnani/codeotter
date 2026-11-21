@@ -51,7 +51,7 @@ const cache = new Map<string, Cached>();
 const CACHE_MS = 30 * 60e3;
 export const clearRelatedCache = () => cache.clear();
 const SKIP_FILE = /\.(lock|map|min\.js|svg|png|jpe?g|gif|json)$/i;
-const wordRe = (sym: string) => new RegExp(`(^|[^\\w$])${sym.replace(/[$]/g, "\\$")}([^\\w$]|$)`);
+const wordRe = (sym: string) => new RegExp(`(^|[^\\w$])${sym.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^\\w$]|$)`);
 
 // One symbol in one repository: the provider's code search (GitHub through gh, the others through forges.ts).
 // null: the provider has no code search API.
@@ -67,7 +67,6 @@ async function searchRepo(repo: string, sym: string, limit: number): Promise<Cod
 
 const timeout = <T>(p: Promise<T>, ms: number): Promise<T | "timeout"> => new Promise((resolve, reject) => {
   const t = setTimeout(() => resolve("timeout"), Math.max(0, ms));
-  t.unref?.();
   p.then((v) => { clearTimeout(t); resolve(v); }, (e: unknown) => { clearTimeout(t); reject(e); });
 });
 
