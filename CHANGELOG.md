@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Contributing.** CONTRIBUTING.md has a Tests policy (new functionality ships with tests, bug fixes add a regression test, untested behaviour changes are not merged) and the pull request template a matching checklist item. The CI workflow's token is limited to `contents: read`.
+
 ## 0.10.0 (2026-11-21)
 
 - **Review result as a GitHub check run.** Where the GitHub App is installed on the repository, `codeotter/checks` is a check run instead of a commit status: in progress while the review runs, then completed with a conclusion (failure when a blocking custom check failed, neutral for "changes requested" or any other failed gate or check, success otherwise), a summary of scores, blast radius and gates, and an annotation per finding with a file and line (sent 50 per request, the Checks API limit). A failed review completes the run as failure with the model's error. Without the App on the repository, and on every other git server, the `codeotter/checks` commit status stays as before (only when custom checks ran); one commit never gets both. The App manifest now asks for `checks: write` and `members: read`; an existing App without `checks: write` keeps getting the status until the permission is granted.
