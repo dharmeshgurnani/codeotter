@@ -969,9 +969,9 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                       <>{check(v.verdict !== "request_changes" && v.scores.quality >= 60)} <span className="text-muted-foreground">({r.linkedIssues.map((i) => i.key || `#${i.number}`).join(", ")})</span></>,
                     ] as React.ReactNode[]]
                   : []),
-                ...(r.gates ?? []).map((g) => [
+                ...(r.gates ?? []).map((g) => [g, !g.pass ? r.overrides?.find((o) => o.check === g.id) : undefined] as const).map(([g, o]) => [
                   <>{g.label}{g.mode === "block" && <Badge className="ml-1.5">blocking</Badge>}</>,
-                  <>{check(g.pass, g.mode === "block")} <span className="text-muted-foreground">({Math.round(g.yes * 100)}% yes{g.id === "issue_requirements" && r.linkedIssues?.length ? ` · ${r.linkedIssues.map((i) => i.key || `#${i.number}`).join(", ")}` : ""})</span></>,
+                  <>{o ? <Badge tone="info" title={`${o.by}: ${o.reason}`}>Overridden by {o.by}</Badge> : check(g.pass, g.mode === "block")} <span className="text-muted-foreground">({Math.round(g.yes * 100)}% yes{g.id === "issue_requirements" && r.linkedIssues?.length ? ` · ${r.linkedIssues.map((i) => i.key || `#${i.number}`).join(", ")}` : ""})</span></>,
                 ] as React.ReactNode[]),
                 ...(pending?.gates ? [["Merge gates", <InlineLoader key="g" text="Checking policy gates…" />] as React.ReactNode[]] : []),
               ]} />

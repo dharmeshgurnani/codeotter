@@ -59,6 +59,8 @@ export type Review = {
     baseCommits?: { sha: string; message: string; author?: string }[];
   };
   gates?: { id: string; label: string; yes: number; pass: boolean; mode?: "warn" | "block" }[];
+  // /override on failing custom checks (core/merge-checks.ts), for the head commit they were given on
+  overrides?: { check: string; label: string; by: string; reason: string; at: string; sha: string }[];
   engines?: { llm: string | null; s1: string | null };
   pending?: {
     scores?: boolean;

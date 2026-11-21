@@ -70,6 +70,7 @@ function load({ ghComments = [] as Row[], giteaReviews = {} as Record<number, Ro
     normalizeForgePr: () => ({}),
     parseCommand: (body: unknown) => (/^\/review/.test(String(body)) ? { cmd: "review", arg: "" } : null),
     commentPrNumber: () => 0,
+    commandEnabled: (cmd: string, rc: { commands?: boolean; overrides?: boolean }) => (cmd === "override" ? !!rc.overrides : !!rc.commands),
     commenterTrusted: async (_repo: string, c: { author_association?: string; user?: { login?: string } }) => { calls.push(["trusted", c.user?.login, c.author_association]); return trusted; },
     runCommand: async () => { calls.push(["command"]); },
     llmConfig: async () => ({ provider: "test", model: "stub" }),

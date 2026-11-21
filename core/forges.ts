@@ -141,6 +141,9 @@ export interface Forge {
   setBody(repo: string, n: number, body: string): Promise<unknown>;
   commentsSince(repo: string, since: string): Promise<ForgeComment[]>;
   trusted(repo: string, c: ForgeComment): Promise<boolean>;
+  // Whether the comment's author is one of the pull request's requested reviewers (a user, or a member of a requested team
+  // where the server can tell). Gates /override (merge-checks.ts); adapters without a reviewer list leave it out.
+  requestedReviewer?(repo: string, n: number, c: ForgeComment): Promise<boolean>;
   react(repo: string, c: ForgeComment): Promise<unknown> | null;
   // Inline review threads, each oldest first, and a reply in one. Adapters without thread replies leave them out.
   reviewThreads?(repo: string, n: number): Promise<ThreadComment[][]>;
@@ -335,6 +338,7 @@ interface GiteaPull {
   number: number; title?: string; body?: string; user?: GiteaUser; updated_at?: string;
   base?: { ref?: string }; head?: { ref?: string; sha?: string; repo?: { full_name?: string } };
   additions?: number; deletions?: number; changed_files?: number; merged?: boolean; state?: string; draft?: boolean; labels?: PrLabel[];
+  requested_reviewers?: (GiteaUser | null)[]; requested_reviewers_teams?: ({ id?: number } | null)[];
 }
 interface GiteaFile { filename: string; additions?: number; deletions?: number }
 interface GiteaCommit { sha: string; commit?: { message?: string; author?: { name?: string; date?: string } }; author?: { login?: string } }
@@ -348,7 +352,7 @@ function gitea(id: string, f: AuthedConfig): Forge {
   f.auth = () => `token ${f.token}`;
   const api = <T = unknown>(path: string, opts: ApiOptions = {}): Promise<T> => {
     if (!f.url) throw new Error(`Set the ${f.label} server under Admin / Git providers`);
-    if (!/^(?:user$|(?:repos|user|users|orgs)\/)/.test(path) || path.split(/[/?]/).some((p) => p === "." || p === "..")) throw new Error("Invalid git server API path");
+    if (!/^(?:user$|(?:repos|user|users|orgs|teams)\/)/.test(path) || path.split(/[/?]/).some((p) => p === "." || p === "..")) throw new Error("Invalid git server API path");
     if (!f.token) throw new Error(`Configure an access token in Admin / Git providers / ${f.label}`);
     return http(f, `${f.url}/api/v1/${path}`, { ...opts, as: opts.raw ? "text" : opts.as, what: path.split("?")[0] }) as Promise<T>;
   };
@@ -466,6 +470,18 @@ function gitea(id: string, f: AuthedConfig): Forge {
       return ["owner", "admin", "write"].includes(String(p?.permission || "").toLowerCase());
     },
     react: (repo, c) => (Number.isSafeInteger(Number(c.id)) ? api(`${r(repo)}/issues/comments/${Number(c.id)}/reactions`, { method: "POST", body: { content: "eyes" } }) : null),
+    async requestedReviewer(repo, n, c) {
+      const login = String(c.user?.login || "").toLowerCase();
+      if (!/^[\w][\w.-]*$/.test(login)) return false;
+      const p = await api<GiteaPull | null>(`${r(repo)}/pulls/${n}`);
+      if ((p?.requested_reviewers || []).some((u) => String(u?.login || u?.username || "").toLowerCase() === login)) return true;
+      for (const t of p?.requested_reviewers_teams || []) {
+        const id = Number(t?.id);
+        if (!Number.isSafeInteger(id) || id <= 0) continue;
+        if (await orNull(api(`teams/${id}/members/${enc(login)}`)).catch(() => null)) return true;
+      }
+      return false;
+    },
     // The API has no reply-to link: the server groups a conversation by file and line, and so does this.
     async reviewThreads(repo, n) {
       const reviews = (await list<GiteaReview>(`${r(repo)}/pulls/${n}/reviews`)).filter((v) => Number.isSafeInteger(Number(v?.id)) && v.state !== "PENDING");
@@ -505,7 +521,7 @@ interface BbPull {
   id: number; title?: string; description?: string; summary?: { raw?: string }; author?: BbUser; updated_on?: string;
   destination?: { branch?: { name?: string }; repository?: BbRepoRef };
   source?: { branch?: { name?: string }; repository?: BbRepoRef; commit?: { hash?: string } };
-  state?: string; draft?: boolean;
+  state?: string; draft?: boolean; reviewers?: (BbUser | null)[];
 }
 interface BbPage<T> { values?: T[]; next?: string }
 interface BbDiffstat { new?: { path?: string }; old?: { path?: string }; lines_added?: number; lines_removed?: number }
@@ -652,6 +668,13 @@ function bitbucket(id: string, f: AuthedConfig): Forge {
       const p = await api<{ permission?: string } | null>(`${r(repo)}/permissions-config/users/${enc(who)}`).catch((e: unknown) => { if ([401, 403, 404].includes(statusOf(e) ?? 0)) return null; throw e; });
       return ["admin", "write"].includes(String(p?.permission || ""));
     },
+    // Bitbucket Cloud has no reviewer teams: the reviewer list is accounts, matched by account id.
+    async requestedReviewer(repo, n, c) {
+      const who = String(c.user?.id || "");
+      if (!who) return false;
+      const p = await api<BbPull | null>(`${r(repo)}/pullrequests/${n}`);
+      return (p?.reviewers || []).some((u) => !!u && (u.account_id === who || u.uuid === who));
+    },
     react: () => null,
     async ensureHook(repo, url, secret) {
       const hooks = await list<BbHook>(`${r(repo)}/hooks`);
@@ -685,7 +708,7 @@ interface DcPull {
   id: number; title?: string; description?: string; author?: { user?: DcUser }; updatedDate?: number;
   toRef?: { displayId?: string; repository?: DcRepoRef };
   fromRef?: { displayId?: string; latestCommit?: string; repository?: DcRepoRef };
-  state?: string; draft?: boolean; version?: number;
+  state?: string; draft?: boolean; version?: number; reviewers?: ({ user?: DcUser } | null)[];
 }
 interface DcPage<T> { values?: T[]; isLastPage?: boolean; nextPageStart: number }
 interface DcComment { id: number; text?: string; createdDate?: number; author?: DcUser; version?: number; threadResolved?: boolean }
@@ -833,6 +856,12 @@ function bitbucketdc(id: string, f: AuthedConfig): Forge {
       };
       return (await grant(r(repo), ["REPO_WRITE", "REPO_ADMIN"])) || grant(`projects/${enc(key)}`, ["PROJECT_WRITE", "PROJECT_ADMIN"]);
     },
+    async requestedReviewer(repo, n, c) {
+      const who = String(c.user?.login || "");
+      if (!who) return false;
+      const p = await api<DcPull | null>(`${r(repo)}/pull-requests/${n}`);
+      return (p?.reviewers || []).some((x) => !!x?.user && login(x.user) === who);
+    },
     react: () => null,
     async ensureHook(repo, url, secret) {
       const hooks = await list<DcHook>(`${r(repo)}/webhooks`, 200);
@@ -868,7 +897,7 @@ interface AzPull {
   pullRequestId: number; title?: string; description?: string; createdBy?: AzIdentity; closedDate?: string; creationDate?: string;
   targetRefName?: string; sourceRefName?: string; lastMergeSourceCommit?: { commitId?: string };
   forkSource?: { repository?: AzRepoRef }; repository?: AzRepoRef; status?: string; isDraft?: boolean;
-  labels?: { name: string; active?: boolean }[];
+  labels?: { name: string; active?: boolean }[]; reviewers?: ((AzIdentity & { isContainer?: boolean }) | null)[];
 }
 interface AzList<T> { value?: T[] }
 interface AzIteration { id: number; sourceRefCommit?: { commitId?: string } }
@@ -1118,6 +1147,13 @@ function azure(id: string, f: AuthedConfig): Forge {
       const p = await api<{ visibility?: string } | null>(`${enc(org)}/_apis/projects/${enc(project)}`).catch((e: unknown) => { if ([401, 403, 404].includes(statusOf(e) ?? 0)) return null; throw e; });
       return p?.visibility === "private";
     },
+    // Individual reviewers only, matched by identity id: group (container) reviewers are not expanded.
+    async requestedReviewer(repo, n, c) {
+      const who = String(c.user?.id || "");
+      if (!who) return false;
+      const p = await api<AzPull | null>(`${g(repo)}/pullrequests/${n}`);
+      return (p?.reviewers || []).some((x) => !!x && !x.isContainer && x.id === who);
+    },
     react: () => null,
     // Service hook subscriptions, one per event, recognised by URL and repository. Azure cannot sign a delivery: the
     // secret travels in a header (X-CodeOtter-Secret) and is compared in constant time.
@@ -1174,6 +1210,7 @@ interface GlMr {
   target_branch?: string; source_branch?: string; sha?: string; last_commit?: { id?: string };
   source_project_id?: number; target_project_id?: number; state?: string; draft?: boolean; work_in_progress?: boolean;
   labels?: (string | { title?: string; name?: string })[]; diff_refs?: { base_sha?: string; start_sha?: string; head_sha?: string };
+  reviewers?: (GlUser | null)[];
 }
 interface GlDiff { old_path?: string; new_path?: string; diff?: string; new_file?: boolean; deleted_file?: boolean; renamed_file?: boolean }
 interface GlCommit { id: string; message?: string; title?: string; author_name?: string; committed_date?: string; authored_date?: string }
@@ -1370,6 +1407,12 @@ function gitlab(id: string, f: AuthedConfig): Forge {
       if (!Number.isSafeInteger(uid) || uid <= 0) return false;
       const m = await api<{ access_level?: number; state?: string } | null>(`${p(repo)}/members/all/${uid}`).catch((e: unknown) => { if ([401, 403, 404].includes(statusOf(e) ?? 0)) return null; throw e; });
       return Number(m?.access_level) >= DEVELOPER && (m?.state ?? "active") === "active";
+    },
+    async requestedReviewer(repo, n, c) {
+      const uid = Number(c.user?.id);
+      if (!Number.isSafeInteger(uid) || uid <= 0) return false;
+      const m = await api<GlMr | null>(`${p(repo)}/merge_requests/${n}`);
+      return (m?.reviewers || []).some((u) => Number(u?.id) === uid);
     },
     react: (repo, c) => (Number.isSafeInteger(Number(c.id)) && c.prNumber ? api(`${p(repo)}/merge_requests/${c.prNumber}/notes/${Number(c.id)}/award_emoji`, { method: "POST", body: { name: "eyes" } }) : null),
     async ensureHook(repo, url, secret) {

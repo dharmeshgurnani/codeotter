@@ -10,6 +10,7 @@ import { postInlineSuggestionsOnPr, resolvePr, score, syncPrComments } from "./r
 import { CATCH_UP_EVERY, HANDLED_COMMENTS, lastCatchUp, remember, webhookHealthy } from "./queue.ts";
 import { repoOf } from "./views.ts";
 import { fixFindings, hunkAt } from "./fix.ts";
+import { overrideChecks } from "./merge-checks.ts";
 import type { ForgeComment, ThreadComment } from "./forges.ts";
 import { audit, orgOfRepo, withActor } from "./audit.ts";
 import type { Guide, PullRequest, ReviewSettings } from "./context.ts";
@@ -239,7 +240,10 @@ export async function runPrTool(prUrl: string, id: string, { question = "", acti
 // PR comment commands: a comment whose first line is /review, /describe, /improve, /docs, /changelog, /ask <question> or
 // /fix [n] runs that action and replies on the pull request. Off unless enabled in Settings, and only the repository's owner,
 // members and collaborators can trigger one: anyone can comment on a public repository and spend its model budget.
-const COMMANDS = ["review", "describe", "improve", "ask", "docs", "changelog", "fix"];
+// /override <check|all> <reason> has its own switch and rule (merge-checks.ts: requested reviewers, never the author),
+// checked when it runs; the queue neither requires comment commands nor write access for it.
+const COMMANDS = ["review", "describe", "improve", "ask", "docs", "changelog", "fix", "override"];
+export const commandEnabled = (cmd: string, rc: { commands?: boolean; overrides?: boolean }) => (cmd === "override" ? !!rc.overrides : !!rc.commands);
 export function parseCommand(body: unknown): PrCommand | null {
   const m = String(body || "").trimStart().split("\n")[0].trim().match(/^\/([a-z]+)(?:\s+(.*))?$/i);
   if (!m || !COMMANDS.includes(m[1].toLowerCase())) return null;
@@ -269,6 +273,8 @@ export async function runCommand(repo: string, c: PrComment, { cmd, arg }: PrCom
     await withActor(actor, async () => {
       if (cmd === "review") {
         await syncPrComments(await score(prUrl, true, repo), repo, { postScores: true, postReview: true });
+      } else if (cmd === "override") {
+        await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/override\`: ${await overrideChecks(repo, number, c.user || {}, arg)}`);
       } else if (cmd === "fix") {
         // suggestions only: nothing is pushed to the branch
         await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/fix${arg ? ` ${oneLine(arg, 20)}` : ""}\`: ${await fixFindings(prUrl, repo, arg)}`);
@@ -392,7 +398,8 @@ if (IS_SERVER) setInterval(async () => {
   try {
     const seen = (await store.getSetting("commandsSeen")) || {};
     for (const repo of await repos()) {
-      if (!(await reviewConfig(repo)).commands) {
+      const rc = await reviewConfig(repo);
+      if (!rc.commands && !rc.overrides) {
         // marked once while off; the first poll after turning commands on starts from that moment, so nothing posted
         // while they were off ever runs (and an off repository costs no writes)
         if (seen[repo] !== "off") { seen[repo] = "off"; await store.setSetting("commandsSeen", seen); }
@@ -415,9 +422,9 @@ if (IS_SERVER) setInterval(async () => {
         if (!at || Date.parse(at) <= Date.parse(since)) continue;
         if (Date.parse(at) > Date.parse(latest)) latest = new Date(Date.parse(at)).toISOString();
         const command = parseCommand(c.body);
-        if (!command || !commentPrNumber(c)) continue;
+        if (!command || !commentPrNumber(c) || !commandEnabled(command.cmd, rc)) continue;
         if (!remember(HANDLED_COMMENTS, `${repo}#${c.id}`)) continue; // a webhook already ran it
-        if (!(await commenterTrusted(repo, c).catch(() => false))) continue;
+        if (command.cmd !== "override" && !(await commenterTrusted(repo, c).catch(() => false))) continue;
         await runCommand(repo, c, command).catch((e) => console.warn(`[commands] ${repo} /${command.cmd}: ${e.message}`));
       }
       seen[repo] = latest;
