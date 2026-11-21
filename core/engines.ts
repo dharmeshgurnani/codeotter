@@ -6,6 +6,8 @@ import { extractHeadSha, issueLabel, REVIEW_DEFAULTS } from "./context.ts";
 import { diffFiles, pathInstructionBlock } from "./repo-rules.ts";
 import { analyzerPrompt, isAnalyzerId } from "./analyzers.ts";
 import type { AnalyzerId, AnalyzerResult } from "./analyzers.ts";
+import { sandboxPrompt, sandboxState } from "./sandbox.ts";
+import type { SandboxRun } from "./sandbox.ts";
 import type { LlmConfig, S1Answers, S1Config, S1Questions } from "./models.ts";
 import type { LocalModel } from "./local-models.ts";
 import type { OutsideImpact } from "./diff.ts";
@@ -93,9 +95,11 @@ export function s1Questions(c: Pick<S1Config, "local">, guide: Guide | null, lin
   for (const g of gates) questions[`gate_${g.id}`] = { type: "noul", instructions: g.q };
   return { questions, gates };
 }
-function s1State(pr: PullRequest, diff: string, c: S1Config, guide: Guide | null = null, gitHistory: GitHistory | null = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = []): Record<string, unknown> {
-  if (c.local) return { pull_request: changeDigest(pr, diff, c.contextChars || 12000) };
+function s1State(pr: PullRequest, diff: string, c: S1Config, guide: Guide | null = null, gitHistory: GitHistory | null = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], sandbox: SandboxRun | null = null): Record<string, unknown> {
+  const testRun = sandboxState(sandbox);
+  if (c.local) return { pull_request: changeDigest(pr, diff, c.contextChars || 12000), ...(testRun ? { sandbox_test_run: testRun } : {}) };
   return {
+    ...(testRun ? { sandbox_test_run: testRun } : {}),
     pull_request: {
       title: pr.title,
       description: (pr.body || "").slice(0, 3000),
@@ -174,8 +178,8 @@ export function changeDigest(pr: Pick<PullRequest, "title" | "body" | "files" | 
   return out.slice(0, maxChars);
 }
 
-export async function scoreWithSystemOne(pr: PullRequest, diff: string, c: S1Config, guide: Guide | null, onPartial: ((p: S1Progress) => void) | null | undefined, gitHistory: GitHistory | null | undefined, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: CustomCheck[] = []): Promise<{ scores: Record<ScoreKey, number>; gates: Gate[] }> {
-  const state = s1State(pr, diff, c, guide, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, accepted);
+export async function scoreWithSystemOne(pr: PullRequest, diff: string, c: S1Config, guide: Guide | null, onPartial: ((p: S1Progress) => void) | null | undefined, gitHistory: GitHistory | null | undefined, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: CustomCheck[] = [], sandbox: SandboxRun | null = null): Promise<{ scores: Record<ScoreKey, number>; gates: Gate[] }> {
+  const state = s1State(pr, diff, c, guide, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, accepted, sandbox);
   const { questions, gates: gateDefs } = s1Questions(c, guide, linkedIssues, checks);
   let a: S1Answers;
   try {
@@ -474,7 +478,7 @@ const PROFILE_PROMPT: Record<ReviewSettings["profile"], string> = {
   balanced: "",
   assertive: "Profile: assertive. Report every real problem, including low-severity issues and nitpicks (style, naming, readability, missing tests, docs); use the full findings budget when the diff warrants it.",
 };
-export function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: GateDef[] = [], analyzers: AnalyzerResult[] = []): string {
+export function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: GateDef[] = [], analyzers: AnalyzerResult[] = [], sandbox: SandboxRun | null = null): string {
   const checksBlock = checks.length
     ? `\nRepository pre-merge checks (answer each from the diff and description in "checks": true = yes, false = no):\n${checks.map((g) => `- ${g.id}: ${g.q}`).join("\n")}\n`
     : "";
@@ -502,7 +506,7 @@ PR #${pr.number}: ${pr.title}
 Author: ${pr.author.login}  Base: ${pr.baseRefName} <- Head: ${pr.headRefName}${pr.headSha ? ` (${pr.headSha.slice(0, 7)})` : ""}  Files: ${pr.changedFiles}  +${pr.additions} -${pr.deletions}
 Description:
 ${(pr.body || "(none)").slice(0, c.contextChars ? Math.min(3000, Math.floor(c.contextChars / 10)) : 3000)}
-${outsideBlock}${incrementalBlock}${issueBlock}${checksBlock}${pathBlock}${learningsBlock}${acceptedBlock}${analyzerPrompt(analyzers)}${gitHistory?.formatted ? `\nGit Change History (commits in this PR and recent target branch history):\n${gitHistory.formatted.slice(0, 4000)}\n` : ""}${guide ? `\nRepository Review Guidelines from ${guide.file} (MANDATORY: verify all code changes and commits against these rules and flag any violation in findings):\n${guide.text}\n` : ""}
+${outsideBlock}${incrementalBlock}${issueBlock}${checksBlock}${pathBlock}${learningsBlock}${acceptedBlock}${analyzerPrompt(analyzers)}${sandboxPrompt(sandbox)}${gitHistory?.formatted ? `\nGit Change History (commits in this PR and recent target branch history):\n${gitHistory.formatted.slice(0, 4000)}\n` : ""}${guide ? `\nRepository Review Guidelines from ${guide.file} (MANDATORY: verify all code changes and commits against these rules and flag any violation in findings):\n${guide.text}\n` : ""}
 Diff${diff.length > Math.min(r.diffChars, c.contextChars || Infinity) ? " (over budget: highest-priority files first, the rest named at the end)" : ""}:
 ${compressDiff(diff, Math.min(r.diffChars, c.contextChars || Infinity)).diff}`;
 }
@@ -534,11 +538,11 @@ ${compressDiff(diff, Math.min(r.diffChars, c.contextChars || Infinity)).diff}`, 
 }
 // </reflect>
 
-export async function judge(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, onProgress: ((partial: Partial<Judgement>) => void) | null = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: CustomCheck[] = [], analyzers: AnalyzerResult[] = []): Promise<Judgement> {
+export async function judge(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, onProgress: ((partial: Partial<Judgement>) => void) | null = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: CustomCheck[] = [], analyzers: AnalyzerResult[] = [], sandbox: SandboxRun | null = null): Promise<Judgement> {
   // CodeReviewer cannot answer checks; it always runs next to System One, which owns them.
   if (c.api === "codereviewer") return reviewWithCodeReviewer(pr, diff, c, guide, gitHistory, onProgress, linkedIssues, learnings, incrementalCtx);
   const checkDefs = customGates(checks);
-  const text = await askModel(prompt(pr, diff, c, r, guide, wantScores, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, accepted, checkDefs, analyzers), { ...c, temperature: r.temperature });
+  const text = await askModel(prompt(pr, diff, c, r, guide, wantScores, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, accepted, checkDefs, analyzers, sandbox), { ...c, temperature: r.temperature });
   // Model output: every field is checked or coerced below before it is stored.
   let out: { summary?: unknown; verdict?: unknown; scores?: Record<string, unknown> | null; findings?: unknown; walkthrough?: unknown; checks?: unknown };
   try {

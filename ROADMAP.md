@@ -2,6 +2,7 @@
 
 | Status | Feature | Date |
 | :---: | :--- | :--- |
+| [x] | Sandbox run: the admin-configured test command on the PR head in Docker (`--network none`, read-only image, non-root, CPU/memory/process and time limits, no credentials), the model picks only which admin-listed test targets to pass; pass/fail, failed tests and output tail are evidence for both engines and a "Sandbox run" section on the review page; per-repository opt-in, needs Docker. Stub-tested; not yet run against a live Docker daemon on every forge | 2026-11-21 |
 | [x] | Post comments, reviews and statuses as the GitHub App bot (installation tokens) instead of the operator's `gh` login | 2026-11-20 |
 | [x] | Review strictness profile per repository (chill / balanced / assertive: findings budget, self-check threshold, model instructions) and a minimum severity for posted comments | 2026-11-20 |
 | [x] | Path filters, path instructions and auto-review skip rules (drafts, authors, base branches, title keywords, labels) per repository, overridable by `.codeotter.json` on the base branch | 2026-11-20 |

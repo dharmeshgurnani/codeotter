@@ -22,6 +22,7 @@ import type { LocalModel } from "./local-models.ts";
 import type { ReviewSettings } from "./context.ts";
 import { CONFIG_FILE, rulesAsText } from "./repo-rules.ts";
 import type { TrackerSettings } from "./trackers.ts";
+import { dockerStatus, LIMITS, normalizeSandbox, SANDBOX_TIMEOUTS, sandboxConfig, sandboxReady } from "./sandbox.ts";
 import { analyzerAsset, analyzerBin, ANALYZER_IDS, ANALYZERS, canInstall, installAnalyzer, isAnalyzerId, removeAnalyzer } from "./analyzers.ts";
 
 // Page JSON drawn by web/src/components/json-form.tsx (Field, Section, Action, Row there).
@@ -358,8 +359,8 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
     access: "admin",
     async load({ org = "", repo = "" } = {}) {
       await onboardedRepo(repo, org);
-      const [rc, files, guides, learnings, accepted, configFile] = await Promise.all([reviewConfig(repo), guideFiles(repo), store.getSetting("guides"), getRepoLearnings(repo), getRepoAccepted(repo),
-        repoConfigFile(repo).then((f) => (f ? `${CONFIG_FILE} on the default branch sets ${Object.keys(f).join(", ") || "nothing"}; those keys override the fields below` : `No ${CONFIG_FILE} at the root`), (e: Error) => e.message)]);
+      const [rc, files, guides, learnings, accepted, configFile, sbx, docker] = await Promise.all([reviewConfig(repo), guideFiles(repo), store.getSetting("guides"), getRepoLearnings(repo), getRepoAccepted(repo),
+        repoConfigFile(repo).then((f) => (f ? `${CONFIG_FILE} on the default branch sets ${Object.keys(f).join(", ") || "nothing"}; those keys override the fields below` : `No ${CONFIG_FILE} at the root`), (e: Error) => e.message), sandboxConfig(repo), dockerStatus()]);
       // One section, one Save: review settings, guidelines and learnings are all this repository's.
       const sections: Section[] = [
         {
@@ -409,10 +410,34 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
           ],
           actions: [{ id: "save", label: "Save" }],
         },
+        // Runs pull-request code: its own section and save, stored apart from the review settings (core/sandbox.ts).
+        {
+          id: "sandbox",
+          title: "Sandbox run",
+          fields: [
+            docker.ok
+              ? { key: "enabled", label: "Sandbox run", type: "checkbox", text: "Run the test command on the PR head in Docker; the result is evidence for both engines" }
+              : { key: "docker", label: "Sandbox run", type: "readonly" },
+            { key: "image", label: "Image", type: "text", placeholder: "node:22-bookworm-slim" },
+            { key: "setup", label: "Setup command", type: "text", placeholder: "npm ci" },
+            { key: "setupNetwork", label: "Setup network", type: "checkbox", text: "Network for the setup command only" },
+            { key: "test", label: "Test command", type: "text", placeholder: "npx vitest run" },
+            { key: "targets", label: "Test targets", type: "textarea", placeholder: "test/api.test.ts\ntest/db.test.ts", hint: "One per line. The model picks the ones the change needs; they are appended to the test command. Empty: the test command runs as is." },
+            { key: "timeoutSec", label: "Time limit", type: "select", options: SANDBOX_TIMEOUTS.map((v) => ({ value: v, label: `${v / 60} min` })) },
+            { key: "limits", label: "Limits", type: "readonly" },
+          ],
+          actions: [{ id: "save", label: "Save", disabled: !docker.ok }],
+        },
       ];
       return {
         sections,
         values: {
+          sandbox: {
+            ...sbx,
+            targets: sbx.targets.join("\n"),
+            ...(docker.ok ? {} : { docker: `Docker not reachable: ${docker.error}` }),
+            limits: `${LIMITS.cpus} CPUs · ${LIMITS.memory.replace("g", " GB")} memory · ${LIMITS.pids} processes · read-only image · non-root · test step without network`,
+          },
           repo: {
             ...Object.fromEntries((Object.keys(REVIEW_DEFAULTS) as (keyof ReviewSettings)[]).map((k) => [k, rc[k]])),
             ...rulesAsText(rc),
@@ -429,6 +454,17 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
     },
     async save(body, { org = "", repo = "" } = {}) {
       await onboardedRepo(repo, org);
+      if (body.sandbox) {
+        const next = normalizeSandbox(rec(body.sandbox));
+        if (next.enabled) {
+          const docker = await dockerStatus();
+          if (!docker.ok) throw new Error(`Docker not reachable: ${docker.error}`);
+          const missing = sandboxReady(next);
+          if (missing) throw new Error(missing);
+        }
+        const rs0 = await store.getSetting("repoSettings");
+        await store.setSetting("repoSettings", { ...(rs0 || {}), [repo]: { ...(rs0?.[repo] || {}), sandbox: next } });
+      }
       if (!body.repo) return;
       const v = rec(body.repo);
       const [guides0, rs0, current] = await Promise.all([store.getSetting("guides"), store.getSetting("repoSettings"), reviewConfig(repo)]);

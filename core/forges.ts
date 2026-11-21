@@ -104,6 +104,11 @@ export interface HookMeta { event: string; delivery: string; signature: string |
 export interface RoutedHook { repo: string; pr?: PullRequest; comment?: ForgeComment; inThread?: boolean }
 export interface FileDiffInput { oldPath: string; newPath: string; oldText: string | null; newText: string | null; binary?: boolean }
 export type DiffOp = ["=" | "+" | "-", string];
+// Where a sandbox run (core/sandbox.ts) fetches a pull request's head with git: a URL on this provider's own origin, the
+// Authorization header for it (handed to git through its environment only) and the ref.
+export interface GitFetch { url: string; header: string; ref: string }
+type HeadRef = { headRepo?: string; headRefName?: string };
+const basic = (user: string, token: string) => `Basic ${Buffer.from(`${user}:${token}`).toString("base64")}`;
 // One adapter. Payload parameters (`normalize`, `hookBody`, `route`) take untrusted server JSON; each adapter declares
 // the raw shape it reads.
 export interface Forge {
@@ -115,6 +120,7 @@ export interface Forge {
   prUrl(repo: string, n: number): string;
   issueUrl(repo: string, n: number): string;
   repoUrl(repo: string): string;
+  fetchSource(repo: string, n: number, head: HeadRef): GitFetch;
   parsePr(u: URL): { native: string; number: number } | null;
   parseRepo(rest: string): string | null;
   test(): Promise<string>;
@@ -378,6 +384,8 @@ function gitea(id: string, f: AuthedConfig): Forge {
     prUrl: (repo, n) => `${f.url}/${native(repo)}/pulls/${n}`,
     issueUrl: (repo, n) => `${f.url}/${native(repo)}/issues/${n}`,
     repoUrl: (repo) => `${f.url}/${native(repo)}`,
+    // the base repository keeps every pull request's head, forks included
+    fetchSource: (repo, n) => ({ url: `${f.url}/${native(repo)}.git`, header: f.auth(), ref: `refs/pull/${n}/head` }),
     parsePr(u) {
       const m = u.pathname.match(/^\/([\w][\w.-]*\/[\w][\w.-]*)\/pulls\/([1-9]\d*)$/);
       return m ? { native: m[1], number: Number(m[2]) } : null;
@@ -561,6 +569,8 @@ function bitbucket(id: string, f: AuthedConfig): Forge {
     prUrl: (repo, n) => `https://bitbucket.org/${native(repo)}/pull-requests/${n}`,
     issueUrl: (repo, n) => `https://bitbucket.org/${native(repo)}/issues/${n}`,
     repoUrl: (repo) => `https://bitbucket.org/${native(repo)}`,
+    // no pull refs: the source branch, from the fork when there is one. Git takes API tokens as x-bitbucket-api-token-auth.
+    fetchSource: (repo, _n, head) => ({ url: `https://bitbucket.org/${native(head.headRepo || repo)}.git`, header: basic(f.user ? "x-bitbucket-api-token-auth" : "x-token-auth", f.token), ref: `refs/heads/${head.headRefName || ""}` }),
     parsePr(u) {
       const m = u.pathname.match(/^\/([\w][\w.-]*\/[\w][\w.-]*)\/pull-requests\/([1-9]\d*)$/);
       return m ? { native: m[1], number: Number(m[2]) } : null;
@@ -748,6 +758,7 @@ function bitbucketdc(id: string, f: AuthedConfig): Forge {
     prUrl: (repo, n) => `${f.url}/projects/${native(repo).split("/")[0]}/repos/${native(repo).split("/")[1]}/pull-requests/${n}`,
     issueUrl: () => "",
     repoUrl: (repo) => `${f.url}/projects/${native(repo).split("/")[0]}/repos/${native(repo).split("/")[1]}`,
+    fetchSource: (repo, n) => ({ url: `${f.url}/scm/${native(repo)}.git`, header: f.auth(), ref: `refs/pull-requests/${n}/from` }),
     parsePr(u) {
       const m = u.pathname.match(/^\/projects\/([\w][\w.-]*)\/repos\/([\w][\w.-]*)\/pull-requests\/([1-9]\d*)$/);
       return m ? { native: `${m[1]}/${m[2]}`, number: Number(m[3]) } : null;
@@ -987,6 +998,8 @@ function azure(id: string, f: AuthedConfig): Forge {
     prUrl: (repo, n) => `${web(repo)}/pullrequest/${n}`,
     issueUrl: (repo, n) => { const [org, project] = parts(repo); return `${AZ}/${enc(org)}/${enc(project)}/_workitems/edit/${n}`; },
     repoUrl: web,
+    // refs/pull/<n>/merge is a merge commit, not the head: the source branch, from the fork when there is one
+    fetchSource: (repo, _n, head) => ({ url: web(head.headRepo || repo), header: f.auth(), ref: `refs/heads/${head.headRefName || ""}` }),
     parsePr(u) {
       const m = u.pathname.match(/^\/([^/]+)\/([^/]+)\/_git\/([^/]+)\/pullrequest\/([1-9]\d*)$/);
       if (!m) return null;
@@ -1248,6 +1261,7 @@ function gitlab(id: string, f: AuthedConfig): Forge {
     prUrl: (repo, n) => `${web(repo)}/-/merge_requests/${n}`,
     issueUrl: (repo, n) => `${web(repo)}/-/issues/${n}`,
     repoUrl: web,
+    fetchSource: (repo, n) => ({ url: `${web(repo)}.git`, header: basic("oauth2", f.token), ref: `refs/merge-requests/${n}/head` }),
     parsePr(u) {
       const m = u.pathname.match(new RegExp(`^/(${GL_SEG}(?:/${GL_SEG}){1,19})/-/merge_requests/([1-9]\\d*)$`));
       return m ? { native: m[1], number: Number(m[2]) } : null;
