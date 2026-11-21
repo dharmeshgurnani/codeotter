@@ -36,13 +36,14 @@ const StatCardSkeleton = ({ button }: { button?: boolean }) => (
   </div>
 );
 
-// Home / any report: stat cards, two tables, a link grid.
+// Home / any report: stat cards, Review next, two tables, a link grid.
 export function ReportSkeleton() {
   return (
     <div className="space-y-8" aria-busy="true" aria-label="Loading">
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
         <StatCardSkeleton button /><StatCardSkeleton /><StatCardSkeleton />
       </div>
+      <section><SectionHeading w="w-24" sub={false} /><TableSkeleton rows={4} widths={["w-4", "w-72", "w-28", "w-8", "w-10", "w-8", "w-14", "w-12", "w-28", "w-16"]} /></section>
       <section><SectionHeading w="w-24" sub={false} /><TableSkeleton rows={2} widths={["w-48", "w-20", "w-8", "w-8", "w-8", "w-28"]} /></section>
       <section><SectionHeading w="w-28" sub={false} /><TableSkeleton rows={4} widths={["w-80", "w-40", "w-24", "w-8", "w-8", "w-14"]} /></section>
       <section>

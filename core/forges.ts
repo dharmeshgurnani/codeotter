@@ -53,6 +53,8 @@ export interface PullRequest {
   url: string;
   author: { login: string };
   updatedAt: string;
+  // when the pull request was opened ("" when the server does not say)
+  createdAt?: string;
   baseRefName: string;
   headRefName: string;
   headRefOid: string;
@@ -73,6 +75,7 @@ interface PullRequestInput {
   url: string;
   author?: string;
   updatedAt?: string;
+  createdAt?: string;
   baseRefName?: string;
   headRefName?: string;
   headRefOid?: string;
@@ -312,7 +315,7 @@ const isBinary = (buf: Buffer) => buf.subarray(0, 8000).includes(0);
 // The normalized pull request every caller sees (the shape `gh pr view --json` gives for GitHub).
 const pullRequest = (o: PullRequestInput): PullRequest => ({
   number: o.number, title: o.title || "", body: o.body || "", url: o.url,
-  author: { login: o.author || "unknown" }, updatedAt: o.updatedAt || "",
+  author: { login: o.author || "unknown" }, updatedAt: o.updatedAt || "", createdAt: o.createdAt || "",
   baseRefName: o.baseRefName || "", headRefName: o.headRefName || "", headRefOid: o.headRefOid || "", headRepo: o.headRepo,
   additions: o.additions ?? (o.files || []).reduce((n, f) => n + f.additions, 0),
   deletions: o.deletions ?? (o.files || []).reduce((n, f) => n + f.deletions, 0),
@@ -332,7 +335,7 @@ const STATE: Record<string, Record<string, string>> = {
 interface GiteaUser { id?: number; login?: string; username?: string }
 interface GiteaLabel { name?: string }
 interface GiteaPull {
-  number: number; title?: string; body?: string; user?: GiteaUser; updated_at?: string;
+  number: number; title?: string; body?: string; user?: GiteaUser; updated_at?: string; created_at?: string;
   base?: { ref?: string }; head?: { ref?: string; sha?: string; repo?: { full_name?: string } };
   additions?: number; deletions?: number; changed_files?: number; merged?: boolean; state?: string; draft?: boolean; labels?: PrLabel[];
 }
@@ -365,7 +368,7 @@ function gitea(id: string, f: AuthedConfig): Forge {
   const r = (repo: string) => `repos/${native(repo)}`;
   const normalize = (p: GiteaPull, repo: string, files?: PrFile[], commits?: PrCommit[]) => pullRequest({
     number: p.number, title: p.title, body: p.body, url: `${f.url}/${native(repo)}/pulls/${p.number}`,
-    author: p.user?.login, updatedAt: p.updated_at,
+    author: p.user?.login, updatedAt: p.updated_at, createdAt: p.created_at,
     baseRefName: p.base?.ref, headRefName: p.head?.ref, headRefOid: p.head?.sha,
     // Fork head content lives in the fork, not in the base repository's branch namespace.
     headRepo: p.head?.repo?.full_name ? `${id}~${p.head.repo.full_name}` : repo,
@@ -502,7 +505,7 @@ const BB_API = "https://api.bitbucket.org/2.0";
 interface BbUser { nickname?: string; username?: string; display_name?: string; account_id?: string; uuid?: string }
 interface BbRepoRef { links?: { html?: { href?: string } }; full_name?: string }
 interface BbPull {
-  id: number; title?: string; description?: string; summary?: { raw?: string }; author?: BbUser; updated_on?: string;
+  id: number; title?: string; description?: string; summary?: { raw?: string }; author?: BbUser; updated_on?: string; created_on?: string;
   destination?: { branch?: { name?: string }; repository?: BbRepoRef };
   source?: { branch?: { name?: string }; repository?: BbRepoRef; commit?: { hash?: string } };
   state?: string; draft?: boolean;
@@ -546,7 +549,7 @@ function bitbucket(id: string, f: AuthedConfig): Forge {
     const src = nativeOf(p.source?.repository);
     return pullRequest({
       number: p.id, title: p.title, body: p.description || p.summary?.raw, url: `https://bitbucket.org/${native(repo)}/pull-requests/${p.id}`,
-      author: login(p.author), updatedAt: p.updated_on,
+      author: login(p.author), updatedAt: p.updated_on, createdAt: p.created_on,
       baseRefName: p.destination?.branch?.name, headRefName: p.source?.branch?.name,
       // the PR object carries a 12-character hash; the commit list has the full one
       headRefOid: commits?.length ? commits.at(-1)?.oid : p.source?.commit?.hash,
@@ -682,7 +685,7 @@ function bitbucket(id: string, f: AuthedConfig): Forge {
 interface DcUser { slug?: string; name?: string; id?: number }
 interface DcRepoRef { project?: { key?: string; type?: string }; slug?: string }
 interface DcPull {
-  id: number; title?: string; description?: string; author?: { user?: DcUser }; updatedDate?: number;
+  id: number; title?: string; description?: string; author?: { user?: DcUser }; updatedDate?: number; createdDate?: number;
   toRef?: { displayId?: string; repository?: DcRepoRef };
   fromRef?: { displayId?: string; latestCommit?: string; repository?: DcRepoRef };
   state?: string; draft?: boolean; version?: number;
@@ -723,7 +726,7 @@ function bitbucketdc(id: string, f: AuthedConfig): Forge {
     const src = nativeOf(p.fromRef?.repository);
     return pullRequest({
       number: p.id, title: p.title, body: p.description, url: `${f.url}/projects/${native(repo).split("/")[0]}/repos/${native(repo).split("/")[1]}/pull-requests/${p.id}`,
-      author: login(p.author?.user), updatedAt: iso(p.updatedDate),
+      author: login(p.author?.user), updatedAt: iso(p.updatedDate), createdAt: iso(p.createdDate),
       baseRefName: p.toRef?.displayId, headRefName: p.fromRef?.displayId, headRefOid: p.fromRef?.latestCommit,
       headRepo: src !== "/" && src !== native(repo) ? `${id}~${src}` : repo,
       files, commits, state: ({ OPEN: "OPEN", MERGED: "MERGED", DECLINED: "CLOSED" } as Record<string, string>)[String(p.state)] || String(p.state || "OPEN"), isDraft: !!p.draft,
@@ -918,7 +921,7 @@ function azure(id: string, f: AuthedConfig): Forge {
     const fork = repoOfPayload(p.forkSource?.repository);
     return pullRequest({
       number: p.pullRequestId, title: p.title, body: p.description, url: `${web(repo)}/pullrequest/${p.pullRequestId}`,
-      author: login(p.createdBy), updatedAt: p.closedDate || p.creationDate,
+      author: login(p.createdBy), updatedAt: p.closedDate || p.creationDate, createdAt: p.creationDate,
       baseRefName: branch(p.targetRefName), headRefName: branch(p.sourceRefName), headRefOid: p.lastMergeSourceCommit?.commitId,
       headRepo: fork ? `${id}~${fork}` : repo,
       files, commits, state: ({ active: "OPEN", completed: "MERGED", abandoned: "CLOSED" } as Record<string, string>)[String(p.status)] || "OPEN", isDraft: !!p.isDraft,
@@ -1170,7 +1173,7 @@ function azure(id: string, f: AuthedConfig): Forge {
 // nested groups, so the native part is group[/subgroup...]/project and goes to the API URL-encoded as one :id segment.
 interface GlUser { id?: number; username?: string; name?: string }
 interface GlMr {
-  iid: number; title?: string; description?: string; author?: GlUser; updated_at?: string; web_url?: string;
+  iid: number; title?: string; description?: string; author?: GlUser; updated_at?: string; created_at?: string; web_url?: string;
   target_branch?: string; source_branch?: string; sha?: string; last_commit?: { id?: string };
   source_project_id?: number; target_project_id?: number; state?: string; draft?: boolean; work_in_progress?: boolean;
   labels?: (string | { title?: string; name?: string })[]; diff_refs?: { base_sha?: string; start_sha?: string; head_sha?: string };
@@ -1215,7 +1218,7 @@ function gitlab(id: string, f: AuthedConfig): Forge {
   const label = (l: string | { title?: string; name?: string }) => (typeof l === "string" ? l : l?.title || l?.name || "");
   const normalize = (m: GlMr, repo: string, files?: PrFile[], commits?: PrCommit[]) => pullRequest({
     number: m.iid, title: m.title, body: m.description, url: `${web(repo)}/-/merge_requests/${m.iid}`,
-    author: m.author?.username, updatedAt: glDate(m.updated_at),
+    author: m.author?.username, updatedAt: glDate(m.updated_at), createdAt: glDate(m.created_at),
     baseRefName: m.target_branch, headRefName: m.source_branch, headRefOid: m.sha || m.last_commit?.id,
     headRepo: repo, files, commits,
     state: ({ opened: "OPEN", merged: "MERGED", closed: "CLOSED", locked: "OPEN" } as Record<string, string>)[String(m.state)] || "OPEN",

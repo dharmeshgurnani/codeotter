@@ -18,7 +18,8 @@ export interface Invite { id: string; provider: string; pb: string; login: strin
 export interface GithubAppSetting { id?: number | string; slug?: string; owner?: string; pem?: string; clientId?: string; clientSecret?: string; webhookSecret?: string; forwardSecret?: string; actionSecret?: string }
 export interface ModelSetting { provider?: string; model?: string; apiKey?: string; baseUrl?: string }
 export interface TriageSetting { auto: boolean; stopAt: number }
-export interface TriageResult { url: string; repo: string; headSha: string; at: string }
+// A stored triage: the scores, or the error of a failed run (review.ts TriageEntry).
+export interface TriageResult { url: string; repo: string; headSha: string; at: string; risk?: number; blast?: number; error?: string }
 export interface ReviewFailure { sha: string; at: number; tries: number; error: string }
 export interface WebhookDelivery { at: number; event: string; delivery: string }
 export interface GuideSetting { use?: boolean; learnings?: string[] }
@@ -37,6 +38,8 @@ export interface SettingsMap {
   s1: ModelSetting;
   triage: TriageSetting;
   triageResults: Record<string, TriageResult>;
+  // Review next: hours before an open pull request counts as overdue, per organization ("" = no organization); 0 or missing = off
+  reviewSla: Record<string, number>;
   autoReviewed: Record<string, string>;
   autoReviewFailed: Record<string, ReviewFailure>;
   commandsSeen: Record<string, string>;

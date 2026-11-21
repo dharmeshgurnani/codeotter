@@ -16,6 +16,7 @@ import { PR_TOOLS, runPrTool } from "../pr-tools.ts";
 import { reviewPrompts } from "../fix.ts";
 import type { ReviewRecord } from "../review.ts";
 import { homeData, renderScore, repoOf } from "../views.ts";
+import { reviewNext } from "../review-next.ts";
 import { analyticsData, periodOf, recordOutcome } from "../analytics.ts";
 import { settingsPages } from "../settings-pages.ts";
 import { assertRepo, checkRepoScope, requestOrg, seesAll, visibleRepos } from "../access.ts";
@@ -54,6 +55,9 @@ reviews.get("/home", review, async (c) => {
   if (org && !OWNER_RE.test(org)) throw new Error("Bad organization");
   return c.json(await homeData(org, c.get("viewer")));
 });
+
+// ?org=: the ranked Review next queue of the viewer's repositories in the organization (also a Home section).
+reviews.get("/review-next", review, async (c) => c.json(await reviewNext(requestOrg(c.req.query("org")), c.get("viewer"))));
 
 // ?org= and ?days= (7, 30 or 90): the Analytics report, scoped like Home.
 reviews.get("/analytics", review, async (c) => c.json(await analyticsData(requestOrg(c.req.query("org")), periodOf(c.req.query("days")), c.get("viewer"))));

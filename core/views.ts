@@ -8,6 +8,7 @@ import { seesAll, visibleRepos } from "./access.ts";
 import type { Viewer } from "./access.ts";
 import type { ReviewRecord } from "./review.ts";
 import type { Finding, Gate } from "./engines.ts";
+import { queueInputs, queueSection, rankQueue } from "./review-next.ts";
 
 // Report JSON drawn by web/src/components/json-report.tsx (kinds: stats, table, links, bars); cells are web/src/components/data-table.tsx's Cell.
 export type Tone = "ok" | "muted" | "warn" | "bad" | "info" | "accent";
@@ -185,6 +186,7 @@ export async function homeData(org = "", g: Viewer = { role: "owner" }): Promise
   const open = (await Promise.all(rs.map((r) => openPrs(r)))).flat();
   const waiting = open.filter((p) => !done.has(p.url));
   await llmConfig();
+  const next = queueSection(rankQueue(open, await queueInputs(all)));
   const week = all.filter((r) => Date.now() - Date.parse(r.at) < 7 * 864e5);
   const changes = all.filter((r) => r.review.verdict === "request_changes").length;
   const perRepo = (repo: string): Cell[] => {
@@ -205,6 +207,7 @@ export async function homeData(org = "", g: Viewer = { role: "owner" }): Promise
       { label: "Reviewed", value: all.length, unit: all.length === 1 ? "review" : "reviews", hint: `${week.length} in the last 7 days` },
       { label: "Average quality", value: all.length ? avg(all.map((r) => r.review.scores.quality)) : "–", unit: all.length ? "/ 100" : "", hint: all.length ? `${changes} with changes requested` : "No reviews yet" },
     ] },
+    next,
     { id: "repos", kind: "table", title: "Repositories", columns: ["Repository", "Waiting", "Reviewed", "Avg quality", "Avg blast", ""], rows: rs.map(perRepo), empty: admin ? "No repository yet. Use \"Add repository\" in the sidebar." : "No repository assigned to your account." },
     { id: "recent", kind: "table", title: "Recent reviews", columns: ["Pull request", "Repository", "Verdict", "Quality", "Blast", "Reviewed"],
       rows: all.slice(0, 8).map((r) => [
