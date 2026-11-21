@@ -9,7 +9,7 @@ import { askSystemOne, llmConfig, metered, newUsage, s1Config } from "./models.t
 import { estimateCost, recordEvent, reviewEvent } from "./analytics.ts";
 import { acceptedSuggestions, blastRadius, dynamicContextFiles, extendDiffContext, extractChangedSymbols, parseDiff, sliceOutsideDiffImpact } from "./diff.ts";
 import { relatedImpact, usableRelated } from "./related.ts";
-import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, getRepoAccepted, getRepoLearnings, effectiveRules, guideFor, headFileTexts, postable, REVIEW_DEFAULTS, reviewConfig, shaMatch } from "./context.ts";
+import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, getRepoAccepted, getRepoLearnings, effectiveRules, headFileTexts, headRulesRef, prGuide, postable, REVIEW_DEFAULTS, reviewConfig, shaMatch } from "./context.ts";
 import { changeDigest, confirmFixedFindings, deriveSuggestionFromDetail, judge, S1_SCORES, scoreWithSystemOne, verifyFindingsWithSystemOne } from "./engines.ts";
 import { formatReviewComment, formatScoresComment } from "./comments.ts";
 import { findingPrompt, hunkAt, promptDetails } from "./fix.ts";
@@ -21,7 +21,7 @@ import { runSandbox, sandboxConfig, sandboxPending } from "./sandbox.ts";
 import type { SandboxRun } from "./sandbox.ts";
 import { audit, AUTO, currentActor, orgOfRepo } from "./audit.ts";
 import type { BlastRadius, DiffContextStats, OutsideImpact } from "./diff.ts";
-import type { GitHistory, LinkedIssue, PullRequest } from "./context.ts";
+import type { GitHistory, LinkedIssue, PullRequest, RulesFromHead } from "./context.ts";
 import type { Finding, Gate, IncrementalCommit, IncrementalContext, Judgement, ScoreKey, Scores, Verdict, WalkthroughItem } from "./engines.ts";
 import type { S1Answers, S1Question } from "./models.ts";
 import type { TriageResult as StoredTriage } from "./store.ts";
@@ -51,6 +51,7 @@ export interface ReviewRecord {
   engines: { llm: string | null; s1: string | null };
   model: string;
   guide: string | null;
+  rulesFromHead?: RulesFromHead | null; // set when a same-repository head's rule files differ from the base's (context.ts)
   learnings: string[];
   linkedIssues: LinkedIssue[];
   gitHistory: GitHistory;
@@ -218,10 +219,9 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
   const runLlm = !part || part === "llm" || !cached || !cached.review?.summary;
   // Use cached PR metadata immediately on Re-review if available, or fetch non-blockingly via ghAsync
   const pr: PullRequest = cached?.pr || JSON.parse(await readPr(urlGuess, spec));
-  // .codeotter.json on the base branch (cached): its "checks" replace Repository settings' before the run starts; a
-  // broken file fails the review below, where the rest of the file applies.
-  const fileRules = effectiveRules(repoOf(pr), rc, pr);
-  const early = await fileRules.catch(() => null);
+  // .codeotter.json on the base branch, and in head mode merged with a same-repository head's (cached): its "checks"
+  // replace Repository settings' before the run starts; a broken file fails the review below, where the rest applies.
+  const early = await effectiveRules(repoOf(pr), rc, pr).catch(() => null);
   if (early?.checks) rc.checks = early.checks;
   // Custom checks are gates: System One answers them with the scores, else the language model in its review.
   const checks = customCount(rc.checks) ? rc.checks : [];
@@ -254,6 +254,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
     engines,
     model: modelLabel,
     guide: cached?.guide || null,
+    rulesFromHead: cached?.rulesFromHead || null,
     learnings: initialLearnings,
     linkedIssues: cached?.linkedIssues || [],
     gitHistory: cached?.gitHistory || { prCommits: Array.isArray(pr.commits) ? pr.commits.map((cm) => ({ sha: String(cm.oid || "").slice(0, 7), message: String(cm.messageHeadline || "").trim(), author: cm.authors?.[0]?.login || pr.author?.login || "" })) : [], baseCommits: [] },
@@ -276,16 +277,20 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
       // Refresh PR metadata in background if we started from cached.pr
       if (cached?.pr) live.pr = JSON.parse(await readPr(urlGuess, spec));
       if (publish) await checksStarted(repoOf(live.pr), live.pr.headRefOid || "", live.pr.url, checksRun ? customCount(checks) : 0).catch((e) => console.warn(`[checks] ${(e as Error).message}`));
-      const [rawDiff, guide, learnings] = await Promise.all([
+      const [rawDiff, guides, learnings, fileRules] = await Promise.all([
         readPr(urlGuess, spec, true),
-        Promise.resolve().then(() => guideFor(repoOf(live.pr), isForgeRepo(repoOf(live.pr)) ? live.pr.headRefOid : live.pr.headRefName, live.pr.headRepo || repoOf(live.pr))),
+        prGuide(repoOf(live.pr), live.pr, rc.rulesSource),
         getRepoLearnings(repoOf(pr)),
+        effectiveRules(repoOf(live.pr), rc, live.pr),
       ]);
+      const { guide } = guides;
       live.guide = guide?.file || null;
       live.learnings = learnings;
-      // .codeotter.json on the base branch wins over Repository settings for this review; excluded paths never reach a model
-      const { configFile: _file, ...rules } = await fileRules;
+      // .codeotter.json wins over Repository settings for this review; excluded paths never reach a model
+      const { configFile: _file, fromHead: configFromHead, ...rules } = fileRules;
       Object.assign(rc, rules);
+      const headFiles = [...guides.fromHead, ...(configFromHead?.files || [])];
+      live.rulesFromHead = headFiles.length ? { ref: headRulesRef(repoOf(live.pr), live.pr, rc.rulesSource), files: headFiles, ignored: configFromHead?.ignored || [] } : null;
       const filtered = filterDiff(rawDiff, rc).diff;
       let diff = filtered;
       if (rawDiff.trim() && !diff.trim()) throw new Error("Every changed file is excluded by the path filters");
@@ -539,6 +544,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
         engines,
         model: modelLabel,
         guide: guide?.file || null,
+        rulesFromHead: live.rulesFromHead || null,
         learnings,
         linkedIssues: live.linkedIssues || [],
         gitHistory: live.gitHistory,

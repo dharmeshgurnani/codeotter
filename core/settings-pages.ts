@@ -411,6 +411,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             { key: "resolveFixed", label: "Resolve fixed comments", type: "checkbox", text: "Resolve CodeOtter's inline comments that a later push fixed" },
             { key: "auto", label: "Auto-review", type: "checkbox", text: "Review every new or updated pull request and post the result (PRs labelled codeotter:skip are left alone)" },
             { key: "configFile", label: "Repository config", type: "readonly" },
+            { key: "rulesSource", label: "Rules source", type: "select", options: [{ value: "base", label: "Base branch" }, { value: "head", label: "Head branch (same-repository PRs)" }], hint: `${CONFIG_FILE}, AGENTS.md and CLAUDE.md. From the head: guides, new path instructions, new checks. Forks, skip rules, path filters and existing checks: always the base.` },
             { key: "reviewDrafts", label: "Draft pull requests", type: "checkbox", text: "Auto-review drafts" },
             { key: "skipAuthors", label: "Skip authors", type: "textarea", placeholder: "dependabot[bot]\nrenovate[bot]", hint: "One login per line, * wildcard." },
             { key: "skipLabels", label: "Skip labels", type: "textarea", placeholder: "no-review" },

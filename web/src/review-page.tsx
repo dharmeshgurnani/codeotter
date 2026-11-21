@@ -744,6 +744,11 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
           {r.guide && (
             <Badge tone="warn"><BookOpen className="size-3" /> Guidelines: {r.guide}</Badge>
           )}
+          {!!r.rulesFromHead?.files.length && (
+            <Badge tone="info" title={r.rulesFromHead.ignored.length ? `Ignored from head, base applies: ${r.rulesFromHead.ignored.join(", ")}` : undefined}>
+              rules from head <code className="font-mono">{r.rulesFromHead.ref.slice(0, 7)}</code>: {r.rulesFromHead.files.join(", ")}
+            </Badge>
+          )}
           {activeLearnings.length > 0 && (
             <Badge tone="accent" title={activeLearnings.join("\n")}>🧠 {activeLearnings.length} team learning{activeLearnings.length === 1 ? "" : "s"} active</Badge>
           )}

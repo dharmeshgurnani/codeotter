@@ -95,7 +95,7 @@ export const normalizeForgePr = (p: unknown, repo: string): PullRequest => forge
 export async function readPr(url: string, spec: string[], diff = false): Promise<string> {
   const parsed = parsePrUrl(url);
   if (!parsed) throw new Error("Invalid pull request URL");
-  if (!parsed.selfHosted) return ghAsync("pr", diff ? "diff" : "view", ...spec, ...(diff ? [] : ["--json", "number,title,body,author,url,baseRefName,headRefName,headRefOid,additions,deletions,changedFiles,files,commits,state"]));
+  if (!parsed.selfHosted) return ghAsync("pr", diff ? "diff" : "view", ...spec, ...(diff ? [] : ["--json", "number,title,body,author,url,baseRefName,headRefName,headRefOid,isCrossRepository,additions,deletions,changedFiles,files,commits,state"]));
   const { repo, number } = parsed;
   const forge = forgeOf(repo);
   return diff ? forge.diff(repo, number) : JSON.stringify(await forge.pr(repo, number));
