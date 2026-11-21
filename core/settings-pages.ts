@@ -1005,6 +1005,29 @@ const accountsPage: SettingsPage & { invite(v: Body): Promise<void> } = {
   },
 };
 SETTINGS_PAGES.accounts = accountsPage;
+// Review next (Home): hours before an open pull request counts as overdue, kept per organization.
+SETTINGS_PAGES.queue = {
+  title: "Review queue",
+  group: "workspace",
+  access: "admin",
+  async load({ org = "" } = {}) {
+    const sla = (await store.getSetting("reviewSla")) || {};
+    return {
+      sections: [{ id: "queue", title: "Review next", fields: [{ key: "slaHours", label: "Review SLA (hours)", type: "number", min: 0, max: 8760, step: 1, hint: "Open pull requests older than this are overdue. 0: off." }], actions: [{ id: "save", label: "Save" }] }],
+      values: { queue: { slaHours: sla[org] ?? 0 } },
+    };
+  },
+  async save(body, { org = "" } = {}) {
+    if (!body.queue) return;
+    const raw = rec(body.queue).slaHours;
+    const hours = raw === "" || raw === null || raw === undefined ? 0 : Number(raw);
+    if (!Number.isInteger(hours) || hours < 0 || hours > 8760) throw new Error("Review SLA: whole hours, 0 to 8760");
+    const sla = { ...((await store.getSetting("reviewSla")) || {}) };
+    if (hours) sla[org] = hours;
+    else delete sla[org];
+    await store.setSetting("reviewSla", sla);
+  },
+};
 SETTINGS_PAGES.audit = auditPage;
 // Local models page: what is downloaded, what is available, one action per row. Nothing downloads by itself.
 // What a running sidecar reports as its device, as GPU or CPU: laya and llama.cpp say vulkan:N / VulkanN / cuda /

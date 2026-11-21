@@ -317,7 +317,7 @@ const ISSUE_REF_RE = /(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|#)\s*(?:([a
 const STANDALONE_ISSUE_RE = /(?:^|[^\w/])(?:([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+))?#(\d+)\b/g;
 const BRANCH_ISSUE_RE = /(?:^|[/_-])(?:issue|fix|bug|feat|closes|resolves|gh)[/_-]?(\d+)\b|^(\d+)[/_-]/gi;
 
-function parseLinkedIssueRefs(baseRepo: string, pr: Partial<Pick<PullRequest, "number" | "title" | "body" | "headRefName">> | null | undefined): { repo: string; number: number }[] {
+export function parseLinkedIssueRefs(baseRepo: string, pr: Partial<Pick<PullRequest, "number" | "title" | "body" | "headRefName">> | null | undefined): { repo: string; number: number }[] {
   if (!baseRepo || !REPO_RE.test(baseRepo)) return [];
   const seen = new Set<string>();
   const out: { repo: string; number: number }[] = [];
