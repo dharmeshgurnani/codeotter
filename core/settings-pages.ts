@@ -17,6 +17,7 @@ import { clearTicketCache, jiraBase, LINEAR_API, testJira, testLinear, trackerKe
 import { accessQueue, allowed, effectiveRole, emailDomainAllowed, isEmailDomain, isRole, onboardedRepo, ROLES, SSO_PB, userView } from "./access.ts";
 import { auditPage, auditRepos } from "./audit.ts";
 import type { Access, Role, SessionUser } from "./access.ts";
+import { RELATED_MAX, relatedChoices, validateRelated } from "./related.ts";
 import type { Cell, CellObject, Tone } from "./views.ts";
 import type { OAuthProviderConfig, SsoSetting } from "./store.ts";
 import type { ProviderDef } from "./providers.ts";
@@ -387,7 +388,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
     access: "admin",
     async load({ org = "", repo = "" } = {}) {
       await onboardedRepo(repo, org);
-      const [rc, files, guides, rules, accepted, configFile, sbx, docker] = await Promise.all([reviewConfig(repo), guideFiles(repo), store.getSetting("guides"), repoRules(repo), getRepoAccepted(repo),
+      const [rc, files, guides, rules, accepted, onboarded, configFile, sbx, docker] = await Promise.all([reviewConfig(repo), guideFiles(repo), store.getSetting("guides"), repoRules(repo), getRepoAccepted(repo), repos(),
         repoConfigFile(repo).then((f) => (f ? `${CONFIG_FILE} on the default branch sets ${Object.keys(f).join(", ") || "nothing"}; those keys override the fields below` : `No ${CONFIG_FILE} at the root`), (e: Error) => e.message), sandboxConfig(repo), dockerStatus()]);
       // One section, one Save: review settings, guidelines and learnings are all this repository's.
       const sections: Section[] = [
@@ -433,6 +434,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
               hint: "A failed Block check fails codeotter/checks (a check run where the GitHub App is installed, else a commit status); Warn failures pass it with a note.",
             },
             { key: "overrides", label: "Check overrides", type: "checkbox", text: "Requested reviewers may override failing checks with /override <check|all> <reason>; never the PR author" },
+            { key: "related", label: "Related repositories", type: "multiselect", options: relatedChoices(repo, onboarded).map((value) => ({ value, label: repoLabel(value) })), hint: `Up to ${RELATED_MAX}, same organization and provider. Reviews search them for usages of changed exported symbols.` },
             files.length ? { key: "useGuides", label: "Review guidelines", type: "checkbox", text: `Follow ${files.join(" + ")}` } : { key: "noGuides", label: "Review guidelines", type: "readonly" },
             { key: "autoLearn", label: "Auto-promote suggested rules", type: "checkbox", text: "Switch a suggested rule on by itself once enough similar findings were pushed back on (off: suggest only)" },
             { key: "promoteAfter", label: "Promote after", type: "select", options: PROMOTE_AFTER.map((v) => ({ value: v, label: `${v} findings pushed back on` })) },
@@ -504,6 +506,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
       }
       if (!body.repo) return;
       const v = rec(body.repo);
+      if ("related" in v) v.related = validateRelated(repo, v.related, await repos());
       const [guides0, rs0, current] = await Promise.all([store.getSetting("guides"), store.getSetting("repoSettings"), reviewConfig(repo)]);
       // Only what was sent changes. Review keys merge over the current values. Lists apply removals only: items the
       // page loaded (`loadedLearnings` / `loadedAccepted`) and no longer sends are dropped from the current list, so a

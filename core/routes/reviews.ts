@@ -21,6 +21,8 @@ import { analyticsData, periodOf, recordOutcome } from "../analytics.ts";
 import { settingsPages } from "../settings-pages.ts";
 import { assertRepo, checkRepoScope, requestOrg, seesAll, visibleRepos } from "../access.ts";
 import { audit, orgOfRepo } from "../audit.ts";
+import { forViewer } from "../related.ts";
+import type { Viewer } from "../access.ts";
 import { gate, jsonBody } from "./middleware.ts";
 import type { Env } from "./middleware.ts";
 
@@ -35,6 +37,8 @@ const parsed = (url: string | null) => {
 // A posted finding's severity from the request ("low" when it is not one of ours).
 const SEVERITIES: readonly Severity[] = ["high", "medium", "low", "nit"];
 const severityOf = (v: unknown): Severity => SEVERITIES.find((x) => x === v) || "low";
+// A review as this viewer may see it: related-repository context only from repositories the viewer can see.
+const shownTo = async <R extends Parameters<typeof forViewer>[0]>(g: Viewer, r: R): Promise<R> => (r ? forViewer(r, seesAll(g) ? null : await visibleRepos(g)) : r);
 // A review whose findings a learning can mark dismissed.
 type Dismissable = { review?: { findings?: { file?: string; title?: string; dismissed?: boolean }[] } };
 
@@ -116,7 +120,7 @@ reviews.post("/learnings", review, async (c) => {
       if (live) live.state = markDismissed(live.state);
     }
   }
-  return c.json({ ok: true, learnings, review: updatedReview });
+  return c.json({ ok: true, learnings, review: updatedReview && (await shownTo(g, updatedReview)) });
 });
 
 reviews.get("/tools", review, (c) => c.json(Object.entries(PR_TOOLS).map(([id, t]) => ({ id, label: t.label, input: ("input" in t && t.input) || null, apply: ("applyLabel" in t && t.applyLabel) || null }))));
@@ -224,9 +228,10 @@ export async function scoreResult(c: Context<Env>) {
   checkRepoScope(parsed(resolved.urlGuess).repo, requestOrg(c.req.query("org")));
   await assertRepo(c.get("viewer"), parsed(resolved.urlGuess).repo);
   // the review page's "Copy fix prompt" actions read agentPrompts
-  const withPrompts = (r: ReviewRecord) => ({ ...r, agentPrompts: reviewPrompts(r, parsed(resolved.urlGuess).repo) });
-  if (c.req.path === "/api/score" && c.req.query("async") !== undefined) return c.json(withPrompts(await startOrPollReview(ref, force, repo, c.req.query("part") || "")));
+  const g = c.get("viewer");
+  const withPrompts = async (r: ReviewRecord) => ({ ...(await shownTo(g, r)), agentPrompts: reviewPrompts(r, parsed(resolved.urlGuess).repo) });
+  if (c.req.path === "/api/score" && c.req.query("async") !== undefined) return c.json(await withPrompts(await startOrPollReview(ref, force, repo, c.req.query("part") || "")));
   const result = await score(ref, force, repo);
-  return c.req.path === "/api/score" ? c.json(withPrompts(result)) : c.html(renderScore(result));
+  return c.req.path === "/api/score" ? c.json(await withPrompts(result)) : c.html(renderScore(await shownTo(g, result)));
 }
 reviews.get("/score", review, scoreResult);

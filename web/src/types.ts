@@ -34,13 +34,17 @@ export type Review = {
     newCommits: { sha: string; message: string; author?: string }[];
     resolvedFindings?: Finding[];
   };
-  blast: { score: number; files: number; lines: number; dirs: number; hotspots: string[]; testFiles: number; outsideCallers?: number; outsideFiles?: number; source?: "s1" };
+  blast: { score: number; files: number; lines: number; dirs: number; hotspots: string[]; testFiles: number; outsideCallers?: number; outsideFiles?: number; relatedCallers?: number; relatedRepos?: number; source?: "s1" };
   outsideDiffImpact?: {
     symbols: string[];
     callers: { symbol: string; file: string; line: number; snippet: string }[];
     outsideCallers: number;
     uniqueFiles: number;
     formatted: string;
+    // related repositories (Repository settings), already filtered to what this viewer may see
+    related?: { repo: string; status: "ok" | "unsupported" | "failed" | "timeout" | "skipped"; callers: number; files: number; cached?: boolean; error?: string }[];
+    relatedCallers?: { repo?: string; symbol: string; file: string; line: number; snippet: string }[];
+    relatedHidden?: number;
   };
   review: {
     summary: string;

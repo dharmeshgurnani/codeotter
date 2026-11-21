@@ -51,6 +51,9 @@ export interface ReviewSettings extends RepoRules {
   promoteAfter: number;
   ruleMinSamples: number;
   ruleMinFixRate: number;
+  // Related repositories searched for callers of changed exported symbols (core/related.ts): onboarded, same
+  // organization and provider, at most RELATED_MAX. Validated on save; filtered again at review time.
+  related: string[];
 }
 // A custom pre-merge check: a yes/no question (yes = pass) asked of the model owning the gates. "block" failures fail the
 // codeotter/checks commit status; "warn" failures only show; "off" is kept but not asked.
@@ -66,7 +69,7 @@ export interface GitHistory { prCommits: GitCommit[]; baseCommits: BaseCommit[];
 export interface LinkedIssue { number: number; key?: string; repo: string; title: string; body: string; state: string; url: string; labels: string[]; }
 export const issueLabel = (i: Pick<LinkedIssue, "number" | "key">): string => i.key || `#${i.number}`;
 
-export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, resolveFixed: true, commands: true, overrides: false, auto: true, agentPrompts: true, gitleaks: false, semgrep: false, trivy: false, autoLearn: false, promoteAfter: 3, ruleMinSamples: 5, ruleMinFixRate: 20, profile: "balanced", minSeverity: "nit", checks: [], ...RULE_DEFAULTS };
+export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, resolveFixed: true, commands: true, overrides: false, auto: true, agentPrompts: true, gitleaks: false, semgrep: false, trivy: false, related: [], autoLearn: false, promoteAfter: 3, ruleMinSamples: 5, ruleMinFixRate: 20, profile: "balanced", minSeverity: "nit", checks: [], ...RULE_DEFAULTS };
 // Review strictness: a profile supplies the defaults for maxFindings and reflectMin (values set explicitly still win)
 // and the tone of the language-model instructions (engines.ts).
 export type ReviewProfile = "chill" | "balanced" | "assertive";
@@ -135,6 +138,7 @@ export const normalizeReview = (v: { [K in keyof ReviewSettings]?: unknown }): R
   promoteAfter: PROMOTE_AFTER.includes(Number(v.promoteAfter)) ? Number(v.promoteAfter) : REVIEW_DEFAULTS.promoteAfter,
   ruleMinSamples: RULE_MIN_SAMPLES.includes(Number(v.ruleMinSamples)) ? Number(v.ruleMinSamples) : REVIEW_DEFAULTS.ruleMinSamples,
   ruleMinFixRate: RULE_MIN_FIX_RATE.includes(Number(v.ruleMinFixRate)) ? Number(v.ruleMinFixRate) : REVIEW_DEFAULTS.ruleMinFixRate,
+  related: [...new Set((Array.isArray(v.related) ? (v.related as unknown[]) : []).map(String))].filter((r) => REPO_RE.test(r)).slice(0, 7),
 });
 export const PROMOTE_AFTER = [2, 3, 5, 8];
 export const RULE_MIN_SAMPLES = [3, 5, 10, 20];

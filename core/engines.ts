@@ -121,6 +121,15 @@ function s1State(pr: PullRequest, diff: string, c: S1Config, guide: Guide | null
           },
         }
       : {}),
+    ...(outsideImpact?.relatedCallers?.length
+      ? {
+          cross_repository_usages: {
+            usages: outsideImpact.relatedCallers.length,
+            repositories: new Set(outsideImpact.relatedCallers.map((c) => c.repo)).size,
+            sampled_usages: outsideImpact.relatedCallers.slice(0, 6).map((c) => `${c.repo}:${c.file}${c.line ? `:${c.line}` : ""} (${c.symbol})`),
+          },
+        }
+      : {}),
     ...(incrementalCtx?.summaryText ? { incremental_review_delta: incrementalCtx.summaryText } : {}),
     ...(linkedIssues?.length
       ? {
@@ -484,7 +493,9 @@ export function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSet
   const checksBlock = checks.length
     ? `\nRepository pre-merge checks (answer each from the diff and description in "checks": true = yes, false = no):\n${checks.map((g) => `- ${g.id}: ${g.q}`).join("\n")}\n`
     : "";
-  const outsideBlock = outsideImpact?.formatted ? `\n${outsideImpact.formatted}\n` : "";
+  // cross-repository usages: a tenth of a local model's context, else up to 6000 characters
+  const related = (outsideImpact?.relatedFormatted || "").slice(0, c.contextChars ? Math.floor(c.contextChars / 10) : 6000);
+  const outsideBlock = [outsideImpact?.formatted, related].filter(Boolean).map((b) => `\n${b}\n`).join("");
   const issueBlock = linkedIssues?.length
     ? `\nLinked Issues & Requirements (MANDATORY: explicitly verify whether the pull request diff fulfills all requirements and acceptance criteria described in these linked issues, and flag any unfulfilled or partially met requirement in findings):\n${linkedIssues
         .map((iss) => `Issue ${issueLabel(iss)} (${iss.repo}, ${iss.state}): ${iss.title}${iss.labels?.length ? ` [${iss.labels.join(", ")}]` : ""}\n${(iss.body || "(no body provided)").slice(0, 1200)}`)

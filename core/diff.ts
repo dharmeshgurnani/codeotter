@@ -7,9 +7,18 @@ import type { PrFile } from "./forges.ts";
 
 // A changed file as gh (and the forge adapters) list it on a pull request.
 export type ChangedFile = PrFile;
-export interface OutsideCaller { symbol: string; file: string; line: number; snippet: string; }
-export interface OutsideImpact { symbols: string[]; callers: OutsideCaller[]; outsideCallers: number; uniqueFiles: number; formatted: string; }
-export interface BlastRadius { score: number; files: number; lines: number; dirs: number; hotspots: string[]; testFiles: number; outsideCallers: number; outsideFiles: number; }
+// `repo` is set on callers found in a related repository (core/related.ts); same-repository callers have none.
+export interface OutsideCaller { symbol: string; file: string; line: number; snippet: string; repo?: string; }
+// Related-repository search outcome, one per related repository (core/related.ts).
+export type RelatedStatus = "ok" | "unsupported" | "failed" | "timeout" | "skipped";
+export interface RelatedRepoResult { repo: string; status: RelatedStatus; callers: number; files: number; cached?: boolean; error?: string; }
+export interface OutsideImpact {
+  symbols: string[]; callers: OutsideCaller[]; outsideCallers: number; uniqueFiles: number; formatted: string;
+  // Context from related repositories (Repository settings): callers by repository, their prompt block, and how many
+  // callers the viewer may not see (set at render time, never stored).
+  related?: RelatedRepoResult[]; relatedCallers?: OutsideCaller[]; relatedFormatted?: string; relatedHidden?: number;
+}
+export interface BlastRadius { score: number; files: number; lines: number; dirs: number; hotspots: string[]; testFiles: number; outsideCallers: number; outsideFiles: number; relatedCallers?: number; relatedRepos?: number; }
 // parseDiff: a hunk header with its body lines, and a file as header lines and hunks in order.
 export interface DiffHunk { old: number; oldN: number; new: number; newN: number; heading: string; lines: string[]; }
 export interface ParsedDiffFile { file: string; parts: (string | DiffHunk)[]; }
@@ -28,7 +37,11 @@ export const HOTSPOTS: [string, RegExp][] = [
   ["CI / deploy", /\.github\/|railway\.json|Dockerfile|docker-compose|\.gitlab-ci/],
 ];
 
-function extractChangedSymbols(diff: string): string[] {
+// A changed line that declares a symbol other code can import: export/pub/public, a capitalised Go func, or a
+// top-level Python def without a leading underscore.
+const EXPORTED_RE = /^(?:\s*(?:export|pub(?:\([^)]*\))?|public)\s|\s*func\s+(?:\([^)]+\)\s*)?[A-Z]|def\s+[a-zA-Z])/;
+// Symbols declared on changed lines; `exportedOnly` keeps those declared on an exported line.
+export function extractChangedSymbols(diff: string, exportedOnly = false): string[] {
   const symbols = new Set<string>();
   const defRegexes = [
     /(?:export\s+)?(?:async\s+)?function\s+([a-zA-Z0-9_$]+)/g,
@@ -49,6 +62,7 @@ function extractChangedSymbols(diff: string): string[] {
   for (const line of diff.split("\n")) {
     if ((line.startsWith("+") || line.startsWith("-")) && !line.startsWith("+++") && !line.startsWith("---")) {
       const code = line.slice(1);
+      if (exportedOnly && !EXPORTED_RE.test(code)) continue;
       for (const re of defRegexes) {
         for (const match of code.matchAll(re)) {
           const sym = match[1];
@@ -127,15 +141,16 @@ export async function sliceOutsideDiffImpact(repo: string, diff: string, changed
   return { symbols, callers, outsideCallers: callers.length, uniqueFiles: uniqueFiles.size, formatted };
 }
 
-export function blastRadius(files: ChangedFile[], outsideCallers = 0, outsideFiles = 0): BlastRadius {
+// `related`: callers found in related repositories (and in how many of them), weighted like outside callers.
+export function blastRadius(files: ChangedFile[], outsideCallers = 0, outsideFiles = 0, related: { callers: number; repos: number } = { callers: 0, repos: 0 }): BlastRadius {
   const lines = files.reduce((n, f) => n + f.additions + f.deletions, 0);
   const dirs = new Set(files.map((f) => f.path.split("/").slice(0, 3).join("/")));
   const hot = HOTSPOTS.filter(([, re]) => files.some((f) => re.test(f.path))).map(([n]) => n);
   const tests = files.filter((f) => /test|spec|__tests__/.test(f.path)).length;
   // Upgraded with real outside-diff call-graph fan-out (Smart Context impact slicing)
-  const callerImpact = Math.min(25, outsideCallers * 4 + outsideFiles * 2);
+  const callerImpact = Math.min(25, outsideCallers * 4 + outsideFiles * 2 + related.callers * 3 + related.repos * 4);
   const score = Math.min(100, Math.min(30, files.length * 2.5) + Math.min(25, lines / 30) + Math.min(25, hot.length * 10) + callerImpact);
-  return { score: Math.round(score), files: files.length, lines, dirs: dirs.size, hotspots: hot, testFiles: tests, outsideCallers, outsideFiles };
+  return { score: Math.round(score), files: files.length, lines, dirs: dirs.size, hotspots: hot, testFiles: tests, outsideCallers, outsideFiles, ...(related.callers ? { relatedCallers: related.callers, relatedRepos: related.repos } : {}) };
 }
 
 // <dynamic-context>

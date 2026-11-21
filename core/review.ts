@@ -7,7 +7,8 @@ import { CHECKS_CONTEXT, checksFailed, checksFinished, checksStarted, keptOverri
 import type { CheckOverride, StatusState } from "./merge-checks.ts";
 import { askSystemOne, llmConfig, metered, newUsage, s1Config } from "./models.ts";
 import { estimateCost, recordEvent, reviewEvent } from "./analytics.ts";
-import { acceptedSuggestions, blastRadius, dynamicContextFiles, extendDiffContext, parseDiff, sliceOutsideDiffImpact } from "./diff.ts";
+import { acceptedSuggestions, blastRadius, dynamicContextFiles, extendDiffContext, extractChangedSymbols, parseDiff, sliceOutsideDiffImpact } from "./diff.ts";
+import { relatedImpact, usableRelated } from "./related.ts";
 import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, getRepoAccepted, getRepoLearnings, effectiveRules, guideFor, headFileTexts, postable, REVIEW_DEFAULTS, reviewConfig, shaMatch } from "./context.ts";
 import { changeDigest, confirmFixedFindings, deriveSuggestionFromDetail, judge, S1_SCORES, scoreWithSystemOne, verifyFindingsWithSystemOne } from "./engines.ts";
 import { formatReviewComment, formatScoresComment } from "./comments.ts";
@@ -319,8 +320,16 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
         : Promise.resolve(null);
 
       const outsideImpact = await sliceOutsideDiffImpact(repoOf(live.pr), diff, (live.pr.files || []).map((f) => f.path));
+      // Related repositories (Repository settings): usages of the changed exported symbols, never failing the review
+      const relatedList = rc.related.length ? usableRelated(repoOf(live.pr), rc.related, await repos()) : [];
+      if (relatedList.length) {
+        const exported = extractChangedSymbols(diff, true);
+        Object.assign(outsideImpact, await relatedImpact(relatedList, exported.length ? exported : outsideImpact.symbols, live.pr.headRefOid || initialHeadSha)
+          .catch((e: Error) => ({ related: relatedList.map((r) => ({ repo: r, status: "failed" as const, callers: 0, files: 0, error: e.message })), relatedCallers: [], relatedFormatted: "" })));
+      }
       live.outsideDiffImpact = outsideImpact;
-      const fb = blastRadius(live.pr.files, outsideImpact.outsideCallers, outsideImpact.uniqueFiles);
+      const relCallers = outsideImpact.relatedCallers || [];
+      const fb = blastRadius(live.pr.files, outsideImpact.outsideCallers, outsideImpact.uniqueFiles, { callers: relCallers.length, repos: new Set(relCallers.map((x) => x.repo)).size });
       const keepScore = !runScores || live.blast.source === "s1";
       live.blast = { ...fb, ...(keepScore ? { score: live.blast.score, source: live.blast.source || prevBlast?.source || "s1" } : {}) };
       const [gitHistory, linkedIssues] = await Promise.all([
