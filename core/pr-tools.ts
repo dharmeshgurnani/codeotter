@@ -11,7 +11,9 @@ import { CATCH_UP_EVERY, HANDLED_COMMENTS, lastCatchUp, remember, webhookHealthy
 import { repoOf } from "./views.ts";
 import { fixFindings, hunkAt } from "./fix.ts";
 import { overrideChecks } from "./merge-checks.ts";
+import { countReactions } from "./forges.ts";
 import type { ForgeComment, ThreadComment } from "./forges.ts";
+import { noteReply } from "./learned.ts";
 import { audit, orgOfRepo, withActor } from "./audit.ts";
 import type { Guide, PullRequest, ReviewSettings } from "./context.ts";
 import type { Finding } from "./engines.ts";
@@ -311,14 +313,14 @@ function githubThreads(raw: unknown): ThreadComment[][] {
     const t: ThreadComment = {
       id: Number(c.id), body: String(c.body || ""), created_at: String(c.created_at || ""), user: { id: Number(user.id) || 0, login },
       bot: user.type === "Bot" || /\[bot\]$/.test(login), path: c.path, line: Number(c.line ?? c.original_line) || 0, hunk: String(c.diff_hunk || ""),
-      author_association: String(c.author_association || ""),
+      author_association: String(c.author_association || ""), reactions: countReactions(c.reactions),
     };
     const key = String(Number(c.in_reply_to_id) || t.id);
     threads.set(key, [...(threads.get(key) || []), t]);
   }
   return [...threads.values()].map((t) => t.sort((a, b) => a.created_at.localeCompare(b.created_at) || Number(a.id) - Number(b.id)));
 }
-async function reviewThreads(repo: string, number: number): Promise<ThreadComment[][]> {
+export async function reviewThreads(repo: string, number: number): Promise<ThreadComment[][]> {
   if (isForgeRepo(repo)) return forgeOf(repo).reviewThreads?.(repo, number) ?? [];
   return githubThreads(JSON.parse(await ghAsync("api", "--paginate", "--slurp", `repos/${repo}/pulls/${number}/comments?per_page=100`)));
 }
@@ -357,6 +359,7 @@ async function answerThread(repo: string, number: number, t: ThreadComment[]) {
   const rule = remembered ? oneLine(remembered[1], 300).replace(/`/g, "") : "";
   if (rule) {
     await setRepoLearnings(repo, [...(await getRepoLearnings(repo)), rule]);
+    await noteReply(repo, prUrlFor(repo, number), root.body);
     return replyInThread(repo, number, root, `🦦 Saved as a team learning for this repository: ${proseOf(rule, 300)}`);
   }
   const c = await llmConfig();
@@ -382,6 +385,8 @@ ${plain(last.body, 3000)}`, "a thread reply");
     const answer = proseOf(out.answer, 4000);
     if (!answer) throw new Error(`${c.provider}/${c.model} returned no reply`);
     const learning = out.dismissed === true ? oneLine(proseOf(out.learning, 300), 300).replace(/`/g, "'") : "";
+    // the model read the reply as pushback: signal for learned rules
+    if (out.dismissed === true) await noteReply(repo, prUrlFor(repo, number), root.body);
     await replyInThread(repo, number, root, learning ? `${answer}\n\nTo keep this as a team learning, reply \`@codeotter remember ${learning}\`` : answer);
   } catch (e) {
     await Promise.resolve(replyInThread(repo, number, root, `🦦 CodeOtter could not answer: ${oneLine((e as Error).message, 500)}`)).catch(() => {});

@@ -274,6 +274,7 @@ test("GitLab adapter and webhooks", async (ctx) => {
         answerReplies: async (repo: string, n: number, commentId: string) => { calls.push(["replies", repo, n, commentId]); return 1; },
         AUTO: { id: "auto", name: "auto" },
         withActor: (_actor: unknown, fn: () => unknown) => fn(),
+        collectFeedback: async () => 0,
         effectiveRules: async (_repo: string, ui: object) => ui,
         skipReason: () => "",
       };

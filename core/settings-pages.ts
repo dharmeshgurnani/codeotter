@@ -7,7 +7,9 @@ import { downloadModel, downloads, ensureRuntime, findPython, localStatus, sidec
 import { PB_URL, store } from "./store.ts";
 import { applyGithubToken, appPostingActive, cleanRepo, forgeApi, forgeId, forgeOf, ghAsync, isForgeRepo, nativeRepo, repoLabel, repos, repositoryChoices } from "./git.ts";
 import { askModel, askSystemOne, llmConfig, s1Config } from "./models.ts";
-import { getRepoAccepted, getRepoLearnings, guideCache, guideFiles, normalizeLearningList, repoConfigFile, REVIEW_DEFAULTS, reviewConfig, storedReview } from "./context.ts";
+import { getRepoAccepted, getRepoLearnings, guideCache, guideFiles, normalizeLearningList, PROMOTE_AFTER, repoConfigFile, REVIEW_DEFAULTS, reviewConfig, RULE_MIN_FIX_RATE, RULE_MIN_SAMPLES, storedReview } from "./context.ts";
+import { repoRules, ruleAction } from "./learned.ts";
+import type { RuleAction, RuleRow } from "./learned.ts";
 import { triageConfig } from "./review.ts";
 import { actionSecret, describeDelivery, forwarderStatus, LOCAL_APP_URL, reposChanged, syncForwarders, webhookUrl } from "./queue.ts";
 import { repoOf } from "./views.ts";
@@ -59,7 +61,7 @@ export type PageScope = { org?: string; repo?: string };
 export type Body = Record<string, unknown>;
 export type CookieWriter = { setCookie(name: string, value: string, maxAgeSeconds: number): void };
 export type ActionResult = { message: string } | { submit: { url: string; fields: Record<string, string> } };
-export type PageAction = (body: Body, http: CookieWriter) => Promise<ActionResult>;
+export type PageAction = (body: Body, http: CookieWriter, scope?: PageScope) => Promise<ActionResult>;
 export interface SettingsPage {
   title: string;
   group: SettingsGroup;
@@ -77,6 +79,28 @@ const isObj = (x: unknown): x is Record<string, unknown> => !!x && typeof x === 
 // A body field read as an object (anything else has no fields) or as a list.
 const rec = (x: unknown): Record<string, unknown> => (isObj(x) ? x : {});
 const arr = (x: unknown): unknown[] => (Array.isArray(x) ? x : []);
+// One learned rule as a Learnings table row. Every action is shown; those that do not apply are disabled.
+const RULE_TONE: Record<RuleRow["status"], Tone> = { active: "ok", off: "muted", locked: "info", suggested: "warn" };
+function ruleTableRow(r: RuleRow): Row {
+  const live = r.status === "active" || r.status === "locked";
+  const actions: (Action & { id: RuleAction })[] = [
+    { id: "accept", label: "Accept", disabled: r.status !== "suggested" },
+    { id: "remove", label: r.status === "suggested" ? "Reject" : "Remove", variant: "outline", danger: r.status !== "suggested" },
+    { id: "lock", label: r.status === "locked" ? "Unlock" : "Lock", variant: "outline", disabled: !live },
+    { id: "switch", label: r.status === "off" ? "Switch on" : "Switch off", variant: "outline", disabled: r.status === "suggested" || r.status === "locked" },
+  ];
+  return {
+    id: r.id,
+    label: r.text,
+    cells: {
+      rule: r.source === "model" && r.support ? { text: r.text, info: `Drafted by the model from ${r.support} finding${r.support === 1 ? "" : "s"} pushed back on` } : r.text,
+      status: { text: r.status, tone: RULE_TONE[r.status] },
+      fixed: r.fixed, ignored: r.ignored, dismissed: r.dismissed,
+      reactions: `${r.up} / ${r.down}`,
+    },
+    actions,
+  };
+}
 // The table row the UI marked as edited, if any.
 const editedRow = (table: unknown, ok: (r: Record<string, unknown>) => boolean) => arr(rec(table).rows).find((r): r is Record<string, unknown> => isObj(r) && !!r.edited && ok(r));
 
@@ -336,6 +360,8 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
       await store.setSetting("repos", next);
       await auditRepos(before, next);
       reposChanged(before, next).catch((e) => console.warn(`[repos] ${e.message}`));
+      // a removed repository's learned rules and signal go with its learnings
+      for (const r of before.filter((x) => !next.includes(x))) if (await store.getSetting(`learned:${r}`)) await store.setSetting(`learned:${r}`, { signals: [], rules: {} });
       const [guides, repoSettings] = await Promise.all([
         store.getSetting("guides").then((x) => ({ ...(x || {}) })),
         store.getSetting("repoSettings").then((x) => ({ ...(x || {}) })),
@@ -360,7 +386,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
     access: "admin",
     async load({ org = "", repo = "" } = {}) {
       await onboardedRepo(repo, org);
-      const [rc, files, guides, learnings, accepted, configFile] = await Promise.all([reviewConfig(repo), guideFiles(repo), store.getSetting("guides"), getRepoLearnings(repo), getRepoAccepted(repo),
+      const [rc, files, guides, rules, accepted, configFile] = await Promise.all([reviewConfig(repo), guideFiles(repo), store.getSetting("guides"), repoRules(repo), getRepoAccepted(repo),
         repoConfigFile(repo).then((f) => (f ? `${CONFIG_FILE} on the default branch sets ${Object.keys(f).join(", ") || "nothing"}; those keys override the fields below` : `No ${CONFIG_FILE} at the root`), (e: Error) => e.message)]);
       // One section, one Save: review settings, guidelines and learnings are all this repository's.
       const sections: Section[] = [
@@ -407,10 +433,19 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             },
             { key: "overrides", label: "Check overrides", type: "checkbox", text: "Requested reviewers may override failing checks with /override <check|all> <reason>; never the PR author" },
             files.length ? { key: "useGuides", label: "Review guidelines", type: "checkbox", text: `Follow ${files.join(" + ")}` } : { key: "noGuides", label: "Review guidelines", type: "readonly" },
-            { key: "learnings", label: "Team learnings", type: "list", hint: "Dismissed findings, kept as rules for this repository." },
+            { key: "autoLearn", label: "Auto-promote suggested rules", type: "checkbox", text: "Switch a suggested rule on by itself once enough similar findings were pushed back on (off: suggest only)" },
+            { key: "promoteAfter", label: "Promote after", type: "select", options: PROMOTE_AFTER.map((v) => ({ value: v, label: `${v} findings pushed back on` })) },
+            { key: "ruleMinSamples", label: "Rule health sample", type: "select", options: RULE_MIN_SAMPLES.map((v) => ({ value: v, label: `${v} closed findings` })) },
+            { key: "ruleMinFixRate", label: "Switch off below", type: "select", options: RULE_MIN_FIX_RATE.map((v) => ({ value: v, label: v ? `${v}% fixed` : "Never" })), hint: "Locked rules stay on." },
             { key: "accepted", label: "Accepted fixes", type: "list" },
           ],
           actions: [{ id: "save", label: "Save" }],
+        },
+        {
+          id: "rules",
+          title: "Learnings",
+          ...(rules.error ? { description: `Drafting a rule failed: ${rules.error}` } : {}),
+          fields: [{ key: "rows", label: "Learnings", type: "table", columns: [{ key: "rule", label: "Rule" }, { key: "status", label: "Status" }, { key: "fixed", label: "Fixed" }, { key: "ignored", label: "Ignored" }, { key: "dismissed", label: "Dismissed" }, { key: "reactions", label: "👍 / 👎" }] }],
         },
       ];
       return {
@@ -421,12 +456,11 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             ...rulesAsText(rc),
             configFile,
             ...(files.length ? { useGuides: guides?.[repo]?.use ?? true } : { noGuides: "No AGENTS.md or CLAUDE.md at the root" }),
-            learnings,
             accepted,
             // not drawn: what the page loaded, so a save can tell removals from items added meanwhile
-            loadedLearnings: learnings,
             loadedAccepted: accepted,
           },
+          rules: { rows: rules.rows.map(ruleTableRow) },
         },
       };
     },
@@ -447,10 +481,14 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
       const reviewKeys = Object.keys(REVIEW_DEFAULTS).filter((k) => k in v);
       const next = { ...prev, ...(reviewKeys.length ? { review: storedReview(current, Object.fromEntries(reviewKeys.map((k) => [k, v[k]]))) } : {}) };
       const g = { ...(guides0?.[repo] || {}), ...("useGuides" in v ? { use: !!v.useGuides } : {}) };
-      if ("learnings" in v) { next.learnings = pruned(await getRepoLearnings(repo), v.loadedLearnings, v.learnings); g.learnings = next.learnings; }
       if ("accepted" in v) next.accepted = pruned(await getRepoAccepted(repo), v.loadedAccepted, v.accepted);
       await Promise.all([store.setSetting("guides", { ...(guides0 || {}), [repo]: g }), store.setSetting("repoSettings", { ...(rs0 || {}), [repo]: next })]);
     },
+    // Learnings table rows (learned.ts): accept or reject a suggestion, lock a rule on, switch it off or on, remove it.
+    actions: Object.fromEntries((["accept", "remove", "lock", "switch"] as const).map((id): [string, PageAction] => [id, async (body, _http, { org = "", repo = "" } = {}) => {
+      await onboardedRepo(repo, org);
+      return { message: await ruleAction(repo, String(body.item || ""), id) };
+    }])),
   },
   model: {
     title: "Model provider",

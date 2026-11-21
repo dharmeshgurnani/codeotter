@@ -1,4 +1,5 @@
 // Review context: settings, guides, learnings, accepted suggestions, history, linked issues, head files.
+import { createHash } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { OWNER_RE, REPO, REPO_RE, ROOT } from "./config.ts";
@@ -43,6 +44,13 @@ export interface ReviewSettings extends RepoRules {
   gitleaks: boolean;
   semgrep: boolean;
   trivy: boolean;
+  // learned rules (core/learned.ts): switch a suggested rule on once `promoteAfter` similar findings were pushed back on
+  // (off: suggest only), and switch a rule off when fewer than `ruleMinFixRate` % of at least `ruleMinSamples` findings
+  // tied to it were fixed (0: never)
+  autoLearn: boolean;
+  promoteAfter: number;
+  ruleMinSamples: number;
+  ruleMinFixRate: number;
 }
 // A custom pre-merge check: a yes/no question (yes = pass) asked of the model owning the gates. "block" failures fail the
 // codeotter/checks commit status; "warn" failures only show; "off" is kept but not asked.
@@ -58,7 +66,7 @@ export interface GitHistory { prCommits: GitCommit[]; baseCommits: BaseCommit[];
 export interface LinkedIssue { number: number; key?: string; repo: string; title: string; body: string; state: string; url: string; labels: string[]; }
 export const issueLabel = (i: Pick<LinkedIssue, "number" | "key">): string => i.key || `#${i.number}`;
 
-export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, resolveFixed: true, commands: true, overrides: false, auto: true, agentPrompts: true, gitleaks: false, semgrep: false, trivy: false, profile: "balanced", minSeverity: "nit", checks: [], ...RULE_DEFAULTS };
+export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, resolveFixed: true, commands: true, overrides: false, auto: true, agentPrompts: true, gitleaks: false, semgrep: false, trivy: false, autoLearn: false, promoteAfter: 3, ruleMinSamples: 5, ruleMinFixRate: 20, profile: "balanced", minSeverity: "nit", checks: [], ...RULE_DEFAULTS };
 // Review strictness: a profile supplies the defaults for maxFindings and reflectMin (values set explicitly still win)
 // and the tone of the language-model instructions (engines.ts).
 export type ReviewProfile = "chill" | "balanced" | "assertive";
@@ -123,7 +131,14 @@ export const normalizeReview = (v: { [K in keyof ReviewSettings]?: unknown }): R
   gitleaks: !!v.gitleaks,
   semgrep: !!v.semgrep,
   trivy: !!v.trivy,
+  autoLearn: !!v.autoLearn,
+  promoteAfter: PROMOTE_AFTER.includes(Number(v.promoteAfter)) ? Number(v.promoteAfter) : REVIEW_DEFAULTS.promoteAfter,
+  ruleMinSamples: RULE_MIN_SAMPLES.includes(Number(v.ruleMinSamples)) ? Number(v.ruleMinSamples) : REVIEW_DEFAULTS.ruleMinSamples,
+  ruleMinFixRate: RULE_MIN_FIX_RATE.includes(Number(v.ruleMinFixRate)) ? Number(v.ruleMinFixRate) : REVIEW_DEFAULTS.ruleMinFixRate,
 });
+export const PROMOTE_AFTER = [2, 3, 5, 8];
+export const RULE_MIN_SAMPLES = [3, 5, 10, 20];
+export const RULE_MIN_FIX_RATE = [0, 10, 20, 30, 50];
 // Untrusted (settings body, later a repository config file): at most 20 checks, each with instructions.
 export const normalizeChecks = (v: unknown): CustomCheck[] =>
   (Array.isArray(v) ? (v as unknown[]) : [])
@@ -230,6 +245,9 @@ export function normalizeLearningList(list: unknown): string[] {
     ),
   ].slice(-50);
 }
+
+// A learning's id: stable across saves, the key of its health record (core/learned.ts) and of findings tied to it.
+export const ruleId = (text: string): string => createHash("sha256").update(String(text).trim()).digest("hex").slice(0, 12);
 
 export async function getRepoLearnings(repo: string): Promise<string[]> {
   if (!repo) return [];

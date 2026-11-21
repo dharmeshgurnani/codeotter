@@ -5,7 +5,7 @@ import assert from "node:assert";
 import { createHmac, timingSafeEqual, randomBytes } from "node:crypto";
 import { test } from "node:test";
 import { serverBlocks } from "./helpers/server-blocks.ts";
-import { makeForge, secretMatches, type ForgeConfig } from "../core/forges.ts";
+import { countReactions, makeForge, secretMatches, type ForgeConfig } from "../core/forges.ts";
 
 type Headers = Record<string, string | undefined>;
 interface Api {
@@ -88,6 +88,9 @@ function load({ ghComments = [] as Row[], giteaReviews = {} as Record<number, Ro
     orgOfRepo: (r: string) => r.split("/")[0],
     withActor: (_actor: unknown, fn: () => unknown) => fn(),
     prUrlFor: (repo: string, n: number) => `https://github.com/${repo}/pull/${n}`,
+    countReactions,
+    noteReply: async (repo: string, url: string) => { calls.push(["pushback", repo, url]); },
+    collectFeedback: async () => 0,
   };
   const names = Object.keys(stubs);
   const api = new Function(...names, `${block}; return { handleWebhook, answerReplies, pending: () => PR_QUEUE.size || REPLY_QUEUE.size || prDraining };`)(...names.map((n) => stubs[n])) as Api;
@@ -166,6 +169,12 @@ const hook = (c: Row, action = "created") => ({ action, repository: { full_name:
   const offer = load({ ghComments: [root, reply], answer: '{"answer":"Understood.","dismissed":true,"learning":"Do not flag the fixed GST rate in cart totals"}' });
   await offer.answerReplies("acme/app", 7, "101");
   assert.deepStrictEqual(offer.saved.learnings, []);
+  // both are pushback on the finding: signal for learned rules; a reply the model does not read as pushback is not
+  assert.deepStrictEqual(api.calls.find((c) => c[0] === "pushback"), ["pushback", "acme/app", "https://github.com/acme/app/pull/7"]);
+  assert.ok(offer.calls.some((c) => c[0] === "pushback"));
+  const plainReply = load({ ghComments: [root, reply] });
+  await plainReply.answerReplies("acme/app", 7, "101");
+  assert.ok(!plainReply.calls.some((c) => c[0] === "pushback"));
   assert.match(String(ghPosts(offer.calls)[0][6]), /Understood\.\n\nTo keep this as a team learning, reply `@codeotter remember Do not flag the fixed GST rate in cart totals`/);
   const failing = load({ ghComments: [root, reply], answer: "not json" });
   await assert.rejects(failing.answerReplies("acme/app", 7, "101"));

@@ -18,7 +18,7 @@ export const AUDIT_ACTIONS = [
   "repository.add", "repository.remove", "repositories.update", "repository-settings.update",
   "model-provider.update", "git-provider.update", "git-provider.app", "auth-provider.update", "webhook-secret.update",
   "local-model.download", "local-model.use", "local-model.delete", "analyzer.download", "analyzer.delete",
-  "issue-tracker.update", "settings.update", "review.post", "command.run", "pr-tool.run", "check.override", "check.override.refused",
+  "issue-tracker.update", "settings.update", "review.post", "command.run", "pr-tool.run", "check.override", "check.override.refused", "rule.auto-off", "rule.auto-on", "rule.update",
 ] as const;
 
 // <audit-actor>
@@ -101,9 +101,11 @@ export async function auditSettings(page: string, body: Record<string, unknown>,
   await audit(null, action, target, { page, fields }, org);
   if (Object.keys(fields).some((k) => /webhookSecret$/.test(k))) await audit(null, "webhook-secret.update", target, { page }, org);
 }
-export async function auditAction(page: string, id: string, body: Record<string, unknown>) {
+export async function auditAction(page: string, id: string, body: Record<string, unknown>, scope: { repo?: string } = {}) {
   // tests change nothing; connect only starts the GitHub App flow, whose callback is audited
   if (id === "test" || id === "probe" || id === "connect" || id.startsWith("test")) return;
+  // a learned rule's row action on Repository settings: the repository, the rule id and what was done
+  if (page === "repo" && scope.repo) return audit(null, "rule.update", scope.repo, { page, action: id, rule: String(body.item || "") }, orgOfRepo(scope.repo));
   const app = page === "git" && id.startsWith("app");
   const action = PAGE_ROW_ACTION[page]?.[id] || ROW_ACTION[id] || (app ? "git-provider.app" : `settings.${page}.${id}`);
   await audit(null, action, app ? id.slice(3) : body.item ? String(body.item) : page, { page });
@@ -148,7 +150,7 @@ export async function exportAudit(q: Omit<AuditQuery, "page" | "perPage">): Prom
 // Settings → Workspace → Audit log (owner): filters, then the entries, newest first. Apply posts the filter section; the
 // page loads with it (the settings route hands the posted body to load()), so nothing about the view is stored.
 const PER_PAGE = 50;
-const TONE: Record<string, Tone> = { "signin.refused": "bad", "signin.success": "ok", "review.post": "info", "command.run": "info", "check.override": "warn", "check.override.refused": "bad" };
+const TONE: Record<string, Tone> = { "signin.refused": "bad", "signin.success": "ok", "review.post": "info", "command.run": "info", "check.override": "warn", "check.override.refused": "bad", "rule.auto-off": "warn", "rule.auto-on": "info" };
 const when = (iso: string) => iso.replace("T", " ").replace(/\.\d+Z$/, "Z");
 async function actorOptions() {
   const users = PB_URL ? await store.users().catch(() => []) : [];
