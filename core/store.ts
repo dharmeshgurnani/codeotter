@@ -11,6 +11,7 @@ import type { Role } from "./access.ts";
 import type { ReviewRecord } from "./review.ts";
 import type { ReviewSettings } from "./context.ts";
 import type { AnalyticsEvent } from "./analytics.ts";
+import type { LearnedState } from "./learned.ts";
 
 // Settings: one JSON value per key. The types are what this app writes; a missing key reads as null. Keys not listed
 // here (dynamic ones such as a forge id) read as unknown and the caller narrows.
@@ -52,6 +53,7 @@ export interface SettingsMap {
   sso: SsoSetting;
   [webhook: `${string}Webhook`]: { secret?: string };
   [origin: `${string}Origin`]: string;
+  [learned: `learned:${string}`]: LearnedState;
 }
 export type SettingKey = keyof SettingsMap;
 export type SettingValue<K extends string> = K extends SettingKey ? SettingsMap[K] : unknown;

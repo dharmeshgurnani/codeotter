@@ -2,7 +2,7 @@
 import { ensureSidecar } from "./local-models.ts";
 import { askModel, askSystemOne } from "./models.ts";
 import { blastRadius, compressDiff, splitHunks } from "./diff.ts";
-import { extractHeadSha, issueLabel, REVIEW_DEFAULTS } from "./context.ts";
+import { extractHeadSha, issueLabel, REVIEW_DEFAULTS, ruleId } from "./context.ts";
 import { diffFiles, pathInstructionBlock } from "./repo-rules.ts";
 import { analyzerPrompt, isAnalyzerId } from "./analyzers.ts";
 import type { AnalyzerId, AnalyzerResult } from "./analyzers.ts";
@@ -25,6 +25,7 @@ export interface Finding {
   confidence?: number; // 0..1, from reflection or System One
   hunk?: string; // the diff hunk at the finding, attached when the review is stored (for agent prompts)
   analyzer?: AnalyzerId; // a static analyzer result the language model confirmed
+  rule?: string; // ruleId() of the team learning the finding enforces (learned rules count its outcome)
 }
 export type Verdict = "approve" | "comment" | "request_changes";
 // `mode` marks a repository's custom check (id `check_<n>`); built-in gates have none.
@@ -465,6 +466,7 @@ export function deriveSuggestionFromDetail(raw: unknown, diff = ""): Finding {
     ...(f?.dismissed ? { dismissed: true } : {}),
     ...(Number.isFinite(Number(f?.confidence)) && f?.confidence !== null && f?.confidence !== "" ? { confidence: Math.max(0, Math.min(1, Number(f?.confidence))) } : {}),
     ...(isAnalyzerId(f?.analyzer) ? { analyzer: f.analyzer } : {}),
+    ...(typeof f?.rule === "string" && /^[0-9a-f]{12}$/.test(f.rule) ? { rule: f.rule } : {}),
   };
 }
 
@@ -485,7 +487,7 @@ export function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSet
         .join("\n\n")}\n`
     : "";
   const learningsBlock = learnings?.length
-    ? `\nRepository Team Learnings (Never flag these dismissed patterns):\n${learnings.map((l) => `- ${l}`).join("\n")}\n`
+    ? `\nRepository Team Learnings (Never flag these dismissed patterns; follow every rule. A finding raised because a learning asks for it carries that learning's number as "rule"):\n${learnings.map((l, i) => `${i + 1}. ${l}`).join("\n")}\n`
     : "";
   const incrementalBlock = incrementalCtx?.promptBlock ? `\n${incrementalCtx.promptBlock}\n` : "";
   const acceptedBlock = accepted?.length
@@ -494,7 +496,7 @@ export function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSet
   const pathBlock = pathInstructionBlock(r.pathInstructions, diffFiles(diff));
   return `You are CodeOtter, a strict senior staff code reviewer. Review this pull request using the repository's review guidelines (AGENTS.md / CLAUDE.md), the repository team learnings, the linked issues and acceptance criteria, the git commit history, the outside-diff call graph context, and the code diff. Reply with ONLY a JSON object:
 {"summary":"3-5 sentence architectural walkthrough covering what changed, commit progression, fulfillment of linked issue requirements, adherence to repository guidelines, and outside caller safety","verdict":"approve|comment|request_changes",
-${wantScores ? ` "scores":{"quality":0-100,"correctness_risk":0-100 (100 = very risky),"test_coverage":0-100,"readability":0-100,"pr_hygiene":0-100 (title, description, scope, commit focus),"blast_radius":0-100 (100 = system-wide or critical-path impact)},\n` : ""} "findings":[{"severity":"blocker|major|minor|nit|high|medium|low","file":"path","line":42,"title":"short","detail":"specific line/behaviour and fix (cite AGENTS.md/CLAUDE.md rule, linked issue #number or ticket key requirement, or commit if relevant)","suggestion":"optional exact replacement code"}],
+${wantScores ? ` "scores":{"quality":0-100,"correctness_risk":0-100 (100 = very risky),"test_coverage":0-100,"readability":0-100,"pr_hygiene":0-100 (title, description, scope, commit focus),"blast_radius":0-100 (100 = system-wide or critical-path impact)},\n` : ""} "findings":[{"severity":"blocker|major|minor|nit|high|medium|low","file":"path","line":42,"title":"short","detail":"specific line/behaviour and fix (cite AGENTS.md/CLAUDE.md rule, linked issue #number or ticket key requirement, or commit if relevant)","suggestion":"optional exact replacement code"${learnings?.length ? ',"rule":"optional number of the team learning this finding enforces"' : ""}}],
  "walkthrough":[{"file":"path","change":"concise summary of change in this file"}]${checks.length ? `,\n "checks":{${checks.map((g) => `"${g.id}":true|false`).join(",")}}` : ""}}
 For each finding, include the integer target \`line\` number in the new file and an optional \`suggestion\` containing the exact replacement code snippet for the target line/block (without markdown backticks) so the fix can be applied in one click. Be concrete; cite exact files and rules. Respect all Repository Team Learnings and never flag dismissed patterns. Max ${r.maxFindings} findings, most severe first.${PROFILE_PROMPT[r.profile] ? ` ${PROFILE_PROMPT[r.profile]}` : ""} Today is ${new Date().toISOString().slice(0, 10)}.
 
@@ -560,7 +562,9 @@ export async function judge(pr: PullRequest, diff: string, c: LlmConfig, r: Revi
   });
   const unanswered = checkGates.filter((x) => Number.isNaN(x.yes)).map((x) => x.g.label);
   if (unanswered.length) throw new Error(`${c.provider}/${c.model} did not answer the pre-merge check(s): ${unanswered.join(", ")}`);
-  let findings: Finding[] = (Array.isArray(out.findings) ? (out.findings as unknown[]) : []).slice(0, 20).map((f) => deriveSuggestionFromDetail(f, diff));
+  // "rule": a learning's number in the prompt, kept only when it names one, stored as that learning's id
+  const ruleOf = (f: unknown) => { const i = Number((f as { rule?: unknown } | null)?.rule); return Number.isInteger(i) && i >= 1 && i <= learnings.length ? ruleId(learnings[i - 1]) : ""; };
+  let findings: Finding[] = (Array.isArray(out.findings) ? (out.findings as unknown[]) : []).slice(0, 20).map((f) => { const d = deriveSuggestionFromDetail(f, diff); delete d.rule; const rule = ruleOf(f); return rule ? { ...d, rule } : d; });
   if (r.profile === "chill") findings = findings.filter((f) => f.severity === "high" || f.severity === "medium");
   // an analyzer tag only for a tool that reported on this file
   findings = findings.map(({ analyzer, ...f }) => (analyzer && analyzers.some((a) => a.analyzer === analyzer && a.file === f.file) ? { ...f, analyzer } : f));

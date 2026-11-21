@@ -2,6 +2,7 @@
 
 | Status | Feature | Date |
 | :---: | :--- | :--- |
+| [x] | Learned rules: 👍/👎 on CodeOtter's inline comments (GitHub, GitLab award emoji, Forgejo/Gitea reactions; none on Bitbucket and Azure DevOps), replies the model reads as pushback, fixes by a later push, dismissals and findings still open at close, read through the PR queue on re-review and close; recurring pushback on similar findings becomes a model-drafted suggested learning (accept / reject; per-repository auto-promotion, off by default); a learning whose findings are rarely fixed switches off unless locked (threshold and sample per repository, audited). Stub-tested | 2026-11-21 |
 | [x] | Post comments, reviews and statuses as the GitHub App bot (installation tokens) instead of the operator's `gh` login | 2026-11-20 |
 | [x] | Review strictness profile per repository (chill / balanced / assertive: findings budget, self-check threshold, model instructions) and a minimum severity for posted comments | 2026-11-20 |
 | [x] | Path filters, path instructions and auto-review skip rules (drafts, authors, base branches, title keywords, labels) per repository, overridable by `.codeotter.json` on the base branch | 2026-11-20 |

@@ -28,7 +28,7 @@ type Roles = {
 type Board = { repos: string[]; settingsPages: unknown[]; onboardingNeeded: boolean; reviewed: { pr: { url: string } }[] };
 type Row = { id: string; cells: Record<string, unknown>; settings: { values: unknown }; actions?: unknown };
 type AccountsPage = { values: { accounts: { rows: Row[] } }; sections: { id: string; fields: { key: string; options: { value: string; label?: string }[] }[] }[] };
-type RepoSettings = { learnings: string[]; postScores?: boolean; maxFindings?: number };
+type RepoSettings = { postScores?: boolean; maxFindings?: number };
 type OAuthReply = { token: string; record: Account; meta: { username: string } };
 
 test("accounts: developer role, repository access, invites", async (ctx) => {
@@ -327,25 +327,32 @@ try {
   assert.equal(db.users.find((x) => x.id === "u-norole")?.role, "", "not admitted by a plain request");
   ctx.diagnostic("a role-less account is never admitted outside the sign-in callback");
 
-  // Repository settings: a save changes only what it sends; lists apply removals only.
+  // Repository settings: a save changes only what it sends; learnings live in the Learnings table, changed by row actions.
   const repoUrl = "/api/settings/repo?org=acme&repo=acme%2Fapi";
-  const before = (await call<{ values: { repo: RepoSettings } }>(repoUrl, { token: "towner" })).json.values.repo;
-  assert.ok(before.learnings.length >= 1, JSON.stringify(before));
+  type RepoPage = { values: { repo: RepoSettings; rules: { rows: { id: string; label: string; cells: { status: { text: string } } }[] } } };
+  const page = async () => (await call<RepoPage>(repoUrl, { token: "towner" })).json.values;
+  const before = await page();
+  assert.ok(before.rules.rows.length >= 1, JSON.stringify(before.rules));
   assert.equal((await call(repoUrl, { token: "towner", method: "POST", body: { repo: { postScores: true } } })).status, 200);
-  const partial = (await call<{ values: { repo: RepoSettings } }>(repoUrl, { token: "towner" })).json.values.repo;
-  assert.deepEqual(partial.learnings, before.learnings, "a partial save keeps learnings");
-  assert.equal(partial.postScores, true);
-  assert.equal(partial.maxFindings, before.maxFindings, "other review values are merged, not reset");
+  const partial = await page();
+  assert.deepEqual(partial.rules.rows.map((r) => r.label), before.rules.rows.map((r) => r.label), "a partial save keeps learnings");
+  assert.equal(partial.repo.postScores, true);
+  assert.equal(partial.repo.maxFindings, before.repo.maxFindings, "other review values are merged, not reset");
   // stale page: a learning added after the page loaded survives that page's Save
   assert.equal((await call("/api/learnings", { token: "towner", method: "POST", body: { repo: "acme/api", title: "added meanwhile" } })).status, 200);
-  assert.equal((await call(repoUrl, { token: "towner", method: "POST", body: { repo: partial } })).status, 200);
-  const after = (await call<{ values: { repo: RepoSettings } }>(repoUrl, { token: "towner" })).json.values.repo;
-  assert.ok(after.learnings.some((l) => l.includes("added meanwhile")), JSON.stringify(after.learnings));
-  // removing one in the page drops just that one
-  const drop = after.learnings[0];
-  assert.equal((await call(repoUrl, { token: "towner", method: "POST", body: { repo: { ...after, learnings: after.learnings.slice(1) } } })).status, 200);
-  assert.ok(!(await call<{ values: { repo: RepoSettings } }>(repoUrl, { token: "towner" })).json.values.repo.learnings.includes(drop));
-  ctx.diagnostic("Repository settings saves are partial and keep learnings added while the page was open");
+  assert.equal((await call(repoUrl, { token: "towner", method: "POST", body: { repo: partial.repo } })).status, 200);
+  const after = await page();
+  assert.ok(after.rules.rows.some((r) => r.label.includes("added meanwhile")), JSON.stringify(after.rules));
+  // the row actions: switch off, lock refused while off, remove drops just that one; audited with the repository
+  const drop = after.rules.rows[0];
+  const act = (id: string, item: string) => call<{ message?: string; error?: string }>(`/api/settings/repo/${id}?org=acme&repo=acme%2Fapi`, { token: "towner", method: "POST", body: { item } });
+  assert.equal((await act("switch", drop.id)).status, 200);
+  assert.equal((await page()).rules.rows.find((r) => r.id === drop.id)?.cells.status.text, "off");
+  assert.notEqual((await act("lock", drop.id)).status, 200, "only an active rule can be locked");
+  assert.equal((await act("remove", drop.id)).status, 200);
+  assert.ok(!(await page()).rules.rows.some((r) => r.id === drop.id));
+  assert.equal((await call(`/api/settings/repo/remove?org=acme&repo=other%2Fx`, { token: "towner", method: "POST", body: { item: drop.id } })).status >= 400, true, "a repository outside the onboarded list is refused");
+  ctx.diagnostic("Repository settings saves are partial; learnings keep items added meanwhile and change through row actions");
 } finally {
   if (child.exitCode === null) await new Promise((ok) => { child.once("exit", ok); child.kill(); });
   await new Promise((ok) => pbFake.close(ok));

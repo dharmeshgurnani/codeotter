@@ -97,7 +97,25 @@ export interface CommitStatus { state: string; context: string; description?: st
 export interface InlineComment { path: string; line: number; startLine?: number; body: string }
 // One comment of an inline review thread (root first). `line` is the new-file line, negative for an old-file line.
 // `thread`: the server's id for the conversation when replies address it rather than a comment (GitLab discussions).
-export interface ThreadComment { id: number | string; body: string; created_at: string; user: { id: number | string; login: string }; bot: boolean; path: string; line: number; hunk: string; author_association?: string; thread?: string }
+// `reactions`: thumbs up / down (and equivalents) on the comment, where the list response carries them (GitHub).
+export interface ThreadComment { id: number | string; body: string; created_at: string; user: { id: number | string; login: string }; bot: boolean; path: string; line: number; hunk: string; author_association?: string; thread?: string; reactions?: Reactions }
+// Reactions on one comment, folded to up / down: 👍 ❤️ 🎉 🚀 count as up, 👎 😕 as down, anything else is ignored.
+export interface Reactions { up: number; down: number }
+const UP_REACTIONS = new Set(["+1", "thumbsup", "heart", "hooray", "tada", "rocket"]);
+const DOWN_REACTIONS = new Set(["-1", "thumbsdown", "confused"]);
+// A list of reaction names (Gitea `content`, GitLab award `name`), or GitHub's rollup object { "+1": n, ... }.
+export function countReactions(x: unknown): Reactions {
+  const out: Reactions = { up: 0, down: 0 };
+  const add = (name: unknown, n: number) => {
+    const k = String(name ?? "").toLowerCase();
+    if (!Number.isSafeInteger(n) || n <= 0) return;
+    if (UP_REACTIONS.has(k)) out.up += n;
+    else if (DOWN_REACTIONS.has(k)) out.down += n;
+  };
+  if (Array.isArray(x)) for (const name of x) add(name, 1);
+  else if (x && typeof x === "object") for (const [k, v] of Object.entries(x)) add(k, Number(v));
+  return out;
+}
 export type HookHeaders = Record<string, string | undefined>;
 export interface HookMeta { event: string; delivery: string; signature: string | undefined }
 // `inThread`: the comment was posted in an inline review conversation (a candidate reply under CodeOtter's comment).
@@ -145,6 +163,8 @@ export interface Forge {
   // Inline review threads, each oldest first, and a reply in one. Adapters without thread replies leave them out.
   reviewThreads?(repo: string, n: number): Promise<ThreadComment[][]>;
   replyInThread?(repo: string, n: number, root: ThreadComment, body: string): Promise<unknown>;
+  // Reactions on one thread comment, read when learned rules collect signal (only where the server has an API for them).
+  reactions?(repo: string, n: number, c: ThreadComment): Promise<Reactions>;
   ensureHook(repo: string, url: string, secret: string): Promise<boolean>;
   removeHook(repo: string, url: string): Promise<void>;
   secretHeader?: string;
@@ -482,6 +502,12 @@ function gitea(id: string, f: AuthedConfig): Forge {
     replyInThread: (repo, n, root, body) => api(`${r(repo)}/pulls/${n}/reviews`, { method: "POST", body: {
       event: "COMMENT", body: "", comments: [{ path: root.path, new_position: root.line > 0 ? root.line : 0, old_position: root.line < 0 ? -root.line : 0, body }],
     } }),
+    // review comments are issue comments to the reactions API
+    async reactions(repo, _n, c) {
+      if (!Number.isSafeInteger(Number(c.id))) return { up: 0, down: 0 };
+      const rows = await orNull(api<{ content?: unknown }[] | null>(`${r(repo)}/issues/comments/${Number(c.id)}/reactions`));
+      return countReactions((Array.isArray(rows) ? rows : []).map((x) => x?.content));
+    },
     async ensureHook(repo, url, secret) {
       const hooks = await api<GiteaHook[] | null>(`${r(repo)}/hooks`);
       if ((Array.isArray(hooks) ? hooks : []).some((h) => h?.config?.url === url)) return false;
@@ -1356,6 +1382,12 @@ function gitlab(id: string, f: AuthedConfig): Forge {
     replyInThread(repo, n, root, body) {
       if (!GL_DISCUSSION.test(String(root.thread || ""))) throw new Error("Invalid discussion id");
       return api(`${p(repo)}/merge_requests/${n}/discussions/${String(root.thread)}/notes`, { method: "POST", body: { body } });
+    },
+    // award emoji on a diff note
+    async reactions(repo, n, c) {
+      if (!Number.isSafeInteger(Number(c.id))) return { up: 0, down: 0 };
+      const rows = await orNull(api<{ name?: unknown }[] | null>(`${p(repo)}/merge_requests/${n}/notes/${Number(c.id)}/award_emoji`));
+      return countReactions((Array.isArray(rows) ? rows : []).map((x) => x?.name));
     },
     setBody: (repo, n, body) => api(`${p(repo)}/merge_requests/${n}`, { method: "PUT", body: { description: body } }),
     async commentsSince(repo, since) {
