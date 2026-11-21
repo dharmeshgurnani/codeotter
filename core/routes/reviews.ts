@@ -13,7 +13,7 @@ import type { Severity } from "../engines.ts";
 import type { InlineTarget } from "../review.ts";
 import { activeReviews, postInlineSuggestionsOnPr, resolvePr, score, startOrPollReview, triagePr } from "../review.ts";
 import { PR_TOOLS, runPrTool } from "../pr-tools.ts";
-import { reviewPrompts } from "../fix.ts";
+import { fixStacked, reviewPrompts } from "../fix.ts";
 import type { ReviewRecord } from "../review.ts";
 import { homeData, renderScore, repoOf } from "../views.ts";
 import { analyticsData, periodOf, recordOutcome } from "../analytics.ts";
@@ -190,6 +190,17 @@ reviews.post("/review-suggestions", review, async (c) => {
     if (live) live.state = updated;
   }
   return c.json({ ok: true, ...resInfo });
+});
+
+// The review page's "Open fix PR": /fix stacked for one PR the viewer may see.
+reviews.post("/fix-stacked", review, async (c) => {
+  const body = await jsonBody(c);
+  const prUrl = String(body.prUrl || "").trim();
+  if (!validPrUrl(prUrl)) throw new Error("Invalid pull request URL");
+  const repo = parsed(prUrl).repo;
+  checkRepoScope(repo, requestOrg(c.req.query("org")));
+  await assertRepo(c.get("viewer"), repo);
+  return c.json(await fixStacked(prUrl, repo));
 });
 
 // GET: every triage result in scope, or one PR's (?pr=). POST ?pr=: triage that PR now.

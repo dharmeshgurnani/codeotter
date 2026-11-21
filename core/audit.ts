@@ -18,7 +18,7 @@ export const AUDIT_ACTIONS = [
   "repository.add", "repository.remove", "repositories.update", "repository-settings.update",
   "model-provider.update", "git-provider.update", "git-provider.app", "auth-provider.update", "webhook-secret.update",
   "local-model.download", "local-model.use", "local-model.delete", "analyzer.download", "analyzer.delete",
-  "issue-tracker.update", "settings.update", "review.post", "command.run", "pr-tool.run",
+  "issue-tracker.update", "settings.update", "review.post", "command.run", "pr-tool.run", "fix.stacked",
 ] as const;
 
 // <audit-actor>
@@ -148,7 +148,7 @@ export async function exportAudit(q: Omit<AuditQuery, "page" | "perPage">): Prom
 // Settings → Workspace → Audit log (owner): filters, then the entries, newest first. Apply posts the filter section; the
 // page loads with it (the settings route hands the posted body to load()), so nothing about the view is stored.
 const PER_PAGE = 50;
-const TONE: Record<string, Tone> = { "signin.refused": "bad", "signin.success": "ok", "review.post": "info", "command.run": "info" };
+const TONE: Record<string, Tone> = { "signin.refused": "bad", "signin.success": "ok", "review.post": "info", "command.run": "info", "fix.stacked": "info" };
 const when = (iso: string) => iso.replace("T", " ").replace(/\.\d+Z$/, "Z");
 async function actorOptions() {
   const users = PB_URL ? await store.users().catch(() => []) : [];

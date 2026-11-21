@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **`/fix stacked`.** A comment command, and **Open fix PR** on the review page (review access to the repository), that commits the stored review's suggested changes (open findings that carry a model-written suggestion; nothing else) on a branch `codeotter/fix-<pr>-<shortsha>` made from the PR's head commit, and opens a pull request into the PR's head branch that links back and lists the findings it fixes. Each suggestion is located in the head by its reviewed lines and their context; one that no longer applies, is already in or overlaps another is skipped and listed. The original PR gets a comment with the link. Re-running updates the open fix pull request (GitHub, GitLab and Azure DevOps move its branch to a fresh commit on the head; Forgejo and Gitea add a commit to it). Same-repository PRs only: a fork PR is refused with a comment saying why. GitHub (as the App bot when installed), GitLab, Forgejo, Gitea and Azure DevOps; Bitbucket Cloud and Data Center are refused (their commit APIs take multipart uploads). Recorded in the audit log as `fix.stacked`.
+
 ## 0.9.0 (2026-11-20)
 
 - **Review profile and minimum severity.** Repository settings add **Profile** (Chill: high and medium findings only, 5 findings, self-check at 7; Balanced: unchanged, the default; Assertive: nitpicks included, 12 findings, self-check at 3) and **Minimum severity to post** (Nit / Low / Medium / High). The profile sets the default Max findings and Self-check and the model's instructions; a Max findings or Self-check value moved off the profile's default is kept as set. The posted review summary and inline suggestions carry only findings at or above the minimum severity; the review page shows all of them.

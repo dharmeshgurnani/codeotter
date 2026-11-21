@@ -151,7 +151,28 @@ export interface Forge {
   hookMeta(h: HookHeaders): HookMeta;
   hookBody?(x: unknown): { event: string; delivery: string };
   route?(event: string, x: unknown): RoutedHook | null;
+  // /fix stacked: a fix branch and pull request. Left out where the API cannot commit files as JSON (Bitbucket).
+  stacked?: StackedOps;
 }
+// <stacked-types>
+// One file of a fix commit, at its full new text.
+export interface FixFile { path: string; content: string }
+// An open fix pull request: its number, web URL and head branch.
+export interface FixPr { number: number; url: string; branch: string }
+export interface FixCommit { branch: string; headSha: string; headBranch: string; files: FixFile[]; message: string }
+export interface StackedOps {
+  // Whether the PR's head lives in another repository; where it is left out, PullRequest.headRepo says so.
+  fork?(repo: string, n: number): Promise<boolean>;
+  // The open same-repository pull request into `base` whose head branch starts with `prefix`.
+  findFixPr(repo: string, base: string, prefix: string): Promise<FixPr | null>;
+  // One commit with `files` on `branch`, made from `headSha` (the branch is created there when it does not exist).
+  commit(repo: string, c: FixCommit): Promise<void>;
+  openPr(repo: string, o: { branch: string; base: string; title: string; body: string }): Promise<FixPr>;
+  editPr(repo: string, n: number, o: { title: string; body: string }): Promise<unknown>;
+}
+export const FIX_BRANCH_RE = /^codeotter\/fix-[1-9]\d*-[0-9a-f]{7}$/;
+const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
+// </stacked-types>
 
 const enc = encodeURIComponent;
 const encPath = (p: string) => String(p).split("/").map(enc).join("/");
@@ -491,6 +512,36 @@ function gitea(id: string, f: AuthedConfig): Forge {
     async removeHook(repo, url) {
       const hooks = await api<GiteaHook[] | null>(`${r(repo)}/hooks`).catch((): GiteaHook[] => []);
       for (const h of Array.isArray(hooks) ? hooks : []) if (h?.config?.url === url && Number.isSafeInteger(Number(h.id))) await api(`${r(repo)}/hooks/${Number(h.id)}`, { method: "DELETE" }).catch(() => {});
+    },
+    // Branches are created from the head commit and never moved: a re-run adds a commit on top of the fix branch.
+    stacked: {
+      async findFixPr(repo, base, prefix) {
+        const own = native(repo);
+        const p = (await list<GiteaPull & { html_url?: string }>(`${r(repo)}/pulls?state=open`)).find((x) => x.base?.ref === base && String(x.head?.ref || "").startsWith(prefix) && FIX_BRANCH_RE.test(String(x.head?.ref)) && x.head?.repo?.full_name === own);
+        return p ? { number: p.number, url: p.html_url || `${f.url}/${own}/pulls/${p.number}`, branch: String(p.head?.ref) } : null;
+      },
+      async commit(repo, c) {
+        const at = await orNull(api<{ commit?: { id?: string } } | null>(`${r(repo)}/branches/${encPath(c.branch)}`));
+        if (!at) {
+          // old_ref_name (a commit) on current servers; older ones read old_branch_name, checked against the head below
+          const made = await api<{ commit?: { id?: string } } | null>(`${r(repo)}/branches`, { method: "POST", body: { new_branch_name: c.branch, old_ref_name: c.headSha, old_branch_name: c.headBranch } });
+          if (made?.commit?.id && made.commit.id !== c.headSha) {
+            await api(`${r(repo)}/branches/${encPath(c.branch)}`, { method: "DELETE" }).catch(() => {});
+            throw new Error(`${c.headBranch} moved past ${c.headSha.slice(0, 7)}: run /review, then /fix stacked again`);
+          }
+        }
+        const files = await Promise.all(c.files.map(async (x) => {
+          if (!safeFile(x.path)) throw new Error("Invalid file path");
+          const cur = await api<{ sha?: string } | null>(`${r(repo)}/contents/${encPath(x.path)}?ref=${enc(c.branch)}`);
+          return { operation: "update", path: x.path, content: b64(x.content), sha: cur?.sha };
+        }));
+        await api(`${r(repo)}/contents`, { method: "POST", body: { branch: c.branch, message: c.message, files } });
+      },
+      async openPr(repo, o) {
+        const p = await api<{ number: number; html_url?: string }>(`${r(repo)}/pulls`, { method: "POST", body: { head: o.branch, base: o.base, title: o.title, body: o.body } });
+        return { number: p.number, url: p.html_url || `${f.url}/${native(repo)}/pulls/${p.number}`, branch: o.branch };
+      },
+      editPr: (repo, n, o) => api(`${r(repo)}/pulls/${n}`, { method: "PATCH", body: { title: o.title, body: o.body } }),
     },
     hookMeta: (h) => ({ event: String(h[`x-${id}-event`] || h["x-gitea-event"] || ""), delivery: String(h[`x-${id}-delivery`] || h["x-gitea-delivery"] || ""), signature: h[`x-${id}-signature`] || h["x-gitea-signature"] }),
   };
@@ -1144,6 +1195,32 @@ function azure(id: string, f: AuthedConfig): Forge {
       const subs = (await api<AzList<AzSubscription> | null>(`${enc(org)}/_apis/hooks/subscriptions`).catch(() => null))?.value || [];
       for (const s of subs) if (s.consumerInputs?.url === url && s.publisherInputs?.repository === repositoryId && /^[0-9a-f-]{36}$/i.test(String(s.id))) await api(`${enc(org)}/_apis/hooks/subscriptions/${s.id}`, { method: "DELETE" }).catch(() => {});
     },
+    // One push makes the fix commit on the head commit and moves the branch to it (a re-run needs force-push permission).
+    stacked: {
+      async findFixPr(repo, base, prefix) {
+        const rows = (await api<AzList<AzPull> | null>(`${g(repo)}/pullrequests?searchCriteria.status=active&searchCriteria.targetRefName=${enc(`refs/heads/${base}`)}&$top=200`))?.value || [];
+        const p = rows.find((x) => !x.forkSource && branch(x.targetRefName) === base && branch(x.sourceRefName).startsWith(prefix) && FIX_BRANCH_RE.test(branch(x.sourceRefName)));
+        return p ? { number: p.pullRequestId, url: `${web(repo)}/pullrequest/${p.pullRequestId}`, branch: branch(p.sourceRefName) } : null;
+      },
+      async commit(repo, c) {
+        if (!isSha(c.headSha)) throw new Error("Invalid head commit");
+        const name = `refs/heads/${c.branch}`;
+        const refs = (await api<AzList<{ name?: string; objectId?: string }> | null>(`${g(repo)}/refs?filter=${enc(`heads/${c.branch}`)}`))?.value || [];
+        const tip = refs.find((x) => x.name === name)?.objectId || "0".repeat(40);
+        await api(`${g(repo)}/pushes`, { method: "POST", body: {
+          refUpdates: [{ name, oldObjectId: tip }],
+          commits: [{ comment: c.message, parents: [c.headSha], changes: c.files.map((x) => {
+            if (!safeFile(x.path)) throw new Error("Invalid file path");
+            return { changeType: "edit", item: { path: `/${x.path}` }, newContent: { content: b64(x.content), contentType: "base64encoded" } };
+          }) }],
+        } });
+      },
+      async openPr(repo, o) {
+        const p = await api<AzPull>(`${g(repo)}/pullrequests`, { method: "POST", body: { sourceRefName: `refs/heads/${o.branch}`, targetRefName: `refs/heads/${o.base}`, title: o.title, description: o.body.slice(0, AZURE_MAX_DESCRIPTION) } });
+        return { number: p.pullRequestId, url: `${web(repo)}/pullrequest/${p.pullRequestId}`, branch: o.branch };
+      },
+      editPr: (repo, n, o) => api(`${g(repo)}/pullrequests/${n}`, { method: "PATCH", body: { title: o.title, description: o.body.slice(0, AZURE_MAX_DESCRIPTION) } }),
+    },
     secretHeader: "x-codeotter-secret",
     hookMeta: () => ({ event: "", delivery: "", signature: "" }), // both come from the body
     hookBody: (x: AzEvent | null | undefined) => ({ event: String(x?.eventType || ""), delivery: String(x?.id || x?.notificationId || "") }),
@@ -1384,6 +1461,33 @@ function gitlab(id: string, f: AuthedConfig): Forge {
     },
     // GitLab sends the hook's secret token as X-Gitlab-Token (compared in constant time). Idempotency-Key (17.4+) stays
     // the same across retries; X-Gitlab-Event-UUID identifies the event on older servers.
+    // The commits API makes the fix commit from the head commit; `force` moves an existing fix branch there.
+    stacked: {
+      async fork(repo, n) {
+        const m = await api<GlMr>(`${p(repo)}/merge_requests/${n}`);
+        return !m.source_project_id || m.source_project_id !== m.target_project_id;
+      },
+      async findFixPr(repo, base, prefix) {
+        const rows = await list<GlMr>(`${p(repo)}/merge_requests?state=opened&target_branch=${enc(base)}`, 500);
+        const m = rows.find((x) => x.target_branch === base && String(x.source_branch || "").startsWith(prefix) && FIX_BRANCH_RE.test(String(x.source_branch)) && !!x.source_project_id && x.source_project_id === x.target_project_id);
+        return m ? { number: m.iid, url: m.web_url || `${web(repo)}/-/merge_requests/${m.iid}`, branch: String(m.source_branch) } : null;
+      },
+      async commit(repo, c) {
+        if (!isSha(c.headSha)) throw new Error("Invalid head commit");
+        await api(`${p(repo)}/repository/commits`, { method: "POST", body: {
+          branch: c.branch, start_sha: c.headSha, force: true, commit_message: c.message,
+          actions: c.files.map((x) => {
+            if (!safeFile(x.path)) throw new Error("Invalid file path");
+            return { action: "update", file_path: x.path, content: b64(x.content), encoding: "base64" };
+          }),
+        } });
+      },
+      async openPr(repo, o) {
+        const m = await api<GlMr>(`${p(repo)}/merge_requests`, { method: "POST", body: { source_branch: o.branch, target_branch: o.base, title: o.title, description: o.body, remove_source_branch: true } });
+        return { number: m.iid, url: m.web_url || `${web(repo)}/-/merge_requests/${m.iid}`, branch: o.branch };
+      },
+      editPr: (repo, n, o) => api(`${p(repo)}/merge_requests/${n}`, { method: "PUT", body: { title: o.title, description: o.body } }),
+    },
     secretHeader: "x-gitlab-token",
     hookMeta: (h) => ({ event: String(h["x-gitlab-event"] || ""), delivery: String(h["idempotency-key"] || h["x-gitlab-event-uuid"] || ""), signature: "" }),
     route(event: string, x: GlEvent | null | undefined) {

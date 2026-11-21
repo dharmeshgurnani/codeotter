@@ -9,7 +9,7 @@ import { deriveSuggestionFromDetail, reflectFindings } from "./engines.ts";
 import { postInlineSuggestionsOnPr, resolvePr, score, syncPrComments } from "./review.ts";
 import { CATCH_UP_EVERY, HANDLED_COMMENTS, lastCatchUp, remember, webhookHealthy } from "./queue.ts";
 import { repoOf } from "./views.ts";
-import { fixFindings, hunkAt } from "./fix.ts";
+import { fixFindings, fixStacked, hunkAt } from "./fix.ts";
 import type { ForgeComment, ThreadComment } from "./forges.ts";
 import { audit, orgOfRepo, withActor } from "./audit.ts";
 import type { Guide, PullRequest, ReviewSettings } from "./context.ts";
@@ -237,7 +237,7 @@ export async function runPrTool(prUrl: string, id: string, { question = "", acti
 
 // <pr-commands>
 // PR comment commands: a comment whose first line is /review, /describe, /improve, /docs, /changelog, /ask <question> or
-// /fix [n] runs that action and replies on the pull request. Off unless enabled in Settings, and only the repository's owner,
+// /fix [n | stacked] runs that action and replies on the pull request. Off unless enabled in Settings, and only the repository's owner,
 // members and collaborators can trigger one: anyone can comment on a public repository and spend its model budget.
 const COMMANDS = ["review", "describe", "improve", "ask", "docs", "changelog", "fix"];
 export function parseCommand(body: unknown): PrCommand | null {
@@ -269,6 +269,8 @@ export async function runCommand(repo: string, c: PrComment, { cmd, arg }: PrCom
     await withActor(actor, async () => {
       if (cmd === "review") {
         await syncPrComments(await score(prUrl, true, repo), repo, { postScores: true, postReview: true });
+      } else if (cmd === "fix" && arg.toLowerCase() === "stacked") {
+        await fixStacked(prUrl, repo); // a fix branch and pull request; it comments the link itself
       } else if (cmd === "fix") {
         // suggestions only: nothing is pushed to the branch
         await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/fix${arg ? ` ${oneLine(arg, 20)}` : ""}\`: ${await fixFindings(prUrl, repo, arg)}`);
@@ -278,7 +280,7 @@ export async function runCommand(repo: string, c: PrComment, { cmd, arg }: PrCom
       }
     });
   } catch (e) {
-    await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/${cmd}\` failed: ${oneLine((e as Error).message, 500)}`).catch(() => {});
+    await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/${cmd}${cmd === "fix" && arg.toLowerCase() === "stacked" ? " stacked" : ""}\` failed: ${oneLine((e as Error).message, 500)}`).catch(() => {});
     throw e;
   }
 }

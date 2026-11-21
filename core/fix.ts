@@ -1,14 +1,18 @@
 // "Fix with AI": self-contained prompts that hand review findings to a coding agent (Claude Code, Codex, Cursor, Copilot
 // agent), and the /fix comment command, which asks the language model for a patch, checks it applies to the PR head in
-// memory, and posts it as committable suggestions. Nothing is ever pushed to the pull request's branch.
+// memory, and posts it as committable suggestions. Nothing is ever pushed to the pull request's branch: /fix stacked
+// commits the stored review's suggested changes to a separate codeotter/fix-<pr>-<sha> branch and opens a pull request
+// into the PR's head branch.
 import { store } from "./store.ts";
-import { isForgeRepo, readPr } from "./git.ts";
+import { createPrComment, forgeOf, githubStacked, isForgeRepo, readPr, repoLabel } from "./git.ts";
+import { audit, orgOfRepo } from "./audit.ts";
 import { askModel, llmConfig } from "./models.ts";
 import { guideFor, headFileTexts } from "./context.ts";
 import { deriveSuggestionFromDetail } from "./engines.ts";
 import { postInlineSuggestionsOnPr, resolvePr } from "./review.ts";
 import type { PullRequest } from "./context.ts";
 import type { Finding } from "./engines.ts";
+import type { FixFile, StackedOps } from "./forges.ts";
 
 // What a prompt needs to know about the pull request; `guide` is the detected guide file(s), e.g. "AGENTS.md + CLAUDE.md".
 export interface PromptPr { url: string; number: number; title?: string; headRefName?: string; baseRefName?: string }
@@ -256,3 +260,118 @@ ${numberedLines(files.get(d.file)!, d.line || 0)}`;
   return `posted ${posted} suggestion${posted === 1 ? "" : "s"} checked against \`${sha}\`${mode === "pr_comment_fallback" ? " as a PR comment (lines outside the diff)" : ""}${rejected.length ? `; ${rejected.length} hunk${rejected.length === 1 ? "" : "s"} did not apply` : ""}. Nothing was pushed.`;
 }
 // </fix-command>
+
+// <fix-stacked-plan>
+// The stored review's suggested replacements (model output: startLine..line of the reviewed commit become `suggestion`)
+// applied to the head files. Each replacement is located in the head by its old lines plus STACK_CONTEXT..1 lines of
+// context on each side, from the file at the reviewed commit; one that no longer matches, is already in, or overlaps an
+// earlier one is skipped with the reason. Nothing is guessed.
+export interface StackTarget { n: number; f: Finding }
+export interface StackPlan { files: FixFile[]; applied: StackTarget[]; skipped: (StackTarget & { why: string })[] }
+const STACK_CONTEXT = 3;
+const splitLines = (t: string) => t.split("\n").map((l) => l.replace(/\r$/, ""));
+export function planStackedFix(targets: StackTarget[], reviewed: Map<string, string>, head: Map<string, string>): StackPlan {
+  const applied: StackTarget[] = [];
+  const skipped: StackPlan["skipped"] = [];
+  const edits = new Map<string, { from: number; to: number; text: string[]; n: number }[]>();
+  for (const t of targets) {
+    const d = deriveSuggestionFromDetail(t.f, "");
+    const end = d.line || 0;
+    const start = d.startLine && d.startLine <= end ? d.startLine : end;
+    const before = reviewed.get(d.file), now = head.get(d.file);
+    if (!d.suggestion || !end) { skipped.push({ ...t, why: "no suggested change" }); continue; }
+    if (before === undefined || now === undefined) { skipped.push({ ...t, why: "file not readable at the head" }); continue; }
+    const old = splitLines(before);
+    if (end > old.length) { skipped.push({ ...t, why: "lines outside the reviewed file" }); continue; }
+    const next = d.suggestion.split("\n");
+    if (old.slice(start - 1, end).join("\n").trimEnd() === next.join("\n").trimEnd()) { skipped.push({ ...t, why: "already applied" }); continue; }
+    const headLines = splitLines(now);
+    // the widest context that still matches, down to one line on each side (a change next door narrows it)
+    const find = (body: string[]) => {
+      for (let n = STACK_CONTEXT; n >= 1; n--) {
+        const lo = Math.max(0, start - 1 - n), hi = Math.min(old.length, end + n);
+        const before = old.slice(lo, start - 1).map((l) => ` ${l}`);
+        const at = locateHunk(headLines, { file: d.file, oldStart: lo + 1, lines: [...before, ...body.map((l) => `-${l}`), ...old.slice(end, hi).map((l) => ` ${l}`)] });
+        if (at >= 0) return at + before.length;
+      }
+      return -1;
+    };
+    const from = find(old.slice(start - 1, end));
+    if (from < 0) { skipped.push({ ...t, why: find(next) >= 0 ? "already applied" : "no longer applies to the head" }); continue; }
+    const to = from + (end - start + 1);
+    const list = edits.get(d.file) || [];
+    const clash = list.find((e) => e.from < to && from < e.to);
+    if (clash) { skipped.push({ ...t, why: `overlaps finding ${clash.n}` }); continue; }
+    list.push({ from, to, text: next, n: t.n });
+    edits.set(d.file, list);
+    applied.push(t);
+  }
+  const files: FixFile[] = [...edits].map(([path, list]) => {
+    const text = head.get(path)!; // edits only exist for files read at the head
+    const crlf = text.includes("\r\n");
+    const out = splitLines(text);
+    for (const e of [...list].sort((a, b) => b.from - a.from)) out.splice(e.from, e.to - e.from, ...e.text);
+    return { path, content: out.join(crlf ? "\r\n" : "\n") };
+  });
+  return { files, applied, skipped };
+}
+// </fix-stacked-plan>
+
+// <fix-stacked>
+// /fix stacked and the review page's "Open fix PR": the stored review's suggested changes that still apply, committed on
+// a fix branch from the PR's head commit, in a pull request into the PR's head branch; a re-run updates that pull request.
+// Same-repository PRs only: a fork's branch is not CodeOtter's to write to, and the fix PR's base must be in this repository.
+const md = (x: unknown, max: number) => flat(x, max).replace(/<!--/g, "<!-​-").replace(/(^|[^\w`])@(?=[\w-])/g, "$1@​").replace(/`/g, "'");
+const stackedOpsOf = (repo: string): StackedOps | undefined => (isForgeRepo(repo) ? forgeOf(repo).stacked : githubStacked);
+const findingAt = (f: Finding) => {
+  const d = deriveSuggestionFromDetail(f, "");
+  return `\`${md(d.file, 200)}${d.line ? `:L${d.startLine && d.startLine < d.line ? `${d.startLine}-` : ""}${d.line}` : ""}\``;
+};
+const stackItem = (t: StackTarget) => `finding ${t.n} [${String(t.f.severity).toUpperCase()}] ${findingAt(t.f)}: ${md(t.f.title, 200) || "Finding"}`;
+export interface StackedResult { message: string; url: string; updated: boolean; applied: number; skipped: number }
+export async function fixStacked(prUrl: string, repo: string): Promise<StackedResult> {
+  const { urlGuess, spec } = await resolvePr(prUrl, repo);
+  const ops = stackedOpsOf(repo);
+  if (!ops) throw new Error(`${repoLabel(repo)}: fix pull requests need a git server whose API commits files as JSON (GitHub, GitLab, Forgejo, Gitea, Azure DevOps). Use /fix for suggestions`);
+  const saved = await store.get(urlGuess);
+  const targets = openFindings(saved?.review?.findings).map((f, i) => ({ n: i + 1, f })).filter((t) => {
+    const d = deriveSuggestionFromDetail(t.f, "");
+    return !!d.suggestion && !!d.line;
+  });
+  if (!targets.length) throw new Error("No open findings with a suggested change: run /review first");
+  const pr: PullRequest = JSON.parse(await readPr(urlGuess, spec));
+  if (String(pr.state || "OPEN").toUpperCase() !== "OPEN") throw new Error("The pull request is not open");
+  const fork = ops.fork ? await ops.fork(repo, pr.number) : !!pr.headRepo && pr.headRepo !== repo;
+  if (fork) throw new Error("this pull request's branch lives in a fork. CodeOtter writes only to this repository, and a fix pull request into a fork's branch needs write access to the fork. Use /fix to get the same changes as suggestions");
+  const headSha = String(pr.headRefOid || "");
+  const headBranch = String(pr.headRefName || "");
+  if (!/^[0-9a-f]{40}$/i.test(headSha) || !headBranch) throw new Error("Could not read the pull request's head commit");
+  const reviewSha = String(saved?.headSha || saved?.pr?.headRefOid || "");
+  if (!/^[0-9a-f]{7,40}$/i.test(reviewSha)) throw new Error("The stored review names no commit: run /review first");
+  const paths = [...new Set(targets.map((t) => t.f.file))];
+  const head = await headFileTexts(pr, paths, 25, 400000, headSha);
+  const reviewed = headSha.startsWith(reviewSha) || reviewSha.startsWith(headSha) ? head : await headFileTexts(pr, paths, 25, 400000, reviewSha);
+  const plan = planStackedFix(targets, reviewed, head);
+  const sha = headSha.slice(0, 7);
+  const skippedList = plan.skipped.map((t) => `- ${stackItem(t)} (${t.why})`);
+  if (!plan.applied.length) throw new Error(`none of the ${targets.length} suggested change${targets.length === 1 ? "" : "s"} apply to \`${sha}\`:\n${skippedList.join("\n")}`);
+  const prefix = `codeotter/fix-${pr.number}-`;
+  const existing = await ops.findFixPr(repo, headBranch, prefix);
+  const branch = existing?.branch || `${prefix}${sha}`;
+  const count = `${plan.applied.length} fix${plan.applied.length === 1 ? "" : "es"}`;
+  const message = [`fix: CodeOtter suggestions for #${pr.number}`, "", ...plan.applied.map((t) => `- finding ${t.n}: ${flat(t.f.title, 120)}`), "", `From the review at ${reviewSha.slice(0, 7)}, applied to ${sha}.`].join("\n");
+  await ops.commit(repo, { branch, headSha, headBranch, files: plan.files, message });
+  const title = `CodeOtter fixes for #${pr.number}: ${flat(pr.title, 120)}`.slice(0, 200);
+  const body = [
+    `<!-- codeotter:fix-stacked:${pr.number} -->`,
+    `🦦 Fixes from the CodeOtter review of [#${pr.number}](${pr.url}), made on \`${md(headBranch, 200)}\` at \`${sha}\`. Merge into \`${md(headBranch, 200)}\` to apply them.`,
+    "", "**Fixes**", ...plan.applied.map((t) => `- ${stackItem(t)}`),
+    ...(skippedList.length ? ["", "**Skipped**", ...skippedList] : []),
+  ].join("\n");
+  const fix = existing ? (await ops.editPr(repo, existing.number, { title, body }), existing) : await ops.openPr(repo, { branch, base: headBranch, title, body });
+  await audit(null, "fix.stacked", urlGuess, { fixPr: fix.url, branch, head: sha, applied: plan.applied.length, skipped: plan.skipped.length, updated: !!existing }, orgOfRepo(repo));
+  const summary = `${existing ? "updated" : "opened"} [fix pull request #${fix.number}](${fix.url}) with ${count} on \`${sha}\`${skippedList.length ? `. Skipped:\n${skippedList.join("\n")}` : "."}`;
+  await createPrComment(urlGuess, repo, pr.number, `🦦 CodeOtter \`/fix stacked\`: ${summary}`);
+  return { message: summary, url: fix.url, updated: !!existing, applied: plan.applied.length, skipped: plan.skipped.length };
+}
+// </fix-stacked>
