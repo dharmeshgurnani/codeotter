@@ -3,7 +3,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createSign } from "node:crypto";
 import { FORGE_API, FORGE_IDS, FORGES, OWNER_RE, REPO, REPO_RE } from "./config.ts";
 import { PB_URL, store } from "./store.ts";
-import type { ApiOptions, PullRequest } from "./forges.ts";
+import type { ApiOptions, GitFetch, PullRequest } from "./forges.ts";
 
 // A pull request URL's repository and number; selfHosted: a git server other than github.com.
 export interface ParsedPr { repo: string; number: number; selfHosted: boolean }
@@ -513,4 +513,19 @@ export async function openPrs(repo: string, { strict = false } = {}): Promise<Pu
     if (strict) throw e;
     return [];
   }
+}
+
+// Where a sandbox run fetches a pull request's head (core/sandbox.ts): the provider's adapter for forge repositories;
+// for GitHub refs/pull/<n>/head on github.com with the App's installation token, else the token gh uses.
+// No token at all: an unauthenticated fetch, which works for public repositories only.
+export async function prFetchSource(pr: { url: string; number: number; headRepo?: string; headRefName?: string }): Promise<GitFetch> {
+  const parsed = parsePrUrl(pr.url);
+  if (!parsed) throw new Error("Not a pull request URL");
+  const { repo, number } = parsed;
+  if (isForgeRepo(repo)) return forgeOf(repo).fetchSource(repo, number, { headRepo: pr.headRepo, headRefName: pr.headRefName });
+  if (!REPO_RE.test(repo)) throw new Error(`Not an owner/name: ${repo}`);
+  const token = (await appInstallationToken(repo).catch(() => ""))
+    || savedGithubToken || process.env.GH_TOKEN || process.env.GITHUB_TOKEN
+    || (await runGh(["auth", "token", "--hostname", "github.com"], process.env).then((t) => t.trim(), () => ""));
+  return { url: `https://github.com/${repo}.git`, header: token ? `Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}` : "", ref: `refs/pull/${number}/head` };
 }

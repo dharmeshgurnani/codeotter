@@ -71,6 +71,37 @@ const Md = ({ head, rows }: { head: string[]; rows: React.ReactNode[][] }) => (
   </div>
 );
 
+const SANDBOX_BADGE: Record<NonNullable<Review["sandbox"]>["status"], { tone: "ok" | "bad" | "warn" | "muted" | "info"; text: string }> = {
+  running: { tone: "info", text: "Running" },
+  passed: { tone: "ok", text: "Passed" },
+  failed: { tone: "bad", text: "Failed" },
+  timeout: { tone: "warn", text: "Timed out" },
+  error: { tone: "warn", text: "Did not run" },
+  skipped: { tone: "muted", text: "Skipped" },
+};
+const secs = (ms: number) => `${Math.round(ms / 100) / 10} s`;
+// The admin's test command on the PR head in Docker (core/sandbox.ts). The output is the PR code's own: shown as text.
+export const SandboxSection = ({ run }: { run: NonNullable<Review["sandbox"]> }) => {
+  const b = SANDBOX_BADGE[run.status];
+  return (
+    <details className="my-2.5" open={run.status === "failed"}><summary className="cursor-pointer text-sm font-semibold">Sandbox run <Badge tone={b.tone} className="ml-1.5">{b.text}</Badge></summary>
+      <Md head={["Step", "Status", "Exit code", "Time"]} rows={[
+        ...run.steps.map((st) => [
+          <>{st.step}{st.network ? <Badge tone="muted" className="ml-1.5">network</Badge> : null}</>,
+          <Badge key={st.step} tone={st.timedOut ? "warn" : st.exitCode === 0 ? "ok" : "bad"}>{st.timedOut ? "Timed out" : st.exitCode === 0 ? "Passed" : "Failed"}</Badge>,
+          st.exitCode ?? "",
+          secs(st.ms),
+        ] as React.ReactNode[]),
+        ...(run.status === "running" ? [["", <InlineLoader key="r" text="Running…" />, "", ""] as React.ReactNode[]] : []),
+      ]} />
+      {run.error ? <p className="my-1.5 text-sm text-muted-foreground">{run.error}</p> : null}
+      <p className="my-1.5 text-sm text-muted-foreground">{run.image}{run.sha ? ` · ${run.sha.slice(0, 7)}` : ""}{run.targets.length ? ` · ${run.targets.join(", ")}` : ""}{run.chosenBy ? ` · picked by ${run.chosenBy}` : ""}{run.rejected ? ` · ${run.rejected} pick(s) outside the list dropped` : ""}</p>
+      {run.failedTests.length ? <Md head={["Failed test"]} rows={run.failedTests.map((t) => [t])} /> : null}
+      {run.output ? <pre className="my-1.5 max-h-64 overflow-auto whitespace-pre-wrap rounded border border-border bg-muted p-2 text-xs">{run.truncated ? "…\n" : ""}{run.output}</pre> : null}
+    </details>
+  );
+};
+
 export const Ring = ({ label, value: raw, invert, loading }: { label: string; value: number; invert?: boolean; loading?: boolean }) => {
   if (loading) {
     return (
@@ -985,6 +1016,7 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                 ] as React.ReactNode[])} />
               </details>
             ) : null}
+            {r.sandbox ? <SandboxSection run={r.sandbox} /> : null}
           </div>
         </div>
 

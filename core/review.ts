@@ -2,7 +2,7 @@
 import { APP_URL, REPO_RE } from "./config.ts";
 import { PROVIDERS } from "./providers.ts";
 import { store } from "./store.ts";
-import { createPrComment, forgeOf, ghAsApp, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, readPr, repos, validPrUrl } from "./git.ts";
+import { createPrComment, forgeOf, ghAsApp, ghAsync, isForgeRepo, parsePrUrl, prFetchSource, prUrlFor, readPr, repos, validPrUrl } from "./git.ts";
 import { CHECKS_CONTEXT, checksFailed, checksFinished, checksStarted, keptOverrides, postCommitStatus, SHA_RE } from "./merge-checks.ts";
 import type { CheckOverride, StatusState } from "./merge-checks.ts";
 import { askSystemOne, llmConfig, metered, newUsage, s1Config } from "./models.ts";
@@ -16,6 +16,8 @@ import { repoOf } from "./views.ts";
 import { filterDiff } from "./repo-rules.ts";
 import { analysisFailed, ANALYZER_IDS, changedLines, redactDeep, runAnalyzers } from "./analyzers.ts";
 import type { Analysis, AnalyzerRun } from "./analyzers.ts";
+import { runSandbox, sandboxConfig, sandboxPending } from "./sandbox.ts";
+import type { SandboxRun } from "./sandbox.ts";
 import { audit, AUTO, currentActor, orgOfRepo } from "./audit.ts";
 import type { BlastRadius, DiffContextStats, OutsideImpact } from "./diff.ts";
 import type { GitHistory, LinkedIssue, PullRequest } from "./context.ts";
@@ -57,6 +59,7 @@ export interface ReviewRecord {
   commentsPosted?: string[];
   analyzers?: AnalyzerRun[];
   overrides?: CheckOverride[]; // /override on failing custom checks, for the head commit they were given on (merge-checks.ts)
+  sandbox?: SandboxRun;
 }
 export interface ActiveReview { state: ReviewRecord; error: string | null; promise: Promise<ReviewRecord> | null; done: boolean; }
 export interface TriageConfig { auto: boolean; stopAt: number; }
@@ -298,6 +301,22 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
       const analysisTask: Promise<Analysis | null> = analyzerIds.length
         ? headFileTexts(live.pr, [...changedLines(filtered).keys()], 100).then((files) => runAnalyzers(files, filtered, analyzerIds)).catch((e: Error) => analysisFailed(analyzerIds, e.message))
         : Promise.resolve(null);
+      // Sandbox run (Repository settings, off by default): the admin's test command on the head, evidence for both
+      // engines. Started here, next to the context fetches; its own wall-clock limit bounds how long the engines wait.
+      // Never fails the review: a failure is the run's status.
+      const sbx = runLlm || runScores ? await sandboxConfig(repoOf(live.pr)) : null;
+      const sandboxTask: Promise<SandboxRun | null> = sbx?.enabled
+        ? (() => {
+            const sha = String(live.pr.headRefOid || "");
+            live.sandbox = sandboxPending(sbx, sha);
+            return runSandbox({
+              settings: sbx, sha, files: [...changedLines(filtered).keys()],
+              source: () => prFetchSource(live.pr),
+              llm: llmReady ? c : null, s1: s1.enabled ? s1 : null,
+              onUpdate: (r) => { live.sandbox = { ...r }; },
+            }).then((r) => (live.sandbox = r));
+          })()
+        : Promise.resolve(null);
 
       const outsideImpact = await sliceOutsideDiffImpact(repoOf(live.pr), diff, (live.pr.files || []).map((f) => f.path));
       live.outsideDiffImpact = outsideImpact;
@@ -402,7 +421,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
       const acceptedFixes = await getRepoAccepted(repoOf(live.pr));
 
       const s1Task = runScores && s1.enabled
-        ? scoreWithSystemOne(live.pr, diff, s1, guide, ({ readyScores, gates, done }) => {
+        ? sandboxTask.then((sandbox) => scoreWithSystemOne(live.pr, diff, s1, guide, ({ readyScores, gates, done }) => {
             live.pending.readyScores = { ...live.pending.readyScores, ...readyScores };
             if (readyScores.blast_radius !== undefined) {
               live.blast = { ...live.blast, score: readyScores.blast_radius, source: "s1" };
@@ -414,16 +433,16 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
               live.pending.scores = false;
               live.pending.gates = false;
             }
-          }, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes, checks)
+          }, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes, checks, sandbox))
         : Promise.resolve(null);
 
       const needLlmForScores = runScores && !s1.enabled;
       const llmTask = (runLlm || needLlmForScores) && llmReady
-        ? analysisTask.then((analysis) => { if (analysis) live.analyzers = analysis.runs; return judge(live.pr, diff, c, rc, guide, !s1.enabled, gitHistory, (partial) => {
+        ? Promise.all([analysisTask, sandboxTask]).then(([analysis, sandbox]) => { if (analysis) live.analyzers = analysis.runs; return judge(live.pr, diff, c, rc, guide, !s1.enabled, gitHistory, (partial) => {
             if (runLlm) {
               live.review = { ...live.review, ...partial, scores: live.review.scores };
             }
-          }, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes, s1.enabled ? [] : checks, analysis?.results || []).then((j) => redactDeep(j, analysis?.secrets || [])); }).then(({ blastRadius: llmBlast, checks: llmChecks, ...nav }): Judgement => {
+          }, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes, s1.enabled ? [] : checks, analysis?.results || [], sandbox).then((j) => redactDeep(j, analysis?.secrets || [])); }).then(({ blastRadius: llmBlast, checks: llmChecks, ...nav }): Judgement => {
             if (llmChecks) {
               live.gates = llmChecks;
               live.pending.gates = false;
@@ -443,7 +462,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
           })
         : Promise.resolve(null);
 
-      const [narrative, typed] = await Promise.all([llmTask, s1Task]);
+      const [narrative, typed] = await Promise.all([llmTask, s1Task, sandboxTask]);
       let review: ReviewBody = runLlm && narrative ? narrative : live.review;
       if (runLlm && c.api === "codereviewer" && s1.enabled && review?.findings?.length) {
         const proposed = review.findings;
@@ -516,6 +535,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
         gitHistory: live.gitHistory,
         at: new Date().toISOString(),
         ...(live.analyzers ? { analyzers: live.analyzers } : !runLlm && cached?.analyzers ? { analyzers: cached.analyzers } : {}),
+        ...(live.sandbox ? { sandbox: live.sandbox } : !sbx && cached?.sandbox ? { sandbox: cached.sandbox } : {}),
       };
       // overrides given (possibly while this run was going) on the commit this result reviewed
       const overrides = keptOverrides(((await store.get(live.pr.url)) as ReviewRecord | null)?.overrides, live.pr.headRefOid || "");
