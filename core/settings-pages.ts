@@ -447,6 +447,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
           title: "Learnings",
           ...(rules.error ? { description: `Drafting a rule failed: ${rules.error}` } : {}),
           fields: [{ key: "rows", label: "Learnings", type: "table", columns: [{ key: "rule", label: "Rule" }, { key: "status", label: "Status" }, { key: "fixed", label: "Fixed" }, { key: "ignored", label: "Ignored" }, { key: "dismissed", label: "Dismissed" }, { key: "reactions", label: "👍 / 👎" }] }],
+        },
         // Runs pull-request code: its own section and save, stored apart from the review settings (core/sandbox.ts).
         {
           id: "sandbox",
