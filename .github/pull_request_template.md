@@ -5,6 +5,7 @@ Closes #
 ## Checklist
 
 - [ ] Follows `AGENTS.md`
+- [ ] Tests added or updated for new or changed behaviour
 - [ ] `pnpm test` passes; `cd web && pnpm build` passes if `web/` changed
 - [ ] CHANGELOG line under Unreleased
 - [ ] ROADMAP updated, if a roadmap item moved
