@@ -2,6 +2,7 @@
 
 | Status | Feature | Date |
 | :---: | :--- | :--- |
+| [x] | Rules from the head branch: per-repository Rules source (base / head); same-repository PRs read AGENTS.md, CLAUDE.md and `.codeotter.json` at the head SHA with only additive keys applied (guides, new path instructions, new checks), forks always use the base; "rules from head" badge on the review page and a line in the posted summary | 2026-11-21 |
 | [x] | Post comments, reviews and statuses as the GitHub App bot (installation tokens) instead of the operator's `gh` login | 2026-11-20 |
 | [x] | Review strictness profile per repository (chill / balanced / assertive: findings budget, self-check threshold, model instructions) and a minimum severity for posted comments | 2026-11-20 |
 | [x] | Path filters, path instructions and auto-review skip rules (drafts, authors, base branches, title keywords, labels) per repository, overridable by `.codeotter.json` on the base branch | 2026-11-20 |

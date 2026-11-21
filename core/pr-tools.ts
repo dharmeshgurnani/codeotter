@@ -4,7 +4,7 @@ import { store } from "./store.ts";
 import { createPrComment, forgeId, forgeOf, ghAsApp, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, readPr, repos } from "./git.ts";
 import { askModel, llmConfig } from "./models.ts";
 import { compressDiff, dynamicContextFiles, extendDiffContext, parseDiff } from "./diff.ts";
-import { getRepoLearnings, guideFor, headFileTexts, reviewConfig, setRepoLearnings } from "./context.ts";
+import { getRepoLearnings, headFileTexts, prGuide, reviewConfig, setRepoLearnings } from "./context.ts";
 import { deriveSuggestionFromDetail, reflectFindings } from "./engines.ts";
 import { postInlineSuggestionsOnPr, resolvePr, score, syncPrComments } from "./review.ts";
 import { CATCH_UP_EVERY, HANDLED_COMMENTS, lastCatchUp, remember, webhookHealthy } from "./queue.ts";
@@ -62,7 +62,7 @@ async function prToolContext(prUrl: string): Promise<PrToolContext> {
   let diff = rawDiff;
   if (rc.contextLines > 0) diff = extendDiffContext(rawDiff, await headFileTexts(pr, dynamicContextFiles(parseDiff(rawDiff))), { before: rc.contextLines, after: 1 }).diff;
   const repo = repoOf(pr);
-  const guide = await guideFor(repo, isForgeRepo(repo) ? pr.headRefOid : pr.headRefName, pr.headRepo || repo).catch(() => null);
+  const guide = await prGuide(repo, pr, rc.rulesSource).then((g) => g.guide, () => null);
   return { pr, repo, c, rc, guide, diff: compressDiff(diff, Math.min(rc.diffChars, c.contextChars || Infinity)).diff };
 }
 

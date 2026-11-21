@@ -104,7 +104,7 @@ test("Fix with AI: prompts, patch check, /fix", async (ctx) => {
       readPr: async () => JSON.stringify(pr),
       llmConfig: async () => ({ provider: "test", model, api }),
       headFileTexts: async (_pr: unknown, paths: string[]) => new Map(paths.filter((p) => files.has(p)).map((p) => [p, files.get(p)!])),
-      guideFor: async () => ({ file: "AGENTS.md", text: "Never use var." }),
+      prGuide: async () => ({ guide: { file: "AGENTS.md", text: "Never use var." }, fromHead: [] }),
       isForgeRepo: () => false,
       askModel: async (text: string) => { calls.prompts.push(text); return answer; },
       deriveSuggestionFromDetail,

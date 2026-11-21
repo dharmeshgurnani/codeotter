@@ -20,7 +20,7 @@ export type PrCommit = Partial<Omit<ForgePrCommit, "authors">> & { authors?: { l
 // gh's JSON may omit the optional fields, and its commits can be partial.
 export type PullRequest = Pick<ForgePullRequest, "url" | "number" | "title" | "author" | "baseRefName" | "headRefName" | "changedFiles" | "additions" | "deletions">
   & Partial<Pick<ForgePullRequest, "body" | "headRefOid" | "headRepo" | "state" | "isDraft" | "updatedAt" | "labels">>
-  & { files: ChangedFile[]; commits?: PrCommit[]; headSha?: string };
+  & { files: ChangedFile[]; commits?: PrCommit[]; headSha?: string; isCrossRepository?: boolean };
 // Path filters, path instructions and skip rules (repo-rules.ts) are review settings too.
 export interface ReviewSettings extends RepoRules {
   maxFindings: number;
@@ -42,6 +42,7 @@ export interface ReviewSettings extends RepoRules {
   gitleaks: boolean;
   semgrep: boolean;
   trivy: boolean;
+  rulesSource: RulesSource; // where AGENTS.md / CLAUDE.md / .codeotter.json are read from (see "Rules source" below)
 }
 // A custom pre-merge check: a yes/no question (yes = pass) asked of the model owning the gates. "block" failures fail the
 // codeotter/checks commit status; "warn" failures only show; "off" is kept but not asked.
@@ -57,7 +58,7 @@ export interface GitHistory { prCommits: GitCommit[]; baseCommits: BaseCommit[];
 export interface LinkedIssue { number: number; key?: string; repo: string; title: string; body: string; state: string; url: string; labels: string[]; }
 export const issueLabel = (i: Pick<LinkedIssue, "number" | "key">): string => i.key || `#${i.number}`;
 
-export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, resolveFixed: true, commands: true, auto: true, agentPrompts: true, gitleaks: false, semgrep: false, trivy: false, profile: "balanced", minSeverity: "nit", checks: [], ...RULE_DEFAULTS };
+export const REVIEW_DEFAULTS: ReviewSettings = { maxFindings: 8, diffChars: 90000, contextLines: 16, reflectMin: 5, temperature: 0.2, postScores: true, postReview: true, postInlineSuggestions: true, resolveFixed: true, commands: true, auto: true, agentPrompts: true, gitleaks: false, semgrep: false, trivy: false, profile: "balanced", minSeverity: "nit", checks: [], rulesSource: "base", ...RULE_DEFAULTS };
 // Review strictness: a profile supplies the defaults for maxFindings and reflectMin (values set explicitly still win)
 // and the tone of the language-model instructions (engines.ts).
 export type ReviewProfile = "chill" | "balanced" | "assertive";
@@ -121,6 +122,7 @@ export const normalizeReview = (v: { [K in keyof ReviewSettings]?: unknown }): R
   gitleaks: !!v.gitleaks,
   semgrep: !!v.semgrep,
   trivy: !!v.trivy,
+  rulesSource: v.rulesSource === "head" ? "head" : "base",
 });
 // Untrusted (settings body, later a repository config file): at most 20 checks, each with instructions.
 export const normalizeChecks = (v: unknown): CustomCheck[] =>
@@ -137,6 +139,49 @@ export const normalizeChecks = (v: unknown): CustomCheck[] =>
     .slice(0, 20)
     .map((x, i) => ({ ...x, name: x.name || `Check ${i + 1}` }));
 
+// Rules source: where a review reads its repository rules, the guides (AGENTS.md / CLAUDE.md) and `.codeotter.json`.
+// A per-repository setting (repoSettings[repo].review.rulesSource):
+//   "base" (default): every rule file is read from the base repository at the pull request's base branch.
+//   "head": a same-repository pull request also reads them at its head commit (by SHA), so a team can try a rule
+//           change on a branch before merging it. Fork pull requests always use "base": a fork is never read.
+// Even in head mode a pull request cannot loosen the rules it is reviewed under. What the head may change:
+//   guides            AGENTS.md / CLAUDE.md text: the head's copy of a file replaces the base's; a guide the head
+//                     deletes is still read from the base.
+//   pathInstructions  head entries are appended to the base's (base file, else Repository settings); none is removed.
+//   checks            head checks with a new name (case-insensitive) and mode warn/block are appended to the base's
+//                     (base file, else Repository settings); a head entry reusing a base name (to switch it off,
+//                     soften block to warn, or reword it) is ignored, and a check the head leaves out stays.
+// Every other `.codeotter.json` key (pathInclude, pathExclude, reviewDrafts and every skip rule, and any key added
+// later) is taken from the base only; the head's differing values are reported as `ignored`. Auto-review skip
+// decisions (queue.ts) never read the head.
+export type RulesSource = "base" | "head";
+// What a review took from the head: the commit, the rule files whose head copy differs from the base's, and the
+// `.codeotter.json` keys the head changed but the merge refused.
+export interface RulesFromHead { ref: string; files: string[]; ignored: string[] }
+const REF_SHA = /^[0-9a-f]{7,64}$/i;
+// The head commit a review may read rules at, or "" when it must use the base: head mode only, same repository only
+// (forge adapters name a fork's head repository in headRepo; gh says isCrossRepository, unknown counts as a fork),
+// and only by commit SHA so a cached file never changes under a push.
+export function headRulesRef(repo: string, pr: { headRepo?: string; isCrossRepository?: boolean; headRefOid?: string }, source: RulesSource = "base"): string {
+  if (source !== "head") return "";
+  const same = isForgeRepo(repo) ? pr.headRepo === repo : pr.isCrossRepository === false;
+  return same && REF_SHA.test(pr.headRefOid || "") ? String(pr.headRefOid) : "";
+}
+
+// A repository file at one ref, exactly (null when missing), cached by repo + ref + path for ten minutes.
+const fileCache = new Map<string, { text: string | null; at: number }>();
+async function fileAt(repo: string, file: string, ref: string): Promise<string | null> {
+  const key = `${repo}@${ref}:${file}`;
+  const hit = fileCache.get(key);
+  if (hit && Date.now() - hit.at < 600e3) return hit.text;
+  const text = isForgeRepo(repo)
+    ? await forgeOf(repo).file(repo, file, ref)
+    : await ghAsync("api", `repos/${repo}/contents/${file}${ref ? `?ref=${encodeURIComponent(ref)}` : ""}`, "-H", "Accept: application/vnd.github.raw").catch(() => null);
+  if (fileCache.size > 1000) fileCache.clear();
+  fileCache.set(key, { text, at: Date.now() });
+  return text;
+}
+
 // Repository review guides: AGENTS.md and/or CLAUDE.md at the repo root (both are used when both exist, since one is
 // often a stub pointing at the other). Detection is cached for 10 minutes; whether guides are used is a per-repository
 // setting ("guides": { "owner/name": { use: bool } }), defaulting to on when found.
@@ -149,7 +194,7 @@ export async function guideFiles(repo: string, ref = ""): Promise<string[]> {
   if (hit && Date.now() - hit.at < 600e3) return hit.files;
   if (isForgeRepo(repo)) {
     const files: string[] = [];
-    for (const file of GUIDE_FILES) if ((await forgeOf(repo).file(repo, file, ref)) !== null) files.push(file);
+    for (const file of GUIDE_FILES) if ((await fileAt(repo, file, ref)) !== null) files.push(file);
     guideCache.set(cacheKey, { files, at: Date.now() });
     capMap(guideCache, 500);
     return files;
@@ -165,11 +210,10 @@ export async function guideFiles(repo: string, ref = ""): Promise<string[]> {
   return files;
 }
 const guideText = async (repo: string, file: string, ref = ""): Promise<string> => {
-  if (isForgeRepo(repo)) return (await forgeOf(repo).file(repo, file, ref)) ?? "";
+  if (isForgeRepo(repo)) return (await fileAt(repo, file, ref)) ?? "";
   if (ref) {
-    try {
-      return await ghAsync("api", `repos/${repo}/contents/${file}?ref=${encodeURIComponent(ref)}`, "-H", "Accept: application/vnd.github.raw");
-    } catch {}
+    const text = await fileAt(repo, file, ref);
+    if (text !== null) return text;
   }
   try {
     return await ghAsync("api", `repos/${repo}/contents/${file}`, "-H", "Accept: application/vnd.github.raw");
@@ -177,46 +221,91 @@ const guideText = async (repo: string, file: string, ref = ""): Promise<string> 
     return repo === REPO && existsSync(join(ROOT, file)) ? readFileSync(join(ROOT, file), "utf8") : "";
   }
 };
+const joinGuides = (parts: [string, string][]): Guide => {
+  const per = Math.floor(GUIDE_CHARS / parts.length);
+  return { file: parts.map(([f]) => f).join(" + "), text: parts.map(([f, t]) => `--- ${f} ---\n${t.slice(0, per)}`).join("\n\n") };
+};
 export async function guideFor(repo: string, ref = "", contentRepo = repo): Promise<Guide | null> {
   if (!REPO_RE.test(contentRepo)) throw new Error("Invalid guide repository");
   const files = await guideFiles(contentRepo, ref);
   if (!files.length) return null;
   const use = (await store.getSetting("guides"))?.[repo]?.use ?? true;
   if (!use) return null;
-  const per = Math.floor(GUIDE_CHARS / files.length);
-  return { file: files.join(" + "), text: (await Promise.all(files.map(async (f) => `--- ${f} ---\n${(await guideText(contentRepo, f, ref)).slice(0, per)}`))).join("\n\n") };
+  return joinGuides(await Promise.all(files.map(async (f): Promise<[string, string]> => [f, await guideText(contentRepo, f, ref)])));
+}
+type RulesPr = { baseRefName?: string; headRepo?: string; isCrossRepository?: boolean; headRefOid?: string };
+// The guides a review of `pr` follows: the base branch's or, in head mode for a same-repository pull request, the
+// head's copies over them (see "Rules source" above). `fromHead` lists the guide files whose head copy is used.
+// `source` defaults to the repository's setting.
+export async function prGuide(repo: string, pr: RulesPr, source?: RulesSource): Promise<{ guide: Guide | null; fromHead: string[] }> {
+  const base = pr.baseRefName || "";
+  const head = headRulesRef(repo, pr, source ?? (await reviewConfig(repo)).rulesSource);
+  const baseGuide = await guideFor(repo, base);
+  if (!head || !((await store.getSetting("guides"))?.[repo]?.use ?? true)) return { guide: baseGuide, fromHead: [] };
+  const texts = await Promise.all(GUIDE_FILES.map((f) => Promise.all([fileAt(repo, f, base), fileAt(repo, f, head)])));
+  const fromHead = GUIDE_FILES.filter((_, i) => texts[i][1] !== null && texts[i][1] !== texts[i][0]);
+  if (!fromHead.length) return { guide: baseGuide, fromHead };
+  const parts = GUIDE_FILES.map((f, i): [string, string | null] => [f, texts[i][1] ?? texts[i][0]]).filter((p): p is [string, string] => p[1] !== null);
+  return { guide: joinGuides(parts), fromHead };
 }
 
-// `.codeotter.json` (schema in repo-rules.ts), read like the guides but only from the base repository at the base branch.
+// `.codeotter.json` (schema in repo-rules.ts), read like the guides from the base repository at the base branch and,
+// in head mode, at a same-repository head (merged by mergeHeadConfig).
 // The file may also carry "checks" (custom pre-merge checks, CustomCheck[]), normalised by normalizeChecks.
 export type RepoConfig = Partial<RepoRules> & { checks?: CustomCheck[] };
-const configCache = new Map<string, { rules: RepoConfig | null; at: number }>();
-export const clearRepoConfigCache = () => configCache.clear();
-// The base repository's `.codeotter.json` at `baseRef` (the default branch when empty), cached for ten minutes.
-// Takes the base repository only: the head (a fork's or a branch's copy) is never read.
-export async function repoConfigFile(repo: string, baseRef = ""): Promise<RepoConfig | null> {
+export const clearRepoConfigCache = () => fileCache.clear();
+// The repository's `.codeotter.json` at `ref` (the default branch when empty), cached with the other rule files.
+// `side` names the ref in a parse error ("head branch").
+export async function repoConfigFile(repo: string, ref = "", side = ""): Promise<RepoConfig | null> {
   if (!REPO_RE.test(repo)) throw new Error("Invalid repository");
-  const key = `${repo}@${baseRef}`;
-  const hit = configCache.get(key);
-  if (hit && Date.now() - hit.at < 600e3) return hit.rules;
-  let text: string | null;
-  if (isForgeRepo(repo)) text = await forgeOf(repo).file(repo, CONFIG_FILE, baseRef);
-  else text = await ghAsync("api", `repos/${repo}/contents/${CONFIG_FILE}${baseRef ? `?ref=${encodeURIComponent(baseRef)}` : ""}`, "-H", "Accept: application/vnd.github.raw").catch(() => null);
-  const rules = text === null || !text.trim() ? null : parseConfigFile(text.slice(0, 65536));
-  if (configCache.size > 500) configCache.clear();
-  configCache.set(key, { rules, at: Date.now() });
-  return rules;
+  const text = await fileAt(repo, CONFIG_FILE, ref);
+  return text === null || !text.trim() ? null : parseConfigFile(text.slice(0, 65536), side);
 }
-const parseConfigFile = (text: string): RepoConfig => {
-  const rules: RepoConfig = parseRepoConfig(text); // throws on invalid JSON or a non-object
+const parseConfigFile = (text: string, side = ""): RepoConfig => {
+  let rules: RepoConfig;
+  try {
+    rules = parseRepoConfig(text); // throws on invalid JSON or a non-object
+  } catch (e) {
+    throw side ? new Error(`${(e as Error).message} (${side})`) : e;
+  }
   const raw = JSON.parse(text) as Record<string, unknown>;
   if ("checks" in raw) rules.checks = normalizeChecks(raw.checks);
   return rules;
 };
-// Repository settings with the file's keys over them. `pr` names the base branch; its head is not used.
-export async function effectiveRules(repo: string, ui: Partial<RepoRules>, pr: { baseRefName?: string } = {}): Promise<RepoRules & { checks?: CustomCheck[]; configFile: string[] | null }> {
-  const file = await repoConfigFile(repo, pr.baseRefName || "");
-  return { ...normalizeRules({ ...ui, ...(file || {}) }), ...(file?.checks ? { checks: file.checks } : {}), configFile: file ? Object.keys(file) : null };
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+// The base file with the head file's additive keys merged in, per "Rules source" above. `ui` supplies the base's path
+// instructions and checks when the base file does not set them, so a head entry never drops a Repository settings one.
+export function mergeHeadConfig(base: RepoConfig | null, head: RepoConfig | null, ui: { pathInstructions?: RepoRules["pathInstructions"]; checks?: CustomCheck[] } = {}): { config: RepoConfig | null; ignored: string[] } {
+  if (!head) return { config: base, ignored: [] };
+  const out: RepoConfig = { ...(base || {}) };
+  const ignored: string[] = (Object.keys(head) as (keyof RepoConfig)[]).filter((k) => k !== "pathInstructions" && k !== "checks" && !same(head[k], base?.[k]));
+  if (head.pathInstructions?.length) {
+    const own = base?.pathInstructions ?? ui.pathInstructions ?? [];
+    const added = head.pathInstructions.filter((p) => !own.some((o) => same(o, p)));
+    if (added.length) out.pathInstructions = [...own, ...added].slice(0, 50);
+  }
+  if (head.checks?.length) {
+    const own = base?.checks ?? ui.checks ?? [];
+    const names = new Set(own.map((c) => c.name.toLowerCase()));
+    if (head.checks.some((c) => names.has(c.name.toLowerCase()) && !own.some((o) => same(o, c)))) ignored.push("checks");
+    const added = head.checks.filter((c) => c.mode !== "off" && !names.has(c.name.toLowerCase()));
+    if (added.length) out.checks = [...own, ...added].slice(0, 20);
+  }
+  return { config: Object.keys(out).length ? out : null, ignored };
+}
+// Repository settings with the file's keys over them. `pr` names the base branch and, in head mode (`ui.rulesSource`),
+// a same-repository head commit; `fromHead` is set when the head's `.codeotter.json` differs from the base's.
+export async function effectiveRules(repo: string, ui: Partial<RepoRules> & { checks?: CustomCheck[]; rulesSource?: RulesSource }, pr: RulesPr = {}): Promise<RepoRules & { checks?: CustomCheck[]; configFile: string[] | null; fromHead: RulesFromHead | null }> {
+  const baseRef = pr.baseRefName || "";
+  let file = await repoConfigFile(repo, baseRef);
+  let fromHead: RulesFromHead | null = null;
+  const head = headRulesRef(repo, pr, ui.rulesSource);
+  if (head && (await fileAt(repo, CONFIG_FILE, head)) !== (await fileAt(repo, CONFIG_FILE, baseRef))) {
+    const merged = mergeHeadConfig(file, await repoConfigFile(repo, head, "head branch"), ui);
+    file = merged.config;
+    fromHead = { ref: head, files: [CONFIG_FILE], ignored: merged.ignored };
+  }
+  return { ...normalizeRules({ ...ui, ...(file || {}) }), ...(file?.checks ? { checks: file.checks } : {}), configFile: file ? Object.keys(file) : null, fromHead };
 }
 
 export function normalizeLearningList(list: unknown): string[] {

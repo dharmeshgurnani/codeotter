@@ -52,6 +52,8 @@ export type Review = {
   };
   model: string;
   guide?: string | null;
+  // rule files read from a same-repository head (Repository settings / Rules source: head branch)
+  rulesFromHead?: { ref: string; files: string[]; ignored: string[] } | null;
   learnings?: string[];
   linkedIssues?: { number: number; key?: string; repo?: string; title: string; body?: string; state?: string; url: string; labels?: string[] }[];
   gitHistory?: {

@@ -25,7 +25,7 @@ export function loadTools({ answer, body = "Author text.", reflectMin = 0, files
     llmConfig: async () => ({ provider: "test", model: "stub" }),
     reviewConfig: async () => ({ contextLines: 0, diffChars: 90000, maxFindings: 8, reflectMin }),
     headFileTexts: async (_pr: unknown, paths: string[]) => new Map(paths.filter((p) => p in files).map((p) => [p, files[p]])),
-    guideFor: async () => ({ file: "AGENTS.md", text: "Titles use the imperative mood." }),
+    prGuide: async () => ({ guide: { file: "AGENTS.md", text: "Titles use the imperative mood." }, fromHead: [] }),
     repoOf: (p: { url: string }) => (p.url.match(/github\.com\/([^/]+\/[^/]+)\/pull/) || [])[1] || "",
     isForgeRepo: () => false,
     parsePrUrl: (u: string) => ({ repo: "acme/shop", number: Number(u.split("/").pop()) }),

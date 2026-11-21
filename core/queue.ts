@@ -78,7 +78,7 @@ async function handlePr(repo: string, p: QueuedPr) {
   if (tc.auto && done[p.url]?.headSha !== p.headRefOid) await triagePr(p.url, repo).catch((e: Error) => console.warn(`[triage] ${p.url}: ${e.message}`));
   if (!rc.auto) return;
   // skip rules: Repository settings, overridden by .codeotter.json on the base branch (repo-rules.ts)
-  if (skipReason(p, await effectiveRules(repo, rc, p))) return;
+  if (skipReason(p, await effectiveRules(repo, { ...rc, rulesSource: "base" }, p))) return;
   const reviewed = (await store.getSetting("autoReviewed")) || {};
   if (reviewed[p.url] === p.headRefOid) return;
   const failed = (await store.getSetting("autoReviewFailed")) || {};

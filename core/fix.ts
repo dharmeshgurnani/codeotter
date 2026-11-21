@@ -2,9 +2,9 @@
 // agent), and the /fix comment command, which asks the language model for a patch, checks it applies to the PR head in
 // memory, and posts it as committable suggestions. Nothing is ever pushed to the pull request's branch.
 import { store } from "./store.ts";
-import { isForgeRepo, readPr } from "./git.ts";
+import { readPr } from "./git.ts";
 import { askModel, llmConfig } from "./models.ts";
-import { guideFor, headFileTexts } from "./context.ts";
+import { headFileTexts, prGuide } from "./context.ts";
 import { deriveSuggestionFromDetail } from "./engines.ts";
 import { postInlineSuggestionsOnPr, resolvePr } from "./review.ts";
 import type { PullRequest } from "./context.ts";
@@ -231,7 +231,7 @@ export async function fixFindings(prUrl: string, repo: string, arg = ""): Promis
   const files = await headFileTexts(pr, [...new Set(targets.map((t) => t.f.file))]);
   const usable = targets.filter((t) => files.has(t.f.file));
   if (!usable.length) throw new Error("Could not read the findings' files at the PR head");
-  const guide = await guideFor(repo, isForgeRepo(repo) ? pr.headRefOid : pr.headRefName, pr.headRepo || repo).catch(() => null);
+  const guide = await prGuide(repo, pr).then((g) => g.guide, () => null);
   const prompt = `Write a patch that fixes these code review findings in pull request #${pr.number} "${flat(pr.title, 200)}". Each file is shown at the PR head with line numbers ("  123| code"); the numbers and "| " are not part of the file.
 Reply with ONLY a unified diff (git diff format, paths a/<file> and b/<file>) in a \`\`\`diff fence. Context and removed lines must match the file exactly. Change only what the findings need. Leave out a finding you cannot fix safely within the lines shown.
 ${guide ? `\nRepository guidelines from ${guide.file}:\n${guide.text.slice(0, 8000)}\n` : ""}
