@@ -21,6 +21,7 @@
   <a href="https://github.com/dharmeshgurnani/CodeOtter/stargazers"><img src="https://img.shields.io/github/stars/dharmeshgurnani/CodeOtter?style=social" alt="GitHub Stars" /></a>
   <a href="https://github.com/dharmeshgurnani/CodeOtter/actions/workflows/ci.yml"><img src="https://github.com/dharmeshgurnani/CodeOtter/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-c2410c.svg" alt="AGPL-3.0" /></a>
+  <a href="https://www.bestpractices.dev/projects/16972"><img src="https://www.bestpractices.dev/projects/16972/badge" alt="OpenSSF Best Practices" /></a>
   <a href="https://docs.codeotter.io/docs/security"><img src="https://img.shields.io/badge/Privacy-Zero_Telemetry-15803d.svg" alt="Zero Telemetry" /></a>
   <a href="https://docs.codeotter.io/docs/local-gguf-sidecar"><img src="https://img.shields.io/badge/Models-Local_GGUF_%7C_BYOK-b45309.svg" alt="Local or BYOK" /></a>
   <a href="package.json"><img src="https://img.shields.io/badge/Node-%3E%3D22-111111.svg" alt="Node Version" /></a>
