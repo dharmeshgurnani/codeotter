@@ -4,6 +4,7 @@ import { HOTSPOTS } from "./diff.ts";
 import { issueLabel } from "./context.ts";
 import { deriveSuggestionFromDetail, S1_SCORES } from "./engines.ts";
 import { allFindingsPrompt, promptDetails } from "./fix.ts";
+import { relatedCount } from "./related.ts";
 import { effort, gateStatus, repoOf, VERDICT } from "./views.ts";
 import type { BlastRadius, ChangedFile, OutsideImpact } from "./diff.ts";
 import type { ScoreKey } from "./engines.ts";
@@ -11,7 +12,7 @@ import type { ReviewBody, ReviewRecord } from "./review.ts";
 
 export type ScoresCommentInput = Pick<ReviewRecord, "pr" | "blast" | "review"> & Partial<Pick<ReviewRecord, "gates" | "linkedIssues" | "headSha" | "incremental">>;
 type MermaidInput = { pr: ReviewRecord["pr"]; blast?: Partial<BlastRadius>; review?: Partial<ReviewBody>; outsideDiffImpact?: OutsideImpact };
-export type ReviewCommentInput = ScoresCommentInput & MermaidInput & { guide?: string | null };
+export type ReviewCommentInput = ScoresCommentInput & MermaidInput & Partial<Pick<ReviewRecord, "rulesFromHead">> & { guide?: string | null };
 
 // A label in a markdown table cell: custom check names are user text, so no pipes, tags, backticks or line breaks.
 const mdCell = (s: string): string => String(s).replace(/[|<>`\s]+/g, " ").trim();
@@ -187,6 +188,13 @@ function buildBlastMermaid(r: MermaidInput): string {
       out.push(`  ${firstCohort} -.->|calls ${cleanMermaidText(c.symbol, 14)}| ${ocid}`);
     });
   }
+  // related repositories: one count node (a PR comment's readers may not see those repositories, or know they exist)
+  const rel = relatedCount(r.outsideDiffImpact);
+  if (rel.usages) {
+    out.push("  classDef related fill:#1e1033,stroke:#a855f7,stroke-width:1.5px,color:#f3e8ff");
+    out.push(`  RR0["🔗 Related repositories<br/>${rel.usages} usage(s) in ${rel.repos} repositor${rel.repos === 1 ? "y" : "ies"}"]:::related`);
+    out.push("  PR -.->|used by| RR0");
+  }
 
   return out.join("\n");
 }
@@ -211,6 +219,13 @@ export function formatReviewComment(r: ReviewCommentInput, { agentPrompts = fals
       ? [
           "",
           `⚡ **Incremental delta:** \`${incremental.prevSha.slice(0, 7)}\` → \`${incremental.headSha.slice(0, 7)}\` (${incremental.newCommits.length} new commit${incremental.newCommits.length === 1 ? "" : "s"})${resolved.length ? ` · ✅ **${resolved.length} prior finding${resolved.length === 1 ? "" : "s"} resolved**` : ""}`,
+        ]
+      : []),
+    // head-branch rules (context.ts, "Rules source"): which rule files came from the head, and what the merge refused
+    ...(r.rulesFromHead?.files.length
+      ? [
+          "",
+          `📐 **Rules from head** \`${r.rulesFromHead.ref.slice(0, 7)}\`: ${r.rulesFromHead.files.map((f) => `\`${mdCell(f)}\``).join(", ")}${r.rulesFromHead.ignored.length ? ` · ignored from head, base applies: ${r.rulesFromHead.ignored.map((k) => `\`${mdCell(k)}\``).join(", ")}` : ""}`,
         ]
       : []),
     ...(linkedIssues.length
@@ -265,6 +280,9 @@ export function formatReviewComment(r: ReviewCommentInput, { agentPrompts = fals
           "The following un-modified files in the repository depend on symbols altered in this diff (verified for contract & exception safety):",
           ...r.outsideDiffImpact.callers.slice(0, 5).map((c) => `- \`${c.file}:${c.line}\`: calls \`${c.symbol}()\` — \`${c.snippet.slice(0, 100)}\``),
         ]
+      : []),
+    ...(relatedCount(r.outsideDiffImpact).usages
+      ? ["", `#### 🔗 Related Repositories: ${relatedCount(r.outsideDiffImpact).usages} usage(s) of changed symbols in ${relatedCount(r.outsideDiffImpact).repos} related repositor${relatedCount(r.outsideDiffImpact).repos === 1 ? "y" : "ies"} (details on CodeOtter)`]
       : []),
     "",
     `## [2.5/4] Architecture & Blast Radius Graph`,

@@ -7,7 +7,9 @@ import { downloadModel, downloads, ensureRuntime, findPython, localStatus, sidec
 import { PB_URL, store } from "./store.ts";
 import { applyGithubToken, appPostingActive, cleanRepo, forgeApi, forgeId, forgeOf, ghAsync, isForgeRepo, nativeRepo, repoLabel, repos, repositoryChoices } from "./git.ts";
 import { askModel, askSystemOne, llmConfig, s1Config } from "./models.ts";
-import { getRepoAccepted, getRepoLearnings, guideCache, guideFiles, normalizeLearningList, repoConfigFile, REVIEW_DEFAULTS, reviewConfig, storedReview } from "./context.ts";
+import { getRepoAccepted, getRepoLearnings, guideCache, guideFiles, normalizeLearningList, PROMOTE_AFTER, repoConfigFile, REVIEW_DEFAULTS, reviewConfig, RULE_MIN_FIX_RATE, RULE_MIN_SAMPLES, storedReview } from "./context.ts";
+import { repoRules, ruleAction } from "./learned.ts";
+import type { RuleAction, RuleRow } from "./learned.ts";
 import { triageConfig } from "./review.ts";
 import { actionSecret, describeDelivery, forwarderStatus, LOCAL_APP_URL, reposChanged, syncForwarders, webhookUrl } from "./queue.ts";
 import { repoOf } from "./views.ts";
@@ -15,6 +17,7 @@ import { clearTicketCache, jiraBase, LINEAR_API, testJira, testLinear, trackerKe
 import { accessQueue, allowed, effectiveRole, emailDomainAllowed, isEmailDomain, isRole, onboardedRepo, ROLES, SSO_PB, userView } from "./access.ts";
 import { auditPage, auditRepos } from "./audit.ts";
 import type { Access, Role, SessionUser } from "./access.ts";
+import { RELATED_MAX, relatedChoices, validateRelated } from "./related.ts";
 import type { Cell, CellObject, Tone } from "./views.ts";
 import type { OAuthProviderConfig, SsoSetting } from "./store.ts";
 import type { ProviderDef } from "./providers.ts";
@@ -22,6 +25,7 @@ import type { LocalModel } from "./local-models.ts";
 import type { ReviewSettings } from "./context.ts";
 import { CONFIG_FILE, rulesAsText } from "./repo-rules.ts";
 import type { TrackerSettings } from "./trackers.ts";
+import { dockerStatus, LIMITS, normalizeSandbox, SANDBOX_TIMEOUTS, sandboxConfig, sandboxReady } from "./sandbox.ts";
 import { analyzerAsset, analyzerBin, ANALYZER_IDS, ANALYZERS, canInstall, installAnalyzer, isAnalyzerId, removeAnalyzer } from "./analyzers.ts";
 
 // Page JSON drawn by web/src/components/json-form.tsx (Field, Section, Action, Row there).
@@ -59,7 +63,7 @@ export type PageScope = { org?: string; repo?: string };
 export type Body = Record<string, unknown>;
 export type CookieWriter = { setCookie(name: string, value: string, maxAgeSeconds: number): void };
 export type ActionResult = { message: string } | { submit: { url: string; fields: Record<string, string> } };
-export type PageAction = (body: Body, http: CookieWriter) => Promise<ActionResult>;
+export type PageAction = (body: Body, http: CookieWriter, scope?: PageScope) => Promise<ActionResult>;
 export interface SettingsPage {
   title: string;
   group: SettingsGroup;
@@ -77,6 +81,28 @@ const isObj = (x: unknown): x is Record<string, unknown> => !!x && typeof x === 
 // A body field read as an object (anything else has no fields) or as a list.
 const rec = (x: unknown): Record<string, unknown> => (isObj(x) ? x : {});
 const arr = (x: unknown): unknown[] => (Array.isArray(x) ? x : []);
+// One learned rule as a Learnings table row. Every action is shown; those that do not apply are disabled.
+const RULE_TONE: Record<RuleRow["status"], Tone> = { active: "ok", off: "muted", locked: "info", suggested: "warn" };
+function ruleTableRow(r: RuleRow): Row {
+  const live = r.status === "active" || r.status === "locked";
+  const actions: (Action & { id: RuleAction })[] = [
+    { id: "accept", label: "Accept", disabled: r.status !== "suggested" },
+    { id: "remove", label: r.status === "suggested" ? "Reject" : "Remove", variant: "outline", danger: r.status !== "suggested" },
+    { id: "lock", label: r.status === "locked" ? "Unlock" : "Lock", variant: "outline", disabled: !live },
+    { id: "switch", label: r.status === "off" ? "Switch on" : "Switch off", variant: "outline", disabled: r.status === "suggested" || r.status === "locked" },
+  ];
+  return {
+    id: r.id,
+    label: r.text,
+    cells: {
+      rule: r.source === "model" && r.support ? { text: r.text, info: `Drafted by the model from ${r.support} finding${r.support === 1 ? "" : "s"} pushed back on` } : r.text,
+      status: { text: r.status, tone: RULE_TONE[r.status] },
+      fixed: r.fixed, ignored: r.ignored, dismissed: r.dismissed,
+      reactions: `${r.up} / ${r.down}`,
+    },
+    actions,
+  };
+}
 // The table row the UI marked as edited, if any.
 const editedRow = (table: unknown, ok: (r: Record<string, unknown>) => boolean) => arr(rec(table).rows).find((r): r is Record<string, unknown> => isObj(r) && !!r.edited && ok(r));
 
@@ -221,6 +247,8 @@ async function githubManifest(body: Body, http: CookieWriter): Promise<ActionRes
       contents: "read",
       pull_requests: "write",
       statuses: "write",
+      checks: "write",
+      members: "read",
       issues: "write",
       metadata: "read",
       administration: "read",
@@ -334,6 +362,8 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
       await store.setSetting("repos", next);
       await auditRepos(before, next);
       reposChanged(before, next).catch((e) => console.warn(`[repos] ${e.message}`));
+      // a removed repository's learned rules and signal go with its learnings
+      for (const r of before.filter((x) => !next.includes(x))) if (await store.getSetting(`learned:${r}`)) await store.setSetting(`learned:${r}`, { signals: [], rules: {} });
       const [guides, repoSettings] = await Promise.all([
         store.getSetting("guides").then((x) => ({ ...(x || {}) })),
         store.getSetting("repoSettings").then((x) => ({ ...(x || {}) })),
@@ -358,8 +388,8 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
     access: "admin",
     async load({ org = "", repo = "" } = {}) {
       await onboardedRepo(repo, org);
-      const [rc, files, guides, learnings, accepted, configFile] = await Promise.all([reviewConfig(repo), guideFiles(repo), store.getSetting("guides"), getRepoLearnings(repo), getRepoAccepted(repo),
-        repoConfigFile(repo).then((f) => (f ? `${CONFIG_FILE} on the default branch sets ${Object.keys(f).join(", ") || "nothing"}; those keys override the fields below` : `No ${CONFIG_FILE} at the root`), (e: Error) => e.message)]);
+      const [rc, files, guides, rules, accepted, onboarded, configFile, sbx, docker] = await Promise.all([reviewConfig(repo), guideFiles(repo), store.getSetting("guides"), repoRules(repo), getRepoAccepted(repo), repos(),
+        repoConfigFile(repo).then((f) => (f ? `${CONFIG_FILE} on the default branch sets ${Object.keys(f).join(", ") || "nothing"}; those keys override the fields below` : `No ${CONFIG_FILE} at the root`), (e: Error) => e.message), sandboxConfig(repo), dockerStatus()]);
       // One section, one Save: review settings, guidelines and learnings are all this repository's.
       const sections: Section[] = [
         {
@@ -381,6 +411,7 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
             { key: "resolveFixed", label: "Resolve fixed comments", type: "checkbox", text: "Resolve CodeOtter's inline comments that a later push fixed" },
             { key: "auto", label: "Auto-review", type: "checkbox", text: "Review every new or updated pull request and post the result (PRs labelled codeotter:skip are left alone)" },
             { key: "configFile", label: "Repository config", type: "readonly" },
+            { key: "rulesSource", label: "Rules source", type: "select", options: [{ value: "base", label: "Base branch" }, { value: "head", label: "Head branch (same-repository PRs)" }], hint: `${CONFIG_FILE}, AGENTS.md and CLAUDE.md. From the head: guides, new path instructions, new checks. Forks, skip rules, path filters and existing checks: always the base.` },
             { key: "reviewDrafts", label: "Draft pull requests", type: "checkbox", text: "Auto-review drafts" },
             { key: "skipAuthors", label: "Skip authors", type: "textarea", placeholder: "dependabot[bot]\nrenovate[bot]", hint: "One login per line, * wildcard." },
             { key: "skipLabels", label: "Skip labels", type: "textarea", placeholder: "no-review" },
@@ -401,36 +432,82 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
                 { key: "instructions", label: "Question (yes passes)", type: "text", placeholder: "Does a change to a public API come with a CHANGELOG entry?" },
                 { key: "mode", label: "Mode", type: "select", options: [{ value: "warn", label: "Warn" }, { value: "block", label: "Block" }, { value: "off", label: "Off" }] },
               ],
-              hint: "A failed Block check fails the codeotter/checks commit status; Warn failures pass it with a note.",
+              hint: "A failed Block check fails codeotter/checks (a check run where the GitHub App is installed, else a commit status); Warn failures pass it with a note.",
             },
+            { key: "overrides", label: "Check overrides", type: "checkbox", text: "Requested reviewers may override failing checks with /override <check|all> <reason>; never the PR author" },
+            { key: "related", label: "Related repositories", type: "multiselect", options: relatedChoices(repo, onboarded).map((value) => ({ value, label: repoLabel(value) })), hint: `Up to ${RELATED_MAX}, same organization and provider. Reviews search them for usages of changed exported symbols.` },
             files.length ? { key: "useGuides", label: "Review guidelines", type: "checkbox", text: `Follow ${files.join(" + ")}` } : { key: "noGuides", label: "Review guidelines", type: "readonly" },
-            { key: "learnings", label: "Team learnings", type: "list", hint: "Dismissed findings, kept as rules for this repository." },
+            { key: "autoLearn", label: "Auto-promote suggested rules", type: "checkbox", text: "Switch a suggested rule on by itself once enough similar findings were pushed back on (off: suggest only)" },
+            { key: "promoteAfter", label: "Promote after", type: "select", options: PROMOTE_AFTER.map((v) => ({ value: v, label: `${v} findings pushed back on` })) },
+            { key: "ruleMinSamples", label: "Rule health sample", type: "select", options: RULE_MIN_SAMPLES.map((v) => ({ value: v, label: `${v} closed findings` })) },
+            { key: "ruleMinFixRate", label: "Switch off below", type: "select", options: RULE_MIN_FIX_RATE.map((v) => ({ value: v, label: v ? `${v}% fixed` : "Never" })), hint: "Locked rules stay on." },
             { key: "accepted", label: "Accepted fixes", type: "list" },
           ],
           actions: [{ id: "save", label: "Save" }],
+        },
+        {
+          id: "rules",
+          title: "Learnings",
+          ...(rules.error ? { description: `Drafting a rule failed: ${rules.error}` } : {}),
+          fields: [{ key: "rows", label: "Learnings", type: "table", columns: [{ key: "rule", label: "Rule" }, { key: "status", label: "Status" }, { key: "fixed", label: "Fixed" }, { key: "ignored", label: "Ignored" }, { key: "dismissed", label: "Dismissed" }, { key: "reactions", label: "👍 / 👎" }] }],
+        },
+        // Runs pull-request code: its own section and save, stored apart from the review settings (core/sandbox.ts).
+        {
+          id: "sandbox",
+          title: "Sandbox run",
+          fields: [
+            docker.ok
+              ? { key: "enabled", label: "Sandbox run", type: "checkbox", text: "Run the test command on the PR head in Docker; the result is evidence for both engines" }
+              : { key: "docker", label: "Sandbox run", type: "readonly" },
+            { key: "image", label: "Image", type: "text", placeholder: "node:22-bookworm-slim" },
+            { key: "setup", label: "Setup command", type: "text", placeholder: "npm ci" },
+            { key: "setupNetwork", label: "Setup network", type: "checkbox", text: "Network for the setup command only" },
+            { key: "test", label: "Test command", type: "text", placeholder: "npx vitest run" },
+            { key: "targets", label: "Test targets", type: "textarea", placeholder: "test/api.test.ts\ntest/db.test.ts", hint: "One per line. The model picks the ones the change needs; they are appended to the test command. Empty: the test command runs as is." },
+            { key: "timeoutSec", label: "Time limit", type: "select", options: SANDBOX_TIMEOUTS.map((v) => ({ value: v, label: `${v / 60} min` })) },
+            { key: "limits", label: "Limits", type: "readonly" },
+          ],
+          actions: [{ id: "save", label: "Save", disabled: !docker.ok }],
         },
       ];
       return {
         sections,
         values: {
+          sandbox: {
+            ...sbx,
+            targets: sbx.targets.join("\n"),
+            ...(docker.ok ? {} : { docker: `Docker not reachable: ${docker.error}` }),
+            limits: `${LIMITS.cpus} CPUs · ${LIMITS.memory.replace("g", " GB")} memory · ${LIMITS.pids} processes · read-only image · non-root · test step without network`,
+          },
           repo: {
             ...Object.fromEntries((Object.keys(REVIEW_DEFAULTS) as (keyof ReviewSettings)[]).map((k) => [k, rc[k]])),
             ...rulesAsText(rc),
             configFile,
             ...(files.length ? { useGuides: guides?.[repo]?.use ?? true } : { noGuides: "No AGENTS.md or CLAUDE.md at the root" }),
-            learnings,
             accepted,
             // not drawn: what the page loaded, so a save can tell removals from items added meanwhile
-            loadedLearnings: learnings,
             loadedAccepted: accepted,
           },
+          rules: { rows: rules.rows.map(ruleTableRow) },
         },
       };
     },
     async save(body, { org = "", repo = "" } = {}) {
       await onboardedRepo(repo, org);
+      if (body.sandbox) {
+        const next = normalizeSandbox(rec(body.sandbox));
+        if (next.enabled) {
+          const docker = await dockerStatus();
+          if (!docker.ok) throw new Error(`Docker not reachable: ${docker.error}`);
+          const missing = sandboxReady(next);
+          if (missing) throw new Error(missing);
+        }
+        const rs0 = await store.getSetting("repoSettings");
+        await store.setSetting("repoSettings", { ...(rs0 || {}), [repo]: { ...(rs0?.[repo] || {}), sandbox: next } });
+      }
       if (!body.repo) return;
       const v = rec(body.repo);
+      if ("related" in v) v.related = validateRelated(repo, v.related, await repos());
       const [guides0, rs0, current] = await Promise.all([store.getSetting("guides"), store.getSetting("repoSettings"), reviewConfig(repo)]);
       // Only what was sent changes. Review keys merge over the current values. Lists apply removals only: items the
       // page loaded (`loadedLearnings` / `loadedAccepted`) and no longer sends are dropped from the current list, so a
@@ -444,10 +521,14 @@ export const SETTINGS_PAGES: Record<string, SettingsPage> = {
       const reviewKeys = Object.keys(REVIEW_DEFAULTS).filter((k) => k in v);
       const next = { ...prev, ...(reviewKeys.length ? { review: storedReview(current, Object.fromEntries(reviewKeys.map((k) => [k, v[k]]))) } : {}) };
       const g = { ...(guides0?.[repo] || {}), ...("useGuides" in v ? { use: !!v.useGuides } : {}) };
-      if ("learnings" in v) { next.learnings = pruned(await getRepoLearnings(repo), v.loadedLearnings, v.learnings); g.learnings = next.learnings; }
       if ("accepted" in v) next.accepted = pruned(await getRepoAccepted(repo), v.loadedAccepted, v.accepted);
       await Promise.all([store.setSetting("guides", { ...(guides0 || {}), [repo]: g }), store.setSetting("repoSettings", { ...(rs0 || {}), [repo]: next })]);
     },
+    // Learnings table rows (learned.ts): accept or reject a suggestion, lock a rule on, switch it off or on, remove it.
+    actions: Object.fromEntries((["accept", "remove", "lock", "switch"] as const).map((id): [string, PageAction] => [id, async (body, _http, { org = "", repo = "" } = {}) => {
+      await onboardedRepo(repo, org);
+      return { message: await ruleAction(repo, String(body.item || ""), id) };
+    }])),
   },
   model: {
     title: "Model provider",
@@ -1002,6 +1083,29 @@ const accountsPage: SettingsPage & { invite(v: Body): Promise<void> } = {
   },
 };
 SETTINGS_PAGES.accounts = accountsPage;
+// Review next (Home): hours before an open pull request counts as overdue, kept per organization.
+SETTINGS_PAGES.queue = {
+  title: "Review queue",
+  group: "workspace",
+  access: "admin",
+  async load({ org = "" } = {}) {
+    const sla = (await store.getSetting("reviewSla")) || {};
+    return {
+      sections: [{ id: "queue", title: "Review next", fields: [{ key: "slaHours", label: "Review SLA (hours)", type: "number", min: 0, max: 8760, step: 1, hint: "Open pull requests older than this are overdue. 0: off." }], actions: [{ id: "save", label: "Save" }] }],
+      values: { queue: { slaHours: sla[org] ?? 0 } },
+    };
+  },
+  async save(body, { org = "" } = {}) {
+    if (!body.queue) return;
+    const raw = rec(body.queue).slaHours;
+    const hours = raw === "" || raw === null || raw === undefined ? 0 : Number(raw);
+    if (!Number.isInteger(hours) || hours < 0 || hours > 8760) throw new Error("Review SLA: whole hours, 0 to 8760");
+    const sla = { ...((await store.getSetting("reviewSla")) || {}) };
+    if (hours) sla[org] = hours;
+    else delete sla[org];
+    await store.setSetting("reviewSla", sla);
+  },
+};
 SETTINGS_PAGES.audit = auditPage;
 // Local models page: what is downloaded, what is available, one action per row. Nothing downloads by itself.
 // What a running sidecar reports as its device, as GPU or CPU: laya and llama.cpp say vulkan:N / VulkanN / cuda /

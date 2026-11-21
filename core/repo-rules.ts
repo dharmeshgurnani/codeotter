@@ -18,8 +18,10 @@
 // Globs: `*` and `?` stay inside one path segment, `**` crosses segments, a trailing `/` means everything below, a
 // leading `/` anchors at the root, and a glob without `/` matches the file name at any depth.
 //
-// Trust: the file is read from the base repository at the pull request's base branch, never from the head, so a pull
-// request (from a fork or not) cannot loosen the rules it is reviewed under; a change to the file applies once merged.
+// Trust: the file is read from the base repository at the pull request's base branch, so a pull request cannot loosen
+// the rules it is reviewed under. With Rules source = head branch (context.ts, "Rules source"), a same-repository pull
+// request's head copy is merged in for additive keys only (pathInstructions, new checks); every key above that can
+// loosen a review stays the base's, and a fork's head is never read.
 // Pure: no I/O and no core imports (context.ts imports it). Reading the file is repoConfigFile() in context.ts.
 
 export interface PathInstruction { path: string; instructions: string }

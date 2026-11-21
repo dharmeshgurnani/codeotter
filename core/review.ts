@@ -2,11 +2,14 @@
 import { APP_URL, REPO_RE } from "./config.ts";
 import { PROVIDERS } from "./providers.ts";
 import { store } from "./store.ts";
-import { createPrComment, forgeOf, ghAsApp, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, readPr, repos, validPrUrl } from "./git.ts";
+import { createPrComment, forgeOf, ghAsApp, ghAsync, isForgeRepo, parsePrUrl, prFetchSource, prUrlFor, readPr, repos, validPrUrl } from "./git.ts";
+import { CHECKS_CONTEXT, checksFailed, checksFinished, checksStarted, keptOverrides, postCommitStatus, SHA_RE } from "./merge-checks.ts";
+import type { CheckOverride, StatusState } from "./merge-checks.ts";
 import { askSystemOne, llmConfig, metered, newUsage, s1Config } from "./models.ts";
 import { estimateCost, recordEvent, reviewEvent } from "./analytics.ts";
-import { acceptedSuggestions, blastRadius, dynamicContextFiles, extendDiffContext, parseDiff, sliceOutsideDiffImpact } from "./diff.ts";
-import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, getRepoAccepted, getRepoLearnings, effectiveRules, guideFor, headFileTexts, postable, REVIEW_DEFAULTS, reviewConfig, shaMatch } from "./context.ts";
+import { acceptedSuggestions, blastRadius, dynamicContextFiles, extendDiffContext, extractChangedSymbols, parseDiff, sliceOutsideDiffImpact } from "./diff.ts";
+import { relatedImpact, usableRelated } from "./related.ts";
+import { addRepoAccepted, extractHeadSha, fetchGitHistory, fetchLinkedIssues, getRepoAccepted, getRepoLearnings, effectiveRules, headFileTexts, headRulesRef, prGuide, postable, REVIEW_DEFAULTS, reviewConfig, shaMatch } from "./context.ts";
 import { changeDigest, confirmFixedFindings, deriveSuggestionFromDetail, judge, S1_SCORES, scoreWithSystemOne, verifyFindingsWithSystemOne } from "./engines.ts";
 import { formatReviewComment, formatScoresComment } from "./comments.ts";
 import { findingPrompt, hunkAt, promptDetails } from "./fix.ts";
@@ -14,9 +17,11 @@ import { repoOf } from "./views.ts";
 import { filterDiff } from "./repo-rules.ts";
 import { analysisFailed, ANALYZER_IDS, changedLines, redactDeep, runAnalyzers } from "./analyzers.ts";
 import type { Analysis, AnalyzerRun } from "./analyzers.ts";
+import { runSandbox, sandboxConfig, sandboxPending } from "./sandbox.ts";
+import type { SandboxRun } from "./sandbox.ts";
 import { audit, AUTO, currentActor, orgOfRepo } from "./audit.ts";
 import type { BlastRadius, DiffContextStats, OutsideImpact } from "./diff.ts";
-import type { GitHistory, LinkedIssue, PullRequest } from "./context.ts";
+import type { GitHistory, LinkedIssue, PullRequest, RulesFromHead } from "./context.ts";
 import type { Finding, Gate, IncrementalCommit, IncrementalContext, Judgement, ScoreKey, Scores, Verdict, WalkthroughItem } from "./engines.ts";
 import type { S1Answers, S1Question } from "./models.ts";
 import type { TriageResult as StoredTriage } from "./store.ts";
@@ -46,6 +51,7 @@ export interface ReviewRecord {
   engines: { llm: string | null; s1: string | null };
   model: string;
   guide: string | null;
+  rulesFromHead?: RulesFromHead | null; // set when a same-repository head's rule files differ from the base's (context.ts)
   learnings: string[];
   linkedIssues: LinkedIssue[];
   gitHistory: GitHistory;
@@ -54,6 +60,8 @@ export interface ReviewRecord {
   commentError?: string;
   commentsPosted?: string[];
   analyzers?: AnalyzerRun[];
+  overrides?: CheckOverride[]; // /override on failing custom checks, for the head commit they were given on (merge-checks.ts)
+  sandbox?: SandboxRun;
 }
 export interface ActiveReview { state: ReviewRecord; error: string | null; promise: Promise<ReviewRecord> | null; done: boolean; }
 export interface TriageConfig { auto: boolean; stopAt: number; }
@@ -71,17 +79,9 @@ export interface InlineResult { posted: number; mode: "none" | "inline_review" |
 // published at once as a commit status (codeotter/triage) and an updatable PR comment, so a pipeline can stop or continue
 // within minutes. The deep review (language model / CodeReviewer) stays on demand. Fails loudly: status "error".
 const TRIAGE_CONTEXT = "codeotter/triage";
-export const SHA_RE = /^[0-9a-f]{7,40}$/i;
 export const triageConfig = async (): Promise<TriageConfig> => ({ auto: false, stopAt: 75, ...((await store.getSetting("triage")) || {}) });
 const triageRuns = new Map<string, Promise<TriageResult>>();
-type StatusState = "pending" | "success" | "failure" | "error";
 const postTriageStatus = (repo: string, sha: string, state: StatusState, description: string, url: string): Promise<unknown> => postCommitStatus(repo, sha, TRIAGE_CONTEXT, state, description, url);
-async function postCommitStatus(repo: string, sha: string, context: string, state: StatusState, description: string, url: string): Promise<unknown> {
-  if (!SHA_RE.test(sha || "")) return;
-  const fields = { state, context, description: description.slice(0, 140), target_url: `${APP_URL}/review?pr=${encodeURIComponent(url)}` };
-  if (isForgeRepo(repo)) return forgeOf(repo).status(repo, sha, fields, parsePrUrl(url)?.number);
-  return ghAsApp(repo, ["api", "--method", "POST", `repos/${repo}/statuses/${sha}`, ...Object.entries(fields).flatMap(([k, v]) => ["-f", `${k}=${v}`])]);
-}
 function formatTriageComment(t: TriageResult): string {
   const level = S1_SCORES.correctness_risk[Math.min(4, Math.round(t.risk / 25))];
   return [
@@ -143,20 +143,8 @@ export async function triagePr(ref: string, repoHint = ""): Promise<TriageResult
   return run;
 }
 
-// Custom pre-merge checks publish one commit status, codeotter/checks: failure when a "block" check fails, success otherwise
-// (warn-only failures are named in the description). No custom check answered, no status.
-const CHECKS_CONTEXT = "codeotter/checks";
-export function checksStatus(gates: Gate[]): { state: "success" | "failure"; description: string } | null {
-  const custom = gates.filter((g) => g.mode);
-  if (!custom.length) return null;
-  const names = (list: Gate[]) => list.map((g) => g.label).join(", ");
-  const blocked = custom.filter((g) => !g.pass && g.mode === "block");
-  const warned = custom.filter((g) => !g.pass && g.mode === "warn");
-  if (blocked.length) return { state: "failure", description: `Failed: ${names(blocked)}${warned.length ? `; warning: ${names(warned)}` : ""}` };
-  if (warned.length) return { state: "success", description: `${custom.length - warned.length}/${custom.length} passed; warning: ${names(warned)}` };
-  return { state: "success", description: `All ${custom.length} check${custom.length === 1 ? "" : "s"} passed` };
-}
-
+// The review result goes to codeotter/checks: a check run where the GitHub App is installed, else a commit status when
+// custom checks ran (merge-checks.ts).
 export const activeReviews = new Map<string, ActiveReview>();
 
 export async function resolvePr(ref: string | number | null | undefined, repo = ""): Promise<{ urlGuess: string; spec: string[] }> {
@@ -231,10 +219,9 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
   const runLlm = !part || part === "llm" || !cached || !cached.review?.summary;
   // Use cached PR metadata immediately on Re-review if available, or fetch non-blockingly via ghAsync
   const pr: PullRequest = cached?.pr || JSON.parse(await readPr(urlGuess, spec));
-  // .codeotter.json on the base branch (cached): its "checks" replace Repository settings' before the run starts; a
-  // broken file fails the review below, where the rest of the file applies.
-  const fileRules = effectiveRules(repoOf(pr), rc, pr);
-  const early = await fileRules.catch(() => null);
+  // .codeotter.json on the base branch, and in head mode merged with a same-repository head's (cached): its "checks"
+  // replace Repository settings' before the run starts; a broken file fails the review below, where the rest applies.
+  const early = await effectiveRules(repoOf(pr), rc, pr).catch(() => null);
   if (early?.checks) rc.checks = early.checks;
   // Custom checks are gates: System One answers them with the scores, else the language model in its review.
   const checks = customCount(rc.checks) ? rc.checks : [];
@@ -267,6 +254,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
     engines,
     model: modelLabel,
     guide: cached?.guide || null,
+    rulesFromHead: cached?.rulesFromHead || null,
     learnings: initialLearnings,
     linkedIssues: cached?.linkedIssues || [],
     gitHistory: cached?.gitHistory || { prCommits: Array.isArray(pr.commits) ? pr.commits.map((cm) => ({ sha: String(cm.oid || "").slice(0, 7), message: String(cm.messageHeadline || "").trim(), author: cm.authors?.[0]?.login || pr.author?.login || "" })) : [], baseCommits: [] },
@@ -288,17 +276,21 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
     try {
       // Refresh PR metadata in background if we started from cached.pr
       if (cached?.pr) live.pr = JSON.parse(await readPr(urlGuess, spec));
-      if (publish && checksRun) await postCommitStatus(repoOf(live.pr), live.pr.headRefOid || "", CHECKS_CONTEXT, "pending", `Running ${customCount(checks)} check(s)`, live.pr.url).catch((e) => console.warn(`[checks] ${(e as Error).message}`));
-      const [rawDiff, guide, learnings] = await Promise.all([
+      if (publish) await checksStarted(repoOf(live.pr), live.pr.headRefOid || "", live.pr.url, checksRun ? customCount(checks) : 0).catch((e) => console.warn(`[checks] ${(e as Error).message}`));
+      const [rawDiff, guides, learnings, fileRules] = await Promise.all([
         readPr(urlGuess, spec, true),
-        Promise.resolve().then(() => guideFor(repoOf(live.pr), isForgeRepo(repoOf(live.pr)) ? live.pr.headRefOid : live.pr.headRefName, live.pr.headRepo || repoOf(live.pr))),
+        prGuide(repoOf(live.pr), live.pr, rc.rulesSource),
         getRepoLearnings(repoOf(pr)),
+        effectiveRules(repoOf(live.pr), rc, live.pr),
       ]);
+      const { guide } = guides;
       live.guide = guide?.file || null;
       live.learnings = learnings;
-      // .codeotter.json on the base branch wins over Repository settings for this review; excluded paths never reach a model
-      const { configFile: _file, ...rules } = await fileRules;
+      // .codeotter.json wins over Repository settings for this review; excluded paths never reach a model
+      const { configFile: _file, fromHead: configFromHead, ...rules } = fileRules;
       Object.assign(rc, rules);
+      const headFiles = [...guides.fromHead, ...(configFromHead?.files || [])];
+      live.rulesFromHead = headFiles.length ? { ref: headRulesRef(repoOf(live.pr), live.pr, rc.rulesSource), files: headFiles, ignored: configFromHead?.ignored || [] } : null;
       const filtered = filterDiff(rawDiff, rc).diff;
       let diff = filtered;
       if (rawDiff.trim() && !diff.trim()) throw new Error("Every changed file is excluded by the path filters");
@@ -315,10 +307,34 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
       const analysisTask: Promise<Analysis | null> = analyzerIds.length
         ? headFileTexts(live.pr, [...changedLines(filtered).keys()], 100).then((files) => runAnalyzers(files, filtered, analyzerIds)).catch((e: Error) => analysisFailed(analyzerIds, e.message))
         : Promise.resolve(null);
+      // Sandbox run (Repository settings, off by default): the admin's test command on the head, evidence for both
+      // engines. Started here, next to the context fetches; its own wall-clock limit bounds how long the engines wait.
+      // Never fails the review: a failure is the run's status.
+      const sbx = runLlm || runScores ? await sandboxConfig(repoOf(live.pr)) : null;
+      const sandboxTask: Promise<SandboxRun | null> = sbx?.enabled
+        ? (() => {
+            const sha = String(live.pr.headRefOid || "");
+            live.sandbox = sandboxPending(sbx, sha);
+            return runSandbox({
+              settings: sbx, sha, files: [...changedLines(filtered).keys()],
+              source: () => prFetchSource(live.pr),
+              llm: llmReady ? c : null, s1: s1.enabled ? s1 : null,
+              onUpdate: (r) => { live.sandbox = { ...r }; },
+            }).then((r) => (live.sandbox = r));
+          })()
+        : Promise.resolve(null);
 
       const outsideImpact = await sliceOutsideDiffImpact(repoOf(live.pr), diff, (live.pr.files || []).map((f) => f.path));
+      // Related repositories (Repository settings): usages of the changed exported symbols, never failing the review
+      const relatedList = rc.related.length ? usableRelated(repoOf(live.pr), rc.related, await repos()) : [];
+      if (relatedList.length) {
+        const exported = extractChangedSymbols(diff, true);
+        Object.assign(outsideImpact, await relatedImpact(relatedList, exported.length ? exported : outsideImpact.symbols, live.pr.headRefOid || initialHeadSha)
+          .catch((e: Error) => ({ related: relatedList.map((r) => ({ repo: r, status: "failed" as const, callers: 0, files: 0, error: e.message })), relatedCallers: [], relatedFormatted: "" })));
+      }
       live.outsideDiffImpact = outsideImpact;
-      const fb = blastRadius(live.pr.files, outsideImpact.outsideCallers, outsideImpact.uniqueFiles);
+      const relCallers = outsideImpact.relatedCallers || [];
+      const fb = blastRadius(live.pr.files, outsideImpact.outsideCallers, outsideImpact.uniqueFiles, { callers: relCallers.length, repos: new Set(relCallers.map((x) => x.repo)).size });
       const keepScore = !runScores || live.blast.source === "s1";
       live.blast = { ...fb, ...(keepScore ? { score: live.blast.score, source: live.blast.source || prevBlast?.source || "s1" } : {}) };
       const [gitHistory, linkedIssues] = await Promise.all([
@@ -419,7 +435,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
       const acceptedFixes = await getRepoAccepted(repoOf(live.pr));
 
       const s1Task = runScores && s1.enabled
-        ? scoreWithSystemOne(live.pr, diff, s1, guide, ({ readyScores, gates, done }) => {
+        ? sandboxTask.then((sandbox) => scoreWithSystemOne(live.pr, diff, s1, guide, ({ readyScores, gates, done }) => {
             live.pending.readyScores = { ...live.pending.readyScores, ...readyScores };
             if (readyScores.blast_radius !== undefined) {
               live.blast = { ...live.blast, score: readyScores.blast_radius, source: "s1" };
@@ -431,16 +447,16 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
               live.pending.scores = false;
               live.pending.gates = false;
             }
-          }, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes, checks)
+          }, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes, checks, sandbox))
         : Promise.resolve(null);
 
       const needLlmForScores = runScores && !s1.enabled;
       const llmTask = (runLlm || needLlmForScores) && llmReady
-        ? analysisTask.then((analysis) => { if (analysis) live.analyzers = analysis.runs; return judge(live.pr, diff, c, rc, guide, !s1.enabled, gitHistory, (partial) => {
+        ? Promise.all([analysisTask, sandboxTask]).then(([analysis, sandbox]) => { if (analysis) live.analyzers = analysis.runs; return judge(live.pr, diff, c, rc, guide, !s1.enabled, gitHistory, (partial) => {
             if (runLlm) {
               live.review = { ...live.review, ...partial, scores: live.review.scores };
             }
-          }, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes, s1.enabled ? [] : checks, analysis?.results || []).then((j) => redactDeep(j, analysis?.secrets || [])); }).then(({ blastRadius: llmBlast, checks: llmChecks, ...nav }): Judgement => {
+          }, linkedIssues, learnings, incrementalCtx, outsideImpact, acceptedFixes, s1.enabled ? [] : checks, analysis?.results || [], sandbox).then((j) => redactDeep(j, analysis?.secrets || [])); }).then(({ blastRadius: llmBlast, checks: llmChecks, ...nav }): Judgement => {
             if (llmChecks) {
               live.gates = llmChecks;
               live.pending.gates = false;
@@ -460,7 +476,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
           })
         : Promise.resolve(null);
 
-      const [narrative, typed] = await Promise.all([llmTask, s1Task]);
+      const [narrative, typed] = await Promise.all([llmTask, s1Task, sandboxTask]);
       let review: ReviewBody = runLlm && narrative ? narrative : live.review;
       if (runLlm && c.api === "codereviewer" && s1.enabled && review?.findings?.length) {
         const proposed = review.findings;
@@ -528,18 +544,22 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
         engines,
         model: modelLabel,
         guide: guide?.file || null,
+        rulesFromHead: live.rulesFromHead || null,
         learnings,
         linkedIssues: live.linkedIssues || [],
         gitHistory: live.gitHistory,
         at: new Date().toISOString(),
         ...(live.analyzers ? { analyzers: live.analyzers } : !runLlm && cached?.analyzers ? { analyzers: cached.analyzers } : {}),
+        ...(live.sandbox ? { sandbox: live.sandbox } : !sbx && cached?.sandbox ? { sandbox: cached.sandbox } : {}),
       };
-      const st = publish && checksRun ? checksStatus(finalGates) : null;
-      if (st) {
+      // overrides given (possibly while this run was going) on the commit this result reviewed
+      const overrides = keptOverrides(((await store.get(live.pr.url)) as ReviewRecord | null)?.overrides, live.pr.headRefOid || "");
+      if (overrides) result.overrides = overrides;
+      if (publish) {
         try {
-          await postCommitStatus(repoOf(live.pr), live.pr.headRefOid || "", CHECKS_CONTEXT, st.state, st.description, live.pr.url);
+          await checksFinished(repoOf(live.pr), result, checksRun);
         } catch (e) {
-          result.commentError = `Commit status ${CHECKS_CONTEXT}: ${(e as Error).message}`;
+          result.commentError = `${CHECKS_CONTEXT}: ${(e as Error).message}`;
         }
       }
       // Inline comments a later push fixed: the re-review dropped them, and a model confirms the delta fixes each one.
@@ -573,7 +593,7 @@ export async function startOrPollReview(ref: string, force: boolean, repo?: stri
     } catch (e) {
       entry.error = (e as Error).message;
       entry.done = true;
-      if (publish && checksRun) await postCommitStatus(repoOf(live.pr), live.pr.headRefOid || "", CHECKS_CONTEXT, "error", `Checks not run: ${entry.error}`, live.pr.url).catch(() => {});
+      if (publish) await checksFailed(repoOf(live.pr), live.pr.headRefOid || "", live.pr.url, entry.error, checksRun).catch((err: Error) => console.warn(`[checks] ${err.message}`));
       // The next poll reports the error; without a poller the entry (and its live state) would stay in memory for good.
       setTimeout(() => { if (activeReviews.get(live.pr.url) === entry) activeReviews.delete(live.pr.url); }, 120000).unref?.();
       throw e;

@@ -34,13 +34,17 @@ export type Review = {
     newCommits: { sha: string; message: string; author?: string }[];
     resolvedFindings?: Finding[];
   };
-  blast: { score: number; files: number; lines: number; dirs: number; hotspots: string[]; testFiles: number; outsideCallers?: number; outsideFiles?: number; source?: "s1" };
+  blast: { score: number; files: number; lines: number; dirs: number; hotspots: string[]; testFiles: number; outsideCallers?: number; outsideFiles?: number; relatedCallers?: number; relatedRepos?: number; source?: "s1" };
   outsideDiffImpact?: {
     symbols: string[];
     callers: { symbol: string; file: string; line: number; snippet: string }[];
     outsideCallers: number;
     uniqueFiles: number;
     formatted: string;
+    // related repositories (Repository settings), already filtered to what this viewer may see
+    related?: { repo: string; status: "ok" | "unsupported" | "failed" | "timeout" | "skipped"; callers: number; files: number; cached?: boolean; error?: string }[];
+    relatedCallers?: { repo?: string; symbol: string; file: string; line: number; snippet: string }[];
+    relatedHidden?: number;
   };
   review: {
     summary: string;
@@ -52,6 +56,8 @@ export type Review = {
   };
   model: string;
   guide?: string | null;
+  // rule files read from a same-repository head (Repository settings / Rules source: head branch)
+  rulesFromHead?: { ref: string; files: string[]; ignored: string[] } | null;
   learnings?: string[];
   linkedIssues?: { number: number; key?: string; repo?: string; title: string; body?: string; state?: string; url: string; labels?: string[] }[];
   gitHistory?: {
@@ -59,6 +65,8 @@ export type Review = {
     baseCommits?: { sha: string; message: string; author?: string }[];
   };
   gates?: { id: string; label: string; yes: number; pass: boolean; mode?: "warn" | "block" }[];
+  // /override on failing custom checks (core/merge-checks.ts), for the head commit they were given on
+  overrides?: { check: string; label: string; by: string; reason: string; at: string; sha: string }[];
   engines?: { llm: string | null; s1: string | null };
   pending?: {
     scores?: boolean;
@@ -71,6 +79,13 @@ export type Review = {
   // self-contained prompts for coding agents: one per finding (by index, empty when dismissed) and one for all open ones
   agentPrompts?: { all: string; findings: string[] };
   analyzers?: { id: string; label: string; status: "ok" | "failed" | "timeout" | "unavailable"; found: number; kept: number; ms: number; error?: string }[];
+  // core/sandbox.ts SandboxRun; output is written by the pull request's code
+  sandbox?: {
+    status: "running" | "passed" | "failed" | "timeout" | "error" | "skipped";
+    image: string; sha: string; targets: string[]; rejected: number; chosenBy: string;
+    steps: { step: "setup" | "test"; exitCode: number | null; ms: number; network: boolean; timedOut: boolean }[];
+    exitCode: number | null; failedTests: string[]; output: string; truncated: boolean; ms: number; error?: string;
+  };
   at: string;
 };
 export type User = { id: string; name: string; email: string; role: string; avatar: string };

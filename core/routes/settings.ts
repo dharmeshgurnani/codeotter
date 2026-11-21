@@ -12,7 +12,7 @@ import type { Env, Viewer } from "./middleware.ts";
 // ?org= and ?repo= of a settings request.
 export type SettingsScope = { org: string; repo: string };
 // What this router needs of a SETTINGS_PAGES entry.
-type SettingsAction = (body: Record<string, unknown>, ctx: { setCookie: (name: string, value: string, maxAge: number) => void }) => Promise<unknown>;
+type SettingsAction = (body: Record<string, unknown>, ctx: { setCookie: (name: string, value: string, maxAge: number) => void }, scope: SettingsScope) => Promise<unknown>;
 type SettingsPage = {
   access?: string;
   load: (scope: SettingsScope, user: Viewer["user"], view?: Record<string, unknown>) => Promise<unknown>;
@@ -52,14 +52,14 @@ settings.post("/:page{[a-z]+}", page, access, scope, async (c) => {
   return c.json(await p.load(s, user, body));
 });
 
-settings.post("/:page{[a-z]+}/:action{[a-z]+}", page, access, async (c) => {
+settings.post("/:page{[a-z]+}/:action{[a-z]+}", page, access, scope, async (c) => {
   const p = c.get("page"), id = c.req.param("action");
   if (id === "test" && typeof p.test === "function") return c.json(await p.test());
   const action = own(p.actions || {}, id);
   if (!action) throw new Error(`No action ${id} on ${c.req.param("page")}`);
   const body = await jsonBody(c);
-  const result = await action(body, { setCookie: (name, value, maxAge) => cookie(c, name, value, maxAge) });
-  await auditAction(c.req.param("page"), id, body);
+  const result = await action(body, { setCookie: (name, value, maxAge) => cookie(c, name, value, maxAge) }, c.get("scope"));
+  await auditAction(c.req.param("page"), id, body, c.get("scope"));
   return c.json(result);
 });
 

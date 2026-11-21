@@ -71,6 +71,37 @@ const Md = ({ head, rows }: { head: string[]; rows: React.ReactNode[][] }) => (
   </div>
 );
 
+const SANDBOX_BADGE: Record<NonNullable<Review["sandbox"]>["status"], { tone: "ok" | "bad" | "warn" | "muted" | "info"; text: string }> = {
+  running: { tone: "info", text: "Running" },
+  passed: { tone: "ok", text: "Passed" },
+  failed: { tone: "bad", text: "Failed" },
+  timeout: { tone: "warn", text: "Timed out" },
+  error: { tone: "warn", text: "Did not run" },
+  skipped: { tone: "muted", text: "Skipped" },
+};
+const secs = (ms: number) => `${Math.round(ms / 100) / 10} s`;
+// The admin's test command on the PR head in Docker (core/sandbox.ts). The output is the PR code's own: shown as text.
+export const SandboxSection = ({ run }: { run: NonNullable<Review["sandbox"]> }) => {
+  const b = SANDBOX_BADGE[run.status];
+  return (
+    <details className="my-2.5" open={run.status === "failed"}><summary className="cursor-pointer text-sm font-semibold">Sandbox run <Badge tone={b.tone} className="ml-1.5">{b.text}</Badge></summary>
+      <Md head={["Step", "Status", "Exit code", "Time"]} rows={[
+        ...run.steps.map((st) => [
+          <>{st.step}{st.network ? <Badge tone="muted" className="ml-1.5">network</Badge> : null}</>,
+          <Badge key={st.step} tone={st.timedOut ? "warn" : st.exitCode === 0 ? "ok" : "bad"}>{st.timedOut ? "Timed out" : st.exitCode === 0 ? "Passed" : "Failed"}</Badge>,
+          st.exitCode ?? "",
+          secs(st.ms),
+        ] as React.ReactNode[]),
+        ...(run.status === "running" ? [["", <InlineLoader key="r" text="Running…" />, "", ""] as React.ReactNode[]] : []),
+      ]} />
+      {run.error ? <p className="my-1.5 text-sm text-muted-foreground">{run.error}</p> : null}
+      <p className="my-1.5 text-sm text-muted-foreground">{run.image}{run.sha ? ` · ${run.sha.slice(0, 7)}` : ""}{run.targets.length ? ` · ${run.targets.join(", ")}` : ""}{run.chosenBy ? ` · picked by ${run.chosenBy}` : ""}{run.rejected ? ` · ${run.rejected} pick(s) outside the list dropped` : ""}</p>
+      {run.failedTests.length ? <Md head={["Failed test"]} rows={run.failedTests.map((t) => [t])} /> : null}
+      {run.output ? <pre className="my-1.5 max-h-64 overflow-auto whitespace-pre-wrap rounded border border-border bg-muted p-2 text-xs">{run.truncated ? "…\n" : ""}{run.output}</pre> : null}
+    </details>
+  );
+};
+
 export const Ring = ({ label, value: raw, invert, loading }: { label: string; value: number; invert?: boolean; loading?: boolean }) => {
   if (loading) {
     return (
@@ -246,7 +277,52 @@ export function buildBlastMermaid(r: Review) {
     });
   }
 
+  // callers in related repositories: outside-repository nodes labelled with their repository
+  const related = r.outsideDiffImpact?.relatedCallers ?? [];
+  const hidden = r.outsideDiffImpact?.relatedHidden ?? 0;
+  if (related.length || hidden) {
+    out.push("  classDef related fill:#1e1033,stroke:#a855f7,stroke-width:1.5px,color:#f3e8ff");
+    related.slice(0, 6).forEach((c, idx) => {
+      const base = c.file.split("/").pop() || c.file;
+      out.push(`  RC${idx}["🔗 ${cleanMermaidText(repoLabel(c.repo || ""), 26)}<br/>${cleanMermaidText(base, 18)}${c.line ? `:${c.line}` : ""} uses ${cleanMermaidText(c.symbol, 16)}"]:::related`);
+      out.push(`  PR -.->|${cleanMermaidText(c.symbol, 14)}| RC${idx}`);
+    });
+    if (hidden) {
+      out.push(`  RCH["🔗 ${hidden} usage(s) in repositories not assigned to you"]:::related`);
+      out.push("  PR -.-> RCH");
+    }
+  }
+
   return out.join("\n");
+}
+
+const RELATED_TONE = { ok: "ok", unsupported: "muted", failed: "bad", timeout: "warn", skipped: "muted" } as const;
+const RELATED_TEXT = { ok: "Searched", unsupported: "No code search", failed: "Failed", timeout: "Timed out", skipped: "Skipped" } as const;
+// Related repositories searched for usages of the changed symbols: one row per repository, then the usages found.
+// The server already dropped repositories this viewer cannot see; only their count arrives.
+export function RelatedRepos({ o }: { o: Review["outsideDiffImpact"] }) {
+  const repos = o?.related ?? [];
+  const usages = o?.relatedCallers ?? [];
+  const hidden = o?.relatedHidden ?? 0;
+  if (!repos.length && !hidden) return null;
+  return (
+    <div className="mt-3 space-y-2">
+      <div className="text-sm font-semibold">Related repositories</div>
+      {repos.length ? (
+        <DataTable
+          columns={[{ key: "repo", label: "Repository" }, { key: "status", label: "Status" }, { key: "usages", label: "Usages", align: "right" }]}
+          rows={repos.map((x) => ({ id: x.repo, cells: { repo: repoLabel(x.repo), status: <Badge tone={RELATED_TONE[x.status]} title={x.error}>{RELATED_TEXT[x.status]}</Badge>, usages: x.callers } }))}
+        />
+      ) : null}
+      {usages.length ? (
+        <DataTable
+          columns={[{ key: "repo", label: "Repository" }, { key: "file", label: "File" }, { key: "symbol", label: "Symbol" }, { key: "snippet", label: "Usage" }]}
+          rows={usages.map((c, i) => ({ id: String(i), cells: { repo: repoLabel(c.repo || ""), file: <code>{c.file}{c.line ? `:${c.line}` : ""}</code>, symbol: <code>{c.symbol}</code>, snippet: <code className="text-xs">{c.snippet}</code> } }))}
+        />
+      ) : null}
+      {hidden ? <Badge tone="muted">{hidden} usage(s) in repositories not assigned to you</Badge> : null}
+    </div>
+  );
 }
 
 function buildAiReviewMarkdown(r: Review) {
@@ -404,6 +480,7 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
   const [learningNotice, setLearningNotice] = useState<string>("");
   const [copiedFixKey, setCopiedFixKey] = useState<string>("");
   const [postingSuggestionKey, setPostingSuggestionKey] = useState<string>("");
+  const [fixPr, setFixPr] = useState<{ busy: boolean; url: string }>({ busy: false, url: "" });
   const [postedSuggestionKeys, setPostedSuggestionKeys] = useState<Record<string, boolean>>({});
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const terminalScrollRef = useRef<HTMLDivElement>(null);
@@ -640,6 +717,25 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
     }
   };
 
+  const handleOpenFixPr = async () => {
+    setFixPr({ busy: true, url: "" });
+    setLearningNotice("");
+    try {
+      const res = await fetch(`/api/fix-stacked?org=${encodeURIComponent(org)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prUrl: p.url }),
+      });
+      const d = await res.json().catch(() => ({ error: `${res.status}` }));
+      if (!res.ok || d.error) throw new Error(d.error || `${res.status}`);
+      setFixPr({ busy: false, url: String(d.url || "") });
+      setLearningNotice(`${d.updated ? "Updated" : "Opened"} fix PR with ${d.applied} fix${d.applied === 1 ? "" : "es"}${d.skipped ? `, ${d.skipped} skipped` : ""}.`);
+    } catch (e) {
+      setFixPr({ busy: false, url: "" });
+      setLearningNotice(`Could not open fix PR: ${(e as Error).message}`);
+    }
+  };
+
   const reviewedSha = (r.headSha || p.headSha || prCommits.at(-1)?.sha || "").slice(0, 7);
 
   return (
@@ -667,6 +763,11 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
           ) : null}
           {r.guide && (
             <Badge tone="warn"><BookOpen className="size-3" /> Guidelines: {r.guide}</Badge>
+          )}
+          {!!r.rulesFromHead?.files.length && (
+            <Badge tone="info" title={r.rulesFromHead.ignored.length ? `Ignored from head, base applies: ${r.rulesFromHead.ignored.join(", ")}` : undefined}>
+              rules from head <code className="font-mono">{r.rulesFromHead.ref.slice(0, 7)}</code>: {r.rulesFromHead.files.join(", ")}
+            </Badge>
           )}
           {activeLearnings.length > 0 && (
             <Badge tone="accent" title={activeLearnings.join("\n")}>🧠 {activeLearnings.length} team learning{activeLearnings.length === 1 ? "" : "s"} active</Badge>
@@ -785,6 +886,18 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
               >
                 <span>{copiedFixKey === "prompt:all" ? "✓ Copied prompt" : "Copy prompt for all"}</span>
               </button>
+              <button
+                type="button"
+                disabled={fixPr.busy || !activeFindings.some((f) => f.suggestion && f.line && f.severity !== "nit")}
+                onClick={handleOpenFixPr}
+                className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2.5 py-1 text-xs font-medium text-neutral-800 hover:bg-accent disabled:opacity-50"
+              >
+                {fixPr.busy && <Loader2 className="size-3 animate-spin" />}
+                <span>Open fix PR</span>
+              </button>
+              {fixPr.url && fixPr.url.startsWith("https://") && (
+                <a href={fixPr.url} target="_blank" rel="noreferrer" className="text-xs font-medium text-brand hover:underline">Fix PR →</a>
+              )}
               <a href="/settings/repos" className="text-xs font-medium text-brand hover:underline">
                 Manage rules in Settings →
               </a>
@@ -956,8 +1069,10 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
               <p className="my-2 text-sm">
                 {b.files} files · {b.lines} lines · {b.dirs} areas · {b.testFiles} test files
                 {b.outsideCallers ? ` · 🌐 ${b.outsideCallers} outside caller(s) across ${b.outsideFiles || 1} un-modified file(s)` : ""}
+                {b.relatedCallers ? ` · 🔗 ${b.relatedCallers} usage(s) in ${b.relatedRepos || 1} related repositor${b.relatedRepos === 1 ? "y" : "ies"}` : ""}
               </p>
               {b.hotspots.length ? b.hotspots.map((h) => <Badge key={h} tone="warn" className="mr-1.5">{h}</Badge>) : <span className="text-sm text-muted-foreground">No hotspots touched.</span>}
+              <RelatedRepos o={r.outsideDiffImpact} />
             </details>
             <details className="my-2.5"><summary className="cursor-pointer text-sm font-semibold">Pre-merge checks</summary>
               <Md head={["Check", "Status"]} rows={[
@@ -969,9 +1084,9 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                       <>{check(v.verdict !== "request_changes" && v.scores.quality >= 60)} <span className="text-muted-foreground">({r.linkedIssues.map((i) => i.key || `#${i.number}`).join(", ")})</span></>,
                     ] as React.ReactNode[]]
                   : []),
-                ...(r.gates ?? []).map((g) => [
+                ...(r.gates ?? []).map((g) => [g, !g.pass ? r.overrides?.find((o) => o.check === g.id) : undefined] as const).map(([g, o]) => [
                   <>{g.label}{g.mode === "block" && <Badge className="ml-1.5">blocking</Badge>}</>,
-                  <>{check(g.pass, g.mode === "block")} <span className="text-muted-foreground">({Math.round(g.yes * 100)}% yes{g.id === "issue_requirements" && r.linkedIssues?.length ? ` · ${r.linkedIssues.map((i) => i.key || `#${i.number}`).join(", ")}` : ""})</span></>,
+                  <>{o ? <Badge tone="info" title={`${o.by}: ${o.reason}`}>Overridden by {o.by}</Badge> : check(g.pass, g.mode === "block")} <span className="text-muted-foreground">({Math.round(g.yes * 100)}% yes{g.id === "issue_requirements" && r.linkedIssues?.length ? ` · ${r.linkedIssues.map((i) => i.key || `#${i.number}`).join(", ")}` : ""})</span></>,
                 ] as React.ReactNode[]),
                 ...(pending?.gates ? [["Merge gates", <InlineLoader key="g" text="Checking policy gates…" />] as React.ReactNode[]] : []),
               ]} />
@@ -985,6 +1100,7 @@ export function ReviewPage({ forgeUrls = {}, org = "", pr, repo: repoHint, force
                 ] as React.ReactNode[])} />
               </details>
             ) : null}
+            {r.sandbox ? <SandboxSection run={r.sandbox} /> : null}
           </div>
         </div>
 

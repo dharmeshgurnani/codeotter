@@ -53,6 +53,8 @@ export interface PullRequest {
   url: string;
   author: { login: string };
   updatedAt: string;
+  // when the pull request was opened ("" when the server does not say)
+  createdAt?: string;
   baseRefName: string;
   headRefName: string;
   headRefOid: string;
@@ -73,6 +75,7 @@ interface PullRequestInput {
   url: string;
   author?: string;
   updatedAt?: string;
+  createdAt?: string;
   baseRefName?: string;
   headRefName?: string;
   headRefOid?: string;
@@ -97,13 +100,38 @@ export interface CommitStatus { state: string; context: string; description?: st
 export interface InlineComment { path: string; line: number; startLine?: number; body: string }
 // One comment of an inline review thread (root first). `line` is the new-file line, negative for an old-file line.
 // `thread`: the server's id for the conversation when replies address it rather than a comment (GitLab discussions).
-export interface ThreadComment { id: number | string; body: string; created_at: string; user: { id: number | string; login: string }; bot: boolean; path: string; line: number; hunk: string; author_association?: string; thread?: string }
+// One code search hit in a repository's default branch: a path, the matching line when the server reports it, a snippet.
+export interface CodeHit { path: string; line: number; snippet: string }
+// `reactions`: thumbs up / down (and equivalents) on the comment, where the list response carries them (GitHub).
+export interface ThreadComment { id: number | string; body: string; created_at: string; user: { id: number | string; login: string }; bot: boolean; path: string; line: number; hunk: string; author_association?: string; thread?: string; reactions?: Reactions }
+// Reactions on one comment, folded to up / down: 👍 ❤️ 🎉 🚀 count as up, 👎 😕 as down, anything else is ignored.
+export interface Reactions { up: number; down: number }
+const UP_REACTIONS = new Set(["+1", "thumbsup", "heart", "hooray", "tada", "rocket"]);
+const DOWN_REACTIONS = new Set(["-1", "thumbsdown", "confused"]);
+// A list of reaction names (Gitea `content`, GitLab award `name`), or GitHub's rollup object { "+1": n, ... }.
+export function countReactions(x: unknown): Reactions {
+  const out: Reactions = { up: 0, down: 0 };
+  const add = (name: unknown, n: number) => {
+    const k = String(name ?? "").toLowerCase();
+    if (!Number.isSafeInteger(n) || n <= 0) return;
+    if (UP_REACTIONS.has(k)) out.up += n;
+    else if (DOWN_REACTIONS.has(k)) out.down += n;
+  };
+  if (Array.isArray(x)) for (const name of x) add(name, 1);
+  else if (x && typeof x === "object") for (const [k, v] of Object.entries(x)) add(k, Number(v));
+  return out;
+}
 export type HookHeaders = Record<string, string | undefined>;
 export interface HookMeta { event: string; delivery: string; signature: string | undefined }
 // `inThread`: the comment was posted in an inline review conversation (a candidate reply under CodeOtter's comment).
 export interface RoutedHook { repo: string; pr?: PullRequest; comment?: ForgeComment; inThread?: boolean }
 export interface FileDiffInput { oldPath: string; newPath: string; oldText: string | null; newText: string | null; binary?: boolean }
 export type DiffOp = ["=" | "+" | "-", string];
+// Where a sandbox run (core/sandbox.ts) fetches a pull request's head with git: a URL on this provider's own origin, the
+// Authorization header for it (handed to git through its environment only) and the ref.
+export interface GitFetch { url: string; header: string; ref: string }
+type HeadRef = { headRepo?: string; headRefName?: string };
+const basic = (user: string, token: string) => `Basic ${Buffer.from(`${user}:${token}`).toString("base64")}`;
 // One adapter. Payload parameters (`normalize`, `hookBody`, `route`) take untrusted server JSON; each adapter declares
 // the raw shape it reads.
 export interface Forge {
@@ -115,6 +143,7 @@ export interface Forge {
   prUrl(repo: string, n: number): string;
   issueUrl(repo: string, n: number): string;
   repoUrl(repo: string): string;
+  fetchSource(repo: string, n: number, head: HeadRef): GitFetch;
   parsePr(u: URL): { native: string; number: number } | null;
   parseRepo(rest: string): string | null;
   test(): Promise<string>;
@@ -127,6 +156,8 @@ export interface Forge {
   file(repo: string, path: string, ref?: string): Promise<string | null>;
   baseCommits(repo: string, branch: string, n?: number): Promise<BaseCommit[]>;
   compare(repo: string, from: string, to: string): Promise<string>;
+  // Code search in one repository's default branch (related-repository context). null: the server has no code search API.
+  searchCode(repo: string, term: string, limit?: number): Promise<CodeHit[] | null>;
   issue(repo: string, n: number): Promise<ForgeIssue | null>;
   status(repo: string, sha: string, s: CommitStatus, n?: number): Promise<unknown>;
   comments(repo: string, n: number): Promise<ForgeComment[]>;
@@ -141,17 +172,43 @@ export interface Forge {
   setBody(repo: string, n: number, body: string): Promise<unknown>;
   commentsSince(repo: string, since: string): Promise<ForgeComment[]>;
   trusted(repo: string, c: ForgeComment): Promise<boolean>;
+  // Whether the comment's author is one of the pull request's requested reviewers (a user, or a member of a requested team
+  // where the server can tell). Gates /override (merge-checks.ts); adapters without a reviewer list leave it out.
+  requestedReviewer?(repo: string, n: number, c: ForgeComment): Promise<boolean>;
   react(repo: string, c: ForgeComment): Promise<unknown> | null;
   // Inline review threads, each oldest first, and a reply in one. Adapters without thread replies leave them out.
   reviewThreads?(repo: string, n: number): Promise<ThreadComment[][]>;
   replyInThread?(repo: string, n: number, root: ThreadComment, body: string): Promise<unknown>;
+  // Reactions on one thread comment, read when learned rules collect signal (only where the server has an API for them).
+  reactions?(repo: string, n: number, c: ThreadComment): Promise<Reactions>;
   ensureHook(repo: string, url: string, secret: string): Promise<boolean>;
   removeHook(repo: string, url: string): Promise<void>;
   secretHeader?: string;
   hookMeta(h: HookHeaders): HookMeta;
   hookBody?(x: unknown): { event: string; delivery: string };
   route?(event: string, x: unknown): RoutedHook | null;
+  // /fix stacked: a fix branch and pull request. Left out where the API cannot commit files as JSON (Bitbucket).
+  stacked?: StackedOps;
 }
+// <stacked-types>
+// One file of a fix commit, at its full new text.
+export interface FixFile { path: string; content: string }
+// An open fix pull request: its number, web URL and head branch.
+export interface FixPr { number: number; url: string; branch: string }
+export interface FixCommit { branch: string; headSha: string; headBranch: string; files: FixFile[]; message: string }
+export interface StackedOps {
+  // Whether the PR's head lives in another repository; where it is left out, PullRequest.headRepo says so.
+  fork?(repo: string, n: number): Promise<boolean>;
+  // The open same-repository pull request into `base` whose head branch starts with `prefix`.
+  findFixPr(repo: string, base: string, prefix: string): Promise<FixPr | null>;
+  // One commit with `files` on `branch`, made from `headSha` (the branch is created there when it does not exist).
+  commit(repo: string, c: FixCommit): Promise<void>;
+  openPr(repo: string, o: { branch: string; base: string; title: string; body: string }): Promise<FixPr>;
+  editPr(repo: string, n: number, o: { title: string; body: string }): Promise<unknown>;
+}
+export const FIX_BRANCH_RE = /^codeotter\/fix-[1-9]\d*-[0-9a-f]{7}$/;
+const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
+// </stacked-types>
 
 const enc = encodeURIComponent;
 const encPath = (p: string) => String(p).split("/").map(enc).join("/");
@@ -312,7 +369,7 @@ const isBinary = (buf: Buffer) => buf.subarray(0, 8000).includes(0);
 // The normalized pull request every caller sees (the shape `gh pr view --json` gives for GitHub).
 const pullRequest = (o: PullRequestInput): PullRequest => ({
   number: o.number, title: o.title || "", body: o.body || "", url: o.url,
-  author: { login: o.author || "unknown" }, updatedAt: o.updatedAt || "",
+  author: { login: o.author || "unknown" }, updatedAt: o.updatedAt || "", createdAt: o.createdAt || "",
   baseRefName: o.baseRefName || "", headRefName: o.headRefName || "", headRefOid: o.headRefOid || "", headRepo: o.headRepo,
   additions: o.additions ?? (o.files || []).reduce((n, f) => n + f.additions, 0),
   deletions: o.deletions ?? (o.files || []).reduce((n, f) => n + f.deletions, 0),
@@ -332,9 +389,10 @@ const STATE: Record<string, Record<string, string>> = {
 interface GiteaUser { id?: number; login?: string; username?: string }
 interface GiteaLabel { name?: string }
 interface GiteaPull {
-  number: number; title?: string; body?: string; user?: GiteaUser; updated_at?: string;
+  number: number; title?: string; body?: string; user?: GiteaUser; updated_at?: string; created_at?: string;
   base?: { ref?: string }; head?: { ref?: string; sha?: string; repo?: { full_name?: string } };
   additions?: number; deletions?: number; changed_files?: number; merged?: boolean; state?: string; draft?: boolean; labels?: PrLabel[];
+  requested_reviewers?: (GiteaUser | null)[]; requested_reviewers_teams?: ({ id?: number } | null)[];
 }
 interface GiteaFile { filename: string; additions?: number; deletions?: number }
 interface GiteaCommit { sha: string; commit?: { message?: string; author?: { name?: string; date?: string } }; author?: { login?: string } }
@@ -348,7 +406,7 @@ function gitea(id: string, f: AuthedConfig): Forge {
   f.auth = () => `token ${f.token}`;
   const api = <T = unknown>(path: string, opts: ApiOptions = {}): Promise<T> => {
     if (!f.url) throw new Error(`Set the ${f.label} server under Admin / Git providers`);
-    if (!/^(?:user$|(?:repos|user|users|orgs)\/)/.test(path) || path.split(/[/?]/).some((p) => p === "." || p === "..")) throw new Error("Invalid git server API path");
+    if (!/^(?:user$|(?:repos|user|users|orgs|teams)\/)/.test(path) || path.split(/[/?]/).some((p) => p === "." || p === "..")) throw new Error("Invalid git server API path");
     if (!f.token) throw new Error(`Configure an access token in Admin / Git providers / ${f.label}`);
     return http(f, `${f.url}/api/v1/${path}`, { ...opts, as: opts.raw ? "text" : opts.as, what: path.split("?")[0] }) as Promise<T>;
   };
@@ -365,7 +423,7 @@ function gitea(id: string, f: AuthedConfig): Forge {
   const r = (repo: string) => `repos/${native(repo)}`;
   const normalize = (p: GiteaPull, repo: string, files?: PrFile[], commits?: PrCommit[]) => pullRequest({
     number: p.number, title: p.title, body: p.body, url: `${f.url}/${native(repo)}/pulls/${p.number}`,
-    author: p.user?.login, updatedAt: p.updated_at,
+    author: p.user?.login, updatedAt: p.updated_at, createdAt: p.created_at,
     baseRefName: p.base?.ref, headRefName: p.head?.ref, headRefOid: p.head?.sha,
     // Fork head content lives in the fork, not in the base repository's branch namespace.
     headRepo: p.head?.repo?.full_name ? `${id}~${p.head.repo.full_name}` : repo,
@@ -378,6 +436,8 @@ function gitea(id: string, f: AuthedConfig): Forge {
     prUrl: (repo, n) => `${f.url}/${native(repo)}/pulls/${n}`,
     issueUrl: (repo, n) => `${f.url}/${native(repo)}/issues/${n}`,
     repoUrl: (repo) => `${f.url}/${native(repo)}`,
+    // the base repository keeps every pull request's head, forks included
+    fetchSource: (repo, n) => ({ url: `${f.url}/${native(repo)}.git`, header: f.auth(), ref: `refs/pull/${n}/head` }),
     parsePr(u) {
       const m = u.pathname.match(/^\/([\w][\w.-]*\/[\w][\w.-]*)\/pulls\/([1-9]\d*)$/);
       return m ? { native: m[1], number: Number(m[2]) } : null;
@@ -413,6 +473,7 @@ function gitea(id: string, f: AuthedConfig): Forge {
       const rows = await api<GiteaCommit[]>(`${r(repo)}/commits?sha=${enc(branch)}&limit=${n}`);
       return (Array.isArray(rows) ? rows : []).map((c) => ({ sha: String(c.sha || "").slice(0, 7), message: firstLine(c.commit?.message).trim(), author: c.author?.login || c.commit?.author?.name || "" }));
     },
+    searchCode: async () => null, // Forgejo/Gitea expose no code search API
     async compare(repo, from, to) {
       const cmp = await api<{ files?: { filename?: string; patch?: string }[] } | null>(`${r(repo)}/compare/${enc(from)}...${enc(to)}`);
       return (cmp?.files || []).filter((x) => x?.filename && x?.patch).map((x) => `diff --git a/${x.filename} b/${x.filename}\n--- a/${x.filename}\n+++ b/${x.filename}\n${x.patch}`).join("\n\n");
@@ -466,6 +527,18 @@ function gitea(id: string, f: AuthedConfig): Forge {
       return ["owner", "admin", "write"].includes(String(p?.permission || "").toLowerCase());
     },
     react: (repo, c) => (Number.isSafeInteger(Number(c.id)) ? api(`${r(repo)}/issues/comments/${Number(c.id)}/reactions`, { method: "POST", body: { content: "eyes" } }) : null),
+    async requestedReviewer(repo, n, c) {
+      const login = String(c.user?.login || "").toLowerCase();
+      if (!/^[\w][\w.-]*$/.test(login)) return false;
+      const p = await api<GiteaPull | null>(`${r(repo)}/pulls/${n}`);
+      if ((p?.requested_reviewers || []).some((u) => String(u?.login || u?.username || "").toLowerCase() === login)) return true;
+      for (const t of p?.requested_reviewers_teams || []) {
+        const id = Number(t?.id);
+        if (!Number.isSafeInteger(id) || id <= 0) continue;
+        if (await orNull(api(`teams/${id}/members/${enc(login)}`)).catch(() => null)) return true;
+      }
+      return false;
+    },
     // The API has no reply-to link: the server groups a conversation by file and line, and so does this.
     async reviewThreads(repo, n) {
       const reviews = (await list<GiteaReview>(`${r(repo)}/pulls/${n}/reviews`)).filter((v) => Number.isSafeInteger(Number(v?.id)) && v.state !== "PENDING");
@@ -482,6 +555,12 @@ function gitea(id: string, f: AuthedConfig): Forge {
     replyInThread: (repo, n, root, body) => api(`${r(repo)}/pulls/${n}/reviews`, { method: "POST", body: {
       event: "COMMENT", body: "", comments: [{ path: root.path, new_position: root.line > 0 ? root.line : 0, old_position: root.line < 0 ? -root.line : 0, body }],
     } }),
+    // review comments are issue comments to the reactions API
+    async reactions(repo, _n, c) {
+      if (!Number.isSafeInteger(Number(c.id))) return { up: 0, down: 0 };
+      const rows = await orNull(api<{ content?: unknown }[] | null>(`${r(repo)}/issues/comments/${Number(c.id)}/reactions`));
+      return countReactions((Array.isArray(rows) ? rows : []).map((x) => x?.content));
+    },
     async ensureHook(repo, url, secret) {
       const hooks = await api<GiteaHook[] | null>(`${r(repo)}/hooks`);
       if ((Array.isArray(hooks) ? hooks : []).some((h) => h?.config?.url === url)) return false;
@@ -491,6 +570,36 @@ function gitea(id: string, f: AuthedConfig): Forge {
     async removeHook(repo, url) {
       const hooks = await api<GiteaHook[] | null>(`${r(repo)}/hooks`).catch((): GiteaHook[] => []);
       for (const h of Array.isArray(hooks) ? hooks : []) if (h?.config?.url === url && Number.isSafeInteger(Number(h.id))) await api(`${r(repo)}/hooks/${Number(h.id)}`, { method: "DELETE" }).catch(() => {});
+    },
+    // Branches are created from the head commit and never moved: a re-run adds a commit on top of the fix branch.
+    stacked: {
+      async findFixPr(repo, base, prefix) {
+        const own = native(repo);
+        const p = (await list<GiteaPull & { html_url?: string }>(`${r(repo)}/pulls?state=open`)).find((x) => x.base?.ref === base && String(x.head?.ref || "").startsWith(prefix) && FIX_BRANCH_RE.test(String(x.head?.ref)) && x.head?.repo?.full_name === own);
+        return p ? { number: p.number, url: p.html_url || `${f.url}/${own}/pulls/${p.number}`, branch: String(p.head?.ref) } : null;
+      },
+      async commit(repo, c) {
+        const at = await orNull(api<{ commit?: { id?: string } } | null>(`${r(repo)}/branches/${encPath(c.branch)}`));
+        if (!at) {
+          // old_ref_name (a commit) on current servers; older ones read old_branch_name, checked against the head below
+          const made = await api<{ commit?: { id?: string } } | null>(`${r(repo)}/branches`, { method: "POST", body: { new_branch_name: c.branch, old_ref_name: c.headSha, old_branch_name: c.headBranch } });
+          if (made?.commit?.id && made.commit.id !== c.headSha) {
+            await api(`${r(repo)}/branches/${encPath(c.branch)}`, { method: "DELETE" }).catch(() => {});
+            throw new Error(`${c.headBranch} moved past ${c.headSha.slice(0, 7)}: run /review, then /fix stacked again`);
+          }
+        }
+        const files = await Promise.all(c.files.map(async (x) => {
+          if (!safeFile(x.path)) throw new Error("Invalid file path");
+          const cur = await api<{ sha?: string } | null>(`${r(repo)}/contents/${encPath(x.path)}?ref=${enc(c.branch)}`);
+          return { operation: "update", path: x.path, content: b64(x.content), sha: cur?.sha };
+        }));
+        await api(`${r(repo)}/contents`, { method: "POST", body: { branch: c.branch, message: c.message, files } });
+      },
+      async openPr(repo, o) {
+        const p = await api<{ number: number; html_url?: string }>(`${r(repo)}/pulls`, { method: "POST", body: { head: o.branch, base: o.base, title: o.title, body: o.body } });
+        return { number: p.number, url: p.html_url || `${f.url}/${native(repo)}/pulls/${p.number}`, branch: o.branch };
+      },
+      editPr: (repo, n, o) => api(`${r(repo)}/pulls/${n}`, { method: "PATCH", body: { title: o.title, body: o.body } }),
     },
     hookMeta: (h) => ({ event: String(h[`x-${id}-event`] || h["x-gitea-event"] || ""), delivery: String(h[`x-${id}-delivery`] || h["x-gitea-delivery"] || ""), signature: h[`x-${id}-signature`] || h["x-gitea-signature"] }),
   };
@@ -502,10 +611,10 @@ const BB_API = "https://api.bitbucket.org/2.0";
 interface BbUser { nickname?: string; username?: string; display_name?: string; account_id?: string; uuid?: string }
 interface BbRepoRef { links?: { html?: { href?: string } }; full_name?: string }
 interface BbPull {
-  id: number; title?: string; description?: string; summary?: { raw?: string }; author?: BbUser; updated_on?: string;
+  id: number; title?: string; description?: string; summary?: { raw?: string }; author?: BbUser; updated_on?: string; created_on?: string;
   destination?: { branch?: { name?: string }; repository?: BbRepoRef };
   source?: { branch?: { name?: string }; repository?: BbRepoRef; commit?: { hash?: string } };
-  state?: string; draft?: boolean;
+  state?: string; draft?: boolean; reviewers?: (BbUser | null)[];
 }
 interface BbPage<T> { values?: T[]; next?: string }
 interface BbDiffstat { new?: { path?: string }; old?: { path?: string }; lines_added?: number; lines_removed?: number }
@@ -515,6 +624,7 @@ interface BbRepo { mainbranch?: { name?: string }; workspace?: { slug?: string }
 interface BbIssue { id?: number; title?: string; content?: { raw?: string }; state?: string; links?: { html?: { href?: string } }; kind?: string; priority?: string }
 interface BbHook { url?: string; uuid: string }
 interface BbEvent { pullrequest?: BbPull; repository?: BbRepoRef; comment?: BbComment }
+interface BbCodeHit { file?: { path?: string }; content_matches?: { lines?: { line?: number; segments?: { text?: string; match?: boolean }[] }[] }[] }
 function bitbucket(id: string, f: AuthedConfig): Forge {
   f.auth = () => (f.user ? `Basic ${Buffer.from(`${f.user}:${f.token}`).toString("base64")}` : `Bearer ${f.token}`);
   const api = <T = unknown>(path: string, opts: ApiOptions = {}): Promise<T> => {
@@ -546,7 +656,7 @@ function bitbucket(id: string, f: AuthedConfig): Forge {
     const src = nativeOf(p.source?.repository);
     return pullRequest({
       number: p.id, title: p.title, body: p.description || p.summary?.raw, url: `https://bitbucket.org/${native(repo)}/pull-requests/${p.id}`,
-      author: login(p.author), updatedAt: p.updated_on,
+      author: login(p.author), updatedAt: p.updated_on, createdAt: p.created_on,
       baseRefName: p.destination?.branch?.name, headRefName: p.source?.branch?.name,
       // the PR object carries a 12-character hash; the commit list has the full one
       headRefOid: commits?.length ? commits.at(-1)?.oid : p.source?.commit?.hash,
@@ -561,6 +671,8 @@ function bitbucket(id: string, f: AuthedConfig): Forge {
     prUrl: (repo, n) => `https://bitbucket.org/${native(repo)}/pull-requests/${n}`,
     issueUrl: (repo, n) => `https://bitbucket.org/${native(repo)}/issues/${n}`,
     repoUrl: (repo) => `https://bitbucket.org/${native(repo)}`,
+    // no pull refs: the source branch, from the fork when there is one. Git takes API tokens as x-bitbucket-api-token-auth.
+    fetchSource: (repo, _n, head) => ({ url: `https://bitbucket.org/${native(head.headRepo || repo)}.git`, header: basic(f.user ? "x-bitbucket-api-token-auth" : "x-token-auth", f.token), ref: `refs/heads/${head.headRefName || ""}` }),
     parsePr(u) {
       const m = u.pathname.match(/^\/([\w][\w.-]*\/[\w][\w.-]*)\/pull-requests\/([1-9]\d*)$/);
       return m ? { native: m[1], number: Number(m[2]) } : null;
@@ -594,6 +706,15 @@ function bitbucket(id: string, f: AuthedConfig): Forge {
     },
     // "a..b" is what a has that b lacks, from their merge base
     compare: (repo, from, to) => api<string>(`${r(repo)}/diff/${enc(to)}..${enc(from)}`, { as: "text" }),
+    // Workspace code search, narrowed to the one repository
+    async searchCode(repo, term, limit = 5) {
+      const [ws, slug] = native(repo).split("/");
+      const page = await api<{ values?: BbCodeHit[] } | null>(`workspaces/${enc(ws)}/search/code?search_query=${enc(`"${term}" repo:${slug}`)}&pagelen=${Math.min(20, limit)}`);
+      return (page?.values || []).slice(0, limit).map((v): CodeHit => {
+        const m = v.content_matches?.[0]?.lines?.find((l) => l.segments?.some((x) => x.match)) || v.content_matches?.[0]?.lines?.[0];
+        return { path: String(v.file?.path || ""), line: Number(m?.line) || 0, snippet: (m?.segments || []).map((x) => String(x.text || "")).join("") };
+      }).filter((h) => safeFile(h.path));
+    },
     async issue(repo, n) {
       const i = await orNull(api<BbIssue | null>(`${r(repo)}/issues/${n}`)).catch((e: unknown) => { if (statusOf(e) === 403) return null; throw e; });
       return i?.id ? { number: i.id, title: i.title, body: i.content?.raw, state: i.state, url: i.links?.html?.href || `https://bitbucket.org/${native(repo)}/issues/${n}`, labels: [i.kind, i.priority].filter((x): x is string => Boolean(x)) } : null;
@@ -652,6 +773,13 @@ function bitbucket(id: string, f: AuthedConfig): Forge {
       const p = await api<{ permission?: string } | null>(`${r(repo)}/permissions-config/users/${enc(who)}`).catch((e: unknown) => { if ([401, 403, 404].includes(statusOf(e) ?? 0)) return null; throw e; });
       return ["admin", "write"].includes(String(p?.permission || ""));
     },
+    // Bitbucket Cloud has no reviewer teams: the reviewer list is accounts, matched by account id.
+    async requestedReviewer(repo, n, c) {
+      const who = String(c.user?.id || "");
+      if (!who) return false;
+      const p = await api<BbPull | null>(`${r(repo)}/pullrequests/${n}`);
+      return (p?.reviewers || []).some((u) => !!u && (u.account_id === who || u.uuid === who));
+    },
     react: () => null,
     async ensureHook(repo, url, secret) {
       const hooks = await list<BbHook>(`${r(repo)}/hooks`);
@@ -682,10 +810,10 @@ function bitbucket(id: string, f: AuthedConfig): Forge {
 interface DcUser { slug?: string; name?: string; id?: number }
 interface DcRepoRef { project?: { key?: string; type?: string }; slug?: string }
 interface DcPull {
-  id: number; title?: string; description?: string; author?: { user?: DcUser }; updatedDate?: number;
+  id: number; title?: string; description?: string; author?: { user?: DcUser }; updatedDate?: number; createdDate?: number;
   toRef?: { displayId?: string; repository?: DcRepoRef };
   fromRef?: { displayId?: string; latestCommit?: string; repository?: DcRepoRef };
-  state?: string; draft?: boolean; version?: number;
+  state?: string; draft?: boolean; version?: number; reviewers?: ({ user?: DcUser } | null)[];
 }
 interface DcPage<T> { values?: T[]; isLastPage?: boolean; nextPageStart: number }
 interface DcComment { id: number; text?: string; createdDate?: number; author?: DcUser; version?: number; threadResolved?: boolean }
@@ -723,7 +851,7 @@ function bitbucketdc(id: string, f: AuthedConfig): Forge {
     const src = nativeOf(p.fromRef?.repository);
     return pullRequest({
       number: p.id, title: p.title, body: p.description, url: `${f.url}/projects/${native(repo).split("/")[0]}/repos/${native(repo).split("/")[1]}/pull-requests/${p.id}`,
-      author: login(p.author?.user), updatedAt: iso(p.updatedDate),
+      author: login(p.author?.user), updatedAt: iso(p.updatedDate), createdAt: iso(p.createdDate),
       baseRefName: p.toRef?.displayId, headRefName: p.fromRef?.displayId, headRefOid: p.fromRef?.latestCommit,
       headRepo: src !== "/" && src !== native(repo) ? `${id}~${src}` : repo,
       files, commits, state: ({ OPEN: "OPEN", MERGED: "MERGED", DECLINED: "CLOSED" } as Record<string, string>)[String(p.state)] || String(p.state || "OPEN"), isDraft: !!p.draft,
@@ -748,6 +876,7 @@ function bitbucketdc(id: string, f: AuthedConfig): Forge {
     prUrl: (repo, n) => `${f.url}/projects/${native(repo).split("/")[0]}/repos/${native(repo).split("/")[1]}/pull-requests/${n}`,
     issueUrl: () => "",
     repoUrl: (repo) => `${f.url}/projects/${native(repo).split("/")[0]}/repos/${native(repo).split("/")[1]}`,
+    fetchSource: (repo, n) => ({ url: `${f.url}/scm/${native(repo)}.git`, header: f.auth(), ref: `refs/pull-requests/${n}/from` }),
     parsePr(u) {
       const m = u.pathname.match(/^\/projects\/([\w][\w.-]*)\/repos\/([\w][\w.-]*)\/pull-requests\/([1-9]\d*)$/);
       return m ? { native: `${m[1]}/${m[2]}`, number: Number(m[3]) } : null;
@@ -772,6 +901,7 @@ function bitbucketdc(id: string, f: AuthedConfig): Forge {
       const page = await api<DcPage<DcCommit> | null>(`${r(repo)}/commits?until=${enc(branch)}&limit=${n}`);
       return (page?.values || []).map((c) => ({ sha: String(c.id || "").slice(0, 7), message: firstLine(c.message).trim(), author: login(c.author) || c.author?.name || "" }));
     },
+    searchCode: async () => null, // code search is a separate, optional Data Center plugin API
     compare: async (repo, from, to) => unified(await api<DcDiff | null>(`${r(repo)}/compare/diff?from=${enc(to)}&to=${enc(from)}&contextLines=3`)),
     issue: async () => null, // issues live in Jira
     status: (_repo, sha, s) => api(`build-status/1.0/commits/${enc(sha)}`, { method: "POST", body: { state: STATE.bitbucket[s.state] || "FAILED", key: s.context, name: s.context, url: s.target_url, description: s.description } }),
@@ -833,6 +963,12 @@ function bitbucketdc(id: string, f: AuthedConfig): Forge {
       };
       return (await grant(r(repo), ["REPO_WRITE", "REPO_ADMIN"])) || grant(`projects/${enc(key)}`, ["PROJECT_WRITE", "PROJECT_ADMIN"]);
     },
+    async requestedReviewer(repo, n, c) {
+      const who = String(c.user?.login || "");
+      if (!who) return false;
+      const p = await api<DcPull | null>(`${r(repo)}/pull-requests/${n}`);
+      return (p?.reviewers || []).some((x) => !!x?.user && login(x.user) === who);
+    },
     react: () => null,
     async ensureHook(repo, url, secret) {
       const hooks = await list<DcHook>(`${r(repo)}/webhooks`, 200);
@@ -868,7 +1004,7 @@ interface AzPull {
   pullRequestId: number; title?: string; description?: string; createdBy?: AzIdentity; closedDate?: string; creationDate?: string;
   targetRefName?: string; sourceRefName?: string; lastMergeSourceCommit?: { commitId?: string };
   forkSource?: { repository?: AzRepoRef }; repository?: AzRepoRef; status?: string; isDraft?: boolean;
-  labels?: { name: string; active?: boolean }[];
+  labels?: { name: string; active?: boolean }[]; reviewers?: ((AzIdentity & { isContainer?: boolean }) | null)[];
 }
 interface AzList<T> { value?: T[] }
 interface AzIteration { id: number; sourceRefCommit?: { commitId?: string } }
@@ -918,7 +1054,7 @@ function azure(id: string, f: AuthedConfig): Forge {
     const fork = repoOfPayload(p.forkSource?.repository);
     return pullRequest({
       number: p.pullRequestId, title: p.title, body: p.description, url: `${web(repo)}/pullrequest/${p.pullRequestId}`,
-      author: login(p.createdBy), updatedAt: p.closedDate || p.creationDate,
+      author: login(p.createdBy), updatedAt: p.closedDate || p.creationDate, createdAt: p.creationDate,
       baseRefName: branch(p.targetRefName), headRefName: branch(p.sourceRefName), headRefOid: p.lastMergeSourceCommit?.commitId,
       headRepo: fork ? `${id}~${fork}` : repo,
       files, commits, state: ({ active: "OPEN", completed: "MERGED", abandoned: "CLOSED" } as Record<string, string>)[String(p.status)] || "OPEN", isDraft: !!p.isDraft,
@@ -987,6 +1123,8 @@ function azure(id: string, f: AuthedConfig): Forge {
     prUrl: (repo, n) => `${web(repo)}/pullrequest/${n}`,
     issueUrl: (repo, n) => { const [org, project] = parts(repo); return `${AZ}/${enc(org)}/${enc(project)}/_workitems/edit/${n}`; },
     repoUrl: web,
+    // refs/pull/<n>/merge is a merge commit, not the head: the source branch, from the fork when there is one
+    fetchSource: (repo, _n, head) => ({ url: web(head.headRepo || repo), header: f.auth(), ref: `refs/heads/${head.headRefName || ""}` }),
     parsePr(u) {
       const m = u.pathname.match(/^\/([^/]+)\/([^/]+)\/_git\/([^/]+)\/pullrequest\/([1-9]\d*)$/);
       if (!m) return null;
@@ -1034,6 +1172,7 @@ function azure(id: string, f: AuthedConfig): Forge {
       const rows = (await api<AzList<AzCommit> | null>(`${g(repo)}/commits?searchCriteria.itemVersion.version=${enc(b)}&searchCriteria.$top=${n}`))?.value || [];
       return rows.map((c) => ({ sha: String(c.commitId || "").slice(0, 7), message: firstLine(c.comment).trim(), author: c.author?.name || "" }));
     },
+    searchCode: async () => null, // Azure DevOps code search lives on almsearch.dev.azure.com, not the configured origin
     async compare(repo, from, to) {
       const d = await api<{ changes?: AzChange[] } | null>(`${g(repo)}/diffs/commits?baseVersion=${enc(from)}&baseVersionType=commit&targetVersion=${enc(to)}&targetVersionType=commit&diffCommonCommit=true&$top=1000`);
       // the diffs endpoint lists items with objectIds; the changes shape matches the iteration one
@@ -1118,6 +1257,13 @@ function azure(id: string, f: AuthedConfig): Forge {
       const p = await api<{ visibility?: string } | null>(`${enc(org)}/_apis/projects/${enc(project)}`).catch((e: unknown) => { if ([401, 403, 404].includes(statusOf(e) ?? 0)) return null; throw e; });
       return p?.visibility === "private";
     },
+    // Individual reviewers only, matched by identity id: group (container) reviewers are not expanded.
+    async requestedReviewer(repo, n, c) {
+      const who = String(c.user?.id || "");
+      if (!who) return false;
+      const p = await api<AzPull | null>(`${g(repo)}/pullrequests/${n}`);
+      return (p?.reviewers || []).some((x) => !!x && !x.isContainer && x.id === who);
+    },
     react: () => null,
     // Service hook subscriptions, one per event, recognised by URL and repository. Azure cannot sign a delivery: the
     // secret travels in a header (X-CodeOtter-Secret) and is compared in constant time.
@@ -1143,6 +1289,32 @@ function azure(id: string, f: AuthedConfig): Forge {
       if (!repositoryId) return;
       const subs = (await api<AzList<AzSubscription> | null>(`${enc(org)}/_apis/hooks/subscriptions`).catch(() => null))?.value || [];
       for (const s of subs) if (s.consumerInputs?.url === url && s.publisherInputs?.repository === repositoryId && /^[0-9a-f-]{36}$/i.test(String(s.id))) await api(`${enc(org)}/_apis/hooks/subscriptions/${s.id}`, { method: "DELETE" }).catch(() => {});
+    },
+    // One push makes the fix commit on the head commit and moves the branch to it (a re-run needs force-push permission).
+    stacked: {
+      async findFixPr(repo, base, prefix) {
+        const rows = (await api<AzList<AzPull> | null>(`${g(repo)}/pullrequests?searchCriteria.status=active&searchCriteria.targetRefName=${enc(`refs/heads/${base}`)}&$top=200`))?.value || [];
+        const p = rows.find((x) => !x.forkSource && branch(x.targetRefName) === base && branch(x.sourceRefName).startsWith(prefix) && FIX_BRANCH_RE.test(branch(x.sourceRefName)));
+        return p ? { number: p.pullRequestId, url: `${web(repo)}/pullrequest/${p.pullRequestId}`, branch: branch(p.sourceRefName) } : null;
+      },
+      async commit(repo, c) {
+        if (!isSha(c.headSha)) throw new Error("Invalid head commit");
+        const name = `refs/heads/${c.branch}`;
+        const refs = (await api<AzList<{ name?: string; objectId?: string }> | null>(`${g(repo)}/refs?filter=${enc(`heads/${c.branch}`)}`))?.value || [];
+        const tip = refs.find((x) => x.name === name)?.objectId || "0".repeat(40);
+        await api(`${g(repo)}/pushes`, { method: "POST", body: {
+          refUpdates: [{ name, oldObjectId: tip }],
+          commits: [{ comment: c.message, parents: [c.headSha], changes: c.files.map((x) => {
+            if (!safeFile(x.path)) throw new Error("Invalid file path");
+            return { changeType: "edit", item: { path: `/${x.path}` }, newContent: { content: b64(x.content), contentType: "base64encoded" } };
+          }) }],
+        } });
+      },
+      async openPr(repo, o) {
+        const p = await api<AzPull>(`${g(repo)}/pullrequests`, { method: "POST", body: { sourceRefName: `refs/heads/${o.branch}`, targetRefName: `refs/heads/${o.base}`, title: o.title, description: o.body.slice(0, AZURE_MAX_DESCRIPTION) } });
+        return { number: p.pullRequestId, url: `${web(repo)}/pullrequest/${p.pullRequestId}`, branch: o.branch };
+      },
+      editPr: (repo, n, o) => api(`${g(repo)}/pullrequests/${n}`, { method: "PATCH", body: { title: o.title, description: o.body.slice(0, AZURE_MAX_DESCRIPTION) } }),
     },
     secretHeader: "x-codeotter-secret",
     hookMeta: () => ({ event: "", delivery: "", signature: "" }), // both come from the body
@@ -1170,10 +1342,11 @@ function azure(id: string, f: AuthedConfig): Forge {
 // nested groups, so the native part is group[/subgroup...]/project and goes to the API URL-encoded as one :id segment.
 interface GlUser { id?: number; username?: string; name?: string }
 interface GlMr {
-  iid: number; title?: string; description?: string; author?: GlUser; updated_at?: string; web_url?: string;
+  iid: number; title?: string; description?: string; author?: GlUser; updated_at?: string; created_at?: string; web_url?: string;
   target_branch?: string; source_branch?: string; sha?: string; last_commit?: { id?: string };
   source_project_id?: number; target_project_id?: number; state?: string; draft?: boolean; work_in_progress?: boolean;
   labels?: (string | { title?: string; name?: string })[]; diff_refs?: { base_sha?: string; start_sha?: string; head_sha?: string };
+  reviewers?: (GlUser | null)[];
 }
 interface GlDiff { old_path?: string; new_path?: string; diff?: string; new_file?: boolean; deleted_file?: boolean; renamed_file?: boolean }
 interface GlCommit { id: string; message?: string; title?: string; author_name?: string; committed_date?: string; authored_date?: string }
@@ -1192,6 +1365,7 @@ const GL_PATH = new RegExp(`^${GL_SEG}(?:/${GL_SEG}){1,19}$`);
 // Webhook payloads date things "2026-11-20 10:00:00 UTC"; the REST API answers ISO 8601.
 const glDate = (s: string | undefined) => String(s || "").replace(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) UTC$/, "$1T$2Z");
 const GL_STATE: Record<string, string> = { success: "success", failure: "failed", error: "failed", pending: "running" };
+interface GlBlob { path?: string; filename?: string; startline?: number; data?: string }
 function gitlab(id: string, f: AuthedConfig): Forge {
   f.auth = () => `Bearer ${f.token}`;
   const api = <T = unknown>(path: string, opts: ApiOptions = {}): Promise<T> => {
@@ -1215,7 +1389,7 @@ function gitlab(id: string, f: AuthedConfig): Forge {
   const label = (l: string | { title?: string; name?: string }) => (typeof l === "string" ? l : l?.title || l?.name || "");
   const normalize = (m: GlMr, repo: string, files?: PrFile[], commits?: PrCommit[]) => pullRequest({
     number: m.iid, title: m.title, body: m.description, url: `${web(repo)}/-/merge_requests/${m.iid}`,
-    author: m.author?.username, updatedAt: glDate(m.updated_at),
+    author: m.author?.username, updatedAt: glDate(m.updated_at), createdAt: glDate(m.created_at),
     baseRefName: m.target_branch, headRefName: m.source_branch, headRefOid: m.sha || m.last_commit?.id,
     headRepo: repo, files, commits,
     state: ({ opened: "OPEN", merged: "MERGED", closed: "CLOSED", locked: "OPEN" } as Record<string, string>)[String(m.state)] || "OPEN",
@@ -1248,6 +1422,7 @@ function gitlab(id: string, f: AuthedConfig): Forge {
     prUrl: (repo, n) => `${web(repo)}/-/merge_requests/${n}`,
     issueUrl: (repo, n) => `${web(repo)}/-/issues/${n}`,
     repoUrl: web,
+    fetchSource: (repo, n) => ({ url: `${web(repo)}.git`, header: basic("oauth2", f.token), ref: `refs/merge-requests/${n}/head` }),
     parsePr(u) {
       const m = u.pathname.match(new RegExp(`^/(${GL_SEG}(?:/${GL_SEG}){1,19})/-/merge_requests/([1-9]\\d*)$`));
       return m ? { native: m[1], number: Number(m[2]) } : null;
@@ -1286,6 +1461,14 @@ function gitlab(id: string, f: AuthedConfig): Forge {
     async baseCommits(repo, branch, n = 8) {
       const rows = await api<GlCommit[]>(`${p(repo)}/repository/commits?ref_name=${enc(branch)}&per_page=${n}`);
       return (Array.isArray(rows) ? rows : []).map((c) => ({ sha: String(c.id || "").slice(0, 7), message: firstLine(c.title || c.message).trim(), author: c.author_name || "" }));
+    },
+    async searchCode(repo, term, limit = 5) {
+      const rows = await api<GlBlob[] | null>(`${p(repo)}/search?scope=blobs&search=${enc(term)}&per_page=${Math.min(20, limit)}`);
+      return (Array.isArray(rows) ? rows : []).slice(0, limit).map((b): CodeHit => {
+        const lines = String(b.data || "").split("\n");
+        const at = Math.max(0, lines.findIndex((l) => l.includes(term)));
+        return { path: String(b.path || b.filename || ""), line: (Number(b.startline) || 1) + at, snippet: lines[at] || "" };
+      }).filter((h) => safeFile(h.path));
     },
     compare: async (repo, from, to) => unified((await api<{ diffs?: GlDiff[] } | null>(`${p(repo)}/repository/compare?from=${enc(from)}&to=${enc(to)}`))?.diffs || []),
     async issue(repo, n) {
@@ -1357,6 +1540,12 @@ function gitlab(id: string, f: AuthedConfig): Forge {
       if (!GL_DISCUSSION.test(String(root.thread || ""))) throw new Error("Invalid discussion id");
       return api(`${p(repo)}/merge_requests/${n}/discussions/${String(root.thread)}/notes`, { method: "POST", body: { body } });
     },
+    // award emoji on a diff note
+    async reactions(repo, n, c) {
+      if (!Number.isSafeInteger(Number(c.id))) return { up: 0, down: 0 };
+      const rows = await orNull(api<{ name?: unknown }[] | null>(`${p(repo)}/merge_requests/${n}/notes/${Number(c.id)}/award_emoji`));
+      return countReactions((Array.isArray(rows) ? rows : []).map((x) => x?.name));
+    },
     setBody: (repo, n, body) => api(`${p(repo)}/merge_requests/${n}`, { method: "PUT", body: { description: body } }),
     async commentsSince(repo, since) {
       const t = Date.parse(since);
@@ -1371,6 +1560,12 @@ function gitlab(id: string, f: AuthedConfig): Forge {
       const m = await api<{ access_level?: number; state?: string } | null>(`${p(repo)}/members/all/${uid}`).catch((e: unknown) => { if ([401, 403, 404].includes(statusOf(e) ?? 0)) return null; throw e; });
       return Number(m?.access_level) >= DEVELOPER && (m?.state ?? "active") === "active";
     },
+    async requestedReviewer(repo, n, c) {
+      const uid = Number(c.user?.id);
+      if (!Number.isSafeInteger(uid) || uid <= 0) return false;
+      const m = await api<GlMr | null>(`${p(repo)}/merge_requests/${n}`);
+      return (m?.reviewers || []).some((u) => Number(u?.id) === uid);
+    },
     react: (repo, c) => (Number.isSafeInteger(Number(c.id)) && c.prNumber ? api(`${p(repo)}/merge_requests/${c.prNumber}/notes/${Number(c.id)}/award_emoji`, { method: "POST", body: { name: "eyes" } }) : null),
     async ensureHook(repo, url, secret) {
       const hooks = await list<GlHook>(`${p(repo)}/hooks`, 200);
@@ -1384,6 +1579,33 @@ function gitlab(id: string, f: AuthedConfig): Forge {
     },
     // GitLab sends the hook's secret token as X-Gitlab-Token (compared in constant time). Idempotency-Key (17.4+) stays
     // the same across retries; X-Gitlab-Event-UUID identifies the event on older servers.
+    // The commits API makes the fix commit from the head commit; `force` moves an existing fix branch there.
+    stacked: {
+      async fork(repo, n) {
+        const m = await api<GlMr>(`${p(repo)}/merge_requests/${n}`);
+        return !m.source_project_id || m.source_project_id !== m.target_project_id;
+      },
+      async findFixPr(repo, base, prefix) {
+        const rows = await list<GlMr>(`${p(repo)}/merge_requests?state=opened&target_branch=${enc(base)}`, 500);
+        const m = rows.find((x) => x.target_branch === base && String(x.source_branch || "").startsWith(prefix) && FIX_BRANCH_RE.test(String(x.source_branch)) && !!x.source_project_id && x.source_project_id === x.target_project_id);
+        return m ? { number: m.iid, url: m.web_url || `${web(repo)}/-/merge_requests/${m.iid}`, branch: String(m.source_branch) } : null;
+      },
+      async commit(repo, c) {
+        if (!isSha(c.headSha)) throw new Error("Invalid head commit");
+        await api(`${p(repo)}/repository/commits`, { method: "POST", body: {
+          branch: c.branch, start_sha: c.headSha, force: true, commit_message: c.message,
+          actions: c.files.map((x) => {
+            if (!safeFile(x.path)) throw new Error("Invalid file path");
+            return { action: "update", file_path: x.path, content: b64(x.content), encoding: "base64" };
+          }),
+        } });
+      },
+      async openPr(repo, o) {
+        const m = await api<GlMr>(`${p(repo)}/merge_requests`, { method: "POST", body: { source_branch: o.branch, target_branch: o.base, title: o.title, description: o.body, remove_source_branch: true } });
+        return { number: m.iid, url: m.web_url || `${web(repo)}/-/merge_requests/${m.iid}`, branch: o.branch };
+      },
+      editPr: (repo, n, o) => api(`${p(repo)}/merge_requests/${n}`, { method: "PUT", body: { title: o.title, description: o.body } }),
+    },
     secretHeader: "x-gitlab-token",
     hookMeta: (h) => ({ event: String(h["x-gitlab-event"] || ""), delivery: String(h["idempotency-key"] || h["x-gitlab-event-uuid"] || ""), signature: "" }),
     route(event: string, x: GlEvent | null | undefined) {

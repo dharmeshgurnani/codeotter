@@ -2,10 +2,12 @@
 import { ensureSidecar } from "./local-models.ts";
 import { askModel, askSystemOne } from "./models.ts";
 import { blastRadius, compressDiff, splitHunks } from "./diff.ts";
-import { extractHeadSha, issueLabel, REVIEW_DEFAULTS } from "./context.ts";
+import { extractHeadSha, issueLabel, REVIEW_DEFAULTS, ruleId } from "./context.ts";
 import { diffFiles, pathInstructionBlock } from "./repo-rules.ts";
 import { analyzerPrompt, isAnalyzerId } from "./analyzers.ts";
 import type { AnalyzerId, AnalyzerResult } from "./analyzers.ts";
+import { sandboxPrompt, sandboxState } from "./sandbox.ts";
+import type { SandboxRun } from "./sandbox.ts";
 import type { LlmConfig, S1Answers, S1Config, S1Questions } from "./models.ts";
 import type { LocalModel } from "./local-models.ts";
 import type { OutsideImpact } from "./diff.ts";
@@ -25,6 +27,7 @@ export interface Finding {
   confidence?: number; // 0..1, from reflection or System One
   hunk?: string; // the diff hunk at the finding, attached when the review is stored (for agent prompts)
   analyzer?: AnalyzerId; // a static analyzer result the language model confirmed
+  rule?: string; // ruleId() of the team learning the finding enforces (learned rules count its outcome)
 }
 export type Verdict = "approve" | "comment" | "request_changes";
 // `mode` marks a repository's custom check (id `check_<n>`); built-in gates have none.
@@ -93,9 +96,11 @@ export function s1Questions(c: Pick<S1Config, "local">, guide: Guide | null, lin
   for (const g of gates) questions[`gate_${g.id}`] = { type: "noul", instructions: g.q };
   return { questions, gates };
 }
-function s1State(pr: PullRequest, diff: string, c: S1Config, guide: Guide | null = null, gitHistory: GitHistory | null = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = []): Record<string, unknown> {
-  if (c.local) return { pull_request: changeDigest(pr, diff, c.contextChars || 12000) };
+function s1State(pr: PullRequest, diff: string, c: S1Config, guide: Guide | null = null, gitHistory: GitHistory | null = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], sandbox: SandboxRun | null = null): Record<string, unknown> {
+  const testRun = sandboxState(sandbox);
+  if (c.local) return { pull_request: changeDigest(pr, diff, c.contextChars || 12000), ...(testRun ? { sandbox_test_run: testRun } : {}) };
   return {
+    ...(testRun ? { sandbox_test_run: testRun } : {}),
     pull_request: {
       title: pr.title,
       description: (pr.body || "").slice(0, 3000),
@@ -113,6 +118,15 @@ function s1State(pr: PullRequest, diff: string, c: S1Config, guide: Guide | null
             affected_outside_callers: outsideImpact.outsideCallers,
             unique_outside_files: outsideImpact.uniqueFiles,
             sampled_call_sites: outsideImpact.callers.slice(0, 6).map((c) => `${c.file}:${c.line} (${c.symbol})`),
+          },
+        }
+      : {}),
+    ...(outsideImpact?.relatedCallers?.length
+      ? {
+          cross_repository_usages: {
+            usages: outsideImpact.relatedCallers.length,
+            repositories: new Set(outsideImpact.relatedCallers.map((c) => c.repo)).size,
+            sampled_usages: outsideImpact.relatedCallers.slice(0, 6).map((c) => `${c.repo}:${c.file}${c.line ? `:${c.line}` : ""} (${c.symbol})`),
           },
         }
       : {}),
@@ -174,8 +188,8 @@ export function changeDigest(pr: Pick<PullRequest, "title" | "body" | "files" | 
   return out.slice(0, maxChars);
 }
 
-export async function scoreWithSystemOne(pr: PullRequest, diff: string, c: S1Config, guide: Guide | null, onPartial: ((p: S1Progress) => void) | null | undefined, gitHistory: GitHistory | null | undefined, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: CustomCheck[] = []): Promise<{ scores: Record<ScoreKey, number>; gates: Gate[] }> {
-  const state = s1State(pr, diff, c, guide, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, accepted);
+export async function scoreWithSystemOne(pr: PullRequest, diff: string, c: S1Config, guide: Guide | null, onPartial: ((p: S1Progress) => void) | null | undefined, gitHistory: GitHistory | null | undefined, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: CustomCheck[] = [], sandbox: SandboxRun | null = null): Promise<{ scores: Record<ScoreKey, number>; gates: Gate[] }> {
+  const state = s1State(pr, diff, c, guide, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, accepted, sandbox);
   const { questions, gates: gateDefs } = s1Questions(c, guide, linkedIssues, checks);
   let a: S1Answers;
   try {
@@ -465,6 +479,7 @@ export function deriveSuggestionFromDetail(raw: unknown, diff = ""): Finding {
     ...(f?.dismissed ? { dismissed: true } : {}),
     ...(Number.isFinite(Number(f?.confidence)) && f?.confidence !== null && f?.confidence !== "" ? { confidence: Math.max(0, Math.min(1, Number(f?.confidence))) } : {}),
     ...(isAnalyzerId(f?.analyzer) ? { analyzer: f.analyzer } : {}),
+    ...(typeof f?.rule === "string" && /^[0-9a-f]{12}$/.test(f.rule) ? { rule: f.rule } : {}),
   };
 }
 
@@ -474,18 +489,20 @@ const PROFILE_PROMPT: Record<ReviewSettings["profile"], string> = {
   balanced: "",
   assertive: "Profile: assertive. Report every real problem, including low-severity issues and nitpicks (style, naming, readability, missing tests, docs); use the full findings budget when the diff warrants it.",
 };
-export function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: GateDef[] = [], analyzers: AnalyzerResult[] = []): string {
+export function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: GateDef[] = [], analyzers: AnalyzerResult[] = [], sandbox: SandboxRun | null = null): string {
   const checksBlock = checks.length
     ? `\nRepository pre-merge checks (answer each from the diff and description in "checks": true = yes, false = no):\n${checks.map((g) => `- ${g.id}: ${g.q}`).join("\n")}\n`
     : "";
-  const outsideBlock = outsideImpact?.formatted ? `\n${outsideImpact.formatted}\n` : "";
+  // cross-repository usages: a tenth of a local model's context, else up to 6000 characters
+  const related = (outsideImpact?.relatedFormatted || "").slice(0, c.contextChars ? Math.floor(c.contextChars / 10) : 6000);
+  const outsideBlock = [outsideImpact?.formatted, related].filter(Boolean).map((b) => `\n${b}\n`).join("");
   const issueBlock = linkedIssues?.length
     ? `\nLinked Issues & Requirements (MANDATORY: explicitly verify whether the pull request diff fulfills all requirements and acceptance criteria described in these linked issues, and flag any unfulfilled or partially met requirement in findings):\n${linkedIssues
         .map((iss) => `Issue ${issueLabel(iss)} (${iss.repo}, ${iss.state}): ${iss.title}${iss.labels?.length ? ` [${iss.labels.join(", ")}]` : ""}\n${(iss.body || "(no body provided)").slice(0, 1200)}`)
         .join("\n\n")}\n`
     : "";
   const learningsBlock = learnings?.length
-    ? `\nRepository Team Learnings (Never flag these dismissed patterns):\n${learnings.map((l) => `- ${l}`).join("\n")}\n`
+    ? `\nRepository Team Learnings (Never flag these dismissed patterns; follow every rule. A finding raised because a learning asks for it carries that learning's number as "rule"):\n${learnings.map((l, i) => `${i + 1}. ${l}`).join("\n")}\n`
     : "";
   const incrementalBlock = incrementalCtx?.promptBlock ? `\n${incrementalCtx.promptBlock}\n` : "";
   const acceptedBlock = accepted?.length
@@ -494,7 +511,7 @@ export function prompt(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSet
   const pathBlock = pathInstructionBlock(r.pathInstructions, diffFiles(diff));
   return `You are CodeOtter, a strict senior staff code reviewer. Review this pull request using the repository's review guidelines (AGENTS.md / CLAUDE.md), the repository team learnings, the linked issues and acceptance criteria, the git commit history, the outside-diff call graph context, and the code diff. Reply with ONLY a JSON object:
 {"summary":"3-5 sentence architectural walkthrough covering what changed, commit progression, fulfillment of linked issue requirements, adherence to repository guidelines, and outside caller safety","verdict":"approve|comment|request_changes",
-${wantScores ? ` "scores":{"quality":0-100,"correctness_risk":0-100 (100 = very risky),"test_coverage":0-100,"readability":0-100,"pr_hygiene":0-100 (title, description, scope, commit focus),"blast_radius":0-100 (100 = system-wide or critical-path impact)},\n` : ""} "findings":[{"severity":"blocker|major|minor|nit|high|medium|low","file":"path","line":42,"title":"short","detail":"specific line/behaviour and fix (cite AGENTS.md/CLAUDE.md rule, linked issue #number or ticket key requirement, or commit if relevant)","suggestion":"optional exact replacement code"}],
+${wantScores ? ` "scores":{"quality":0-100,"correctness_risk":0-100 (100 = very risky),"test_coverage":0-100,"readability":0-100,"pr_hygiene":0-100 (title, description, scope, commit focus),"blast_radius":0-100 (100 = system-wide or critical-path impact)},\n` : ""} "findings":[{"severity":"blocker|major|minor|nit|high|medium|low","file":"path","line":42,"title":"short","detail":"specific line/behaviour and fix (cite AGENTS.md/CLAUDE.md rule, linked issue #number or ticket key requirement, or commit if relevant)","suggestion":"optional exact replacement code"${learnings?.length ? ',"rule":"optional number of the team learning this finding enforces"' : ""}}],
  "walkthrough":[{"file":"path","change":"concise summary of change in this file"}]${checks.length ? `,\n "checks":{${checks.map((g) => `"${g.id}":true|false`).join(",")}}` : ""}}
 For each finding, include the integer target \`line\` number in the new file and an optional \`suggestion\` containing the exact replacement code snippet for the target line/block (without markdown backticks) so the fix can be applied in one click. Be concrete; cite exact files and rules. Respect all Repository Team Learnings and never flag dismissed patterns. Max ${r.maxFindings} findings, most severe first.${PROFILE_PROMPT[r.profile] ? ` ${PROFILE_PROMPT[r.profile]}` : ""} Today is ${new Date().toISOString().slice(0, 10)}.
 
@@ -502,7 +519,7 @@ PR #${pr.number}: ${pr.title}
 Author: ${pr.author.login}  Base: ${pr.baseRefName} <- Head: ${pr.headRefName}${pr.headSha ? ` (${pr.headSha.slice(0, 7)})` : ""}  Files: ${pr.changedFiles}  +${pr.additions} -${pr.deletions}
 Description:
 ${(pr.body || "(none)").slice(0, c.contextChars ? Math.min(3000, Math.floor(c.contextChars / 10)) : 3000)}
-${outsideBlock}${incrementalBlock}${issueBlock}${checksBlock}${pathBlock}${learningsBlock}${acceptedBlock}${analyzerPrompt(analyzers)}${gitHistory?.formatted ? `\nGit Change History (commits in this PR and recent target branch history):\n${gitHistory.formatted.slice(0, 4000)}\n` : ""}${guide ? `\nRepository Review Guidelines from ${guide.file} (MANDATORY: verify all code changes and commits against these rules and flag any violation in findings):\n${guide.text}\n` : ""}
+${outsideBlock}${incrementalBlock}${issueBlock}${checksBlock}${pathBlock}${learningsBlock}${acceptedBlock}${analyzerPrompt(analyzers)}${sandboxPrompt(sandbox)}${gitHistory?.formatted ? `\nGit Change History (commits in this PR and recent target branch history):\n${gitHistory.formatted.slice(0, 4000)}\n` : ""}${guide ? `\nRepository Review Guidelines from ${guide.file} (MANDATORY: verify all code changes and commits against these rules and flag any violation in findings):\n${guide.text}\n` : ""}
 Diff${diff.length > Math.min(r.diffChars, c.contextChars || Infinity) ? " (over budget: highest-priority files first, the rest named at the end)" : ""}:
 ${compressDiff(diff, Math.min(r.diffChars, c.contextChars || Infinity)).diff}`;
 }
@@ -534,11 +551,11 @@ ${compressDiff(diff, Math.min(r.diffChars, c.contextChars || Infinity)).diff}`, 
 }
 // </reflect>
 
-export async function judge(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, onProgress: ((partial: Partial<Judgement>) => void) | null = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: CustomCheck[] = [], analyzers: AnalyzerResult[] = []): Promise<Judgement> {
+export async function judge(pr: PullRequest, diff: string, c: LlmConfig, r: ReviewSettings = REVIEW_DEFAULTS, guide: Guide | null = null, wantScores = true, gitHistory: GitHistory | null | undefined = null, onProgress: ((partial: Partial<Judgement>) => void) | null = null, linkedIssues: LinkedIssue[] = [], learnings: string[] = [], incrementalCtx: IncrementalContext | null = null, outsideImpact: OutsideImpact | null = null, accepted: string[] = [], checks: CustomCheck[] = [], analyzers: AnalyzerResult[] = [], sandbox: SandboxRun | null = null): Promise<Judgement> {
   // CodeReviewer cannot answer checks; it always runs next to System One, which owns them.
   if (c.api === "codereviewer") return reviewWithCodeReviewer(pr, diff, c, guide, gitHistory, onProgress, linkedIssues, learnings, incrementalCtx);
   const checkDefs = customGates(checks);
-  const text = await askModel(prompt(pr, diff, c, r, guide, wantScores, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, accepted, checkDefs, analyzers), { ...c, temperature: r.temperature });
+  const text = await askModel(prompt(pr, diff, c, r, guide, wantScores, gitHistory, linkedIssues, learnings, incrementalCtx, outsideImpact, accepted, checkDefs, analyzers, sandbox), { ...c, temperature: r.temperature });
   // Model output: every field is checked or coerced below before it is stored.
   let out: { summary?: unknown; verdict?: unknown; scores?: Record<string, unknown> | null; findings?: unknown; walkthrough?: unknown; checks?: unknown };
   try {
@@ -560,7 +577,9 @@ export async function judge(pr: PullRequest, diff: string, c: LlmConfig, r: Revi
   });
   const unanswered = checkGates.filter((x) => Number.isNaN(x.yes)).map((x) => x.g.label);
   if (unanswered.length) throw new Error(`${c.provider}/${c.model} did not answer the pre-merge check(s): ${unanswered.join(", ")}`);
-  let findings: Finding[] = (Array.isArray(out.findings) ? (out.findings as unknown[]) : []).slice(0, 20).map((f) => deriveSuggestionFromDetail(f, diff));
+  // "rule": a learning's number in the prompt, kept only when it names one, stored as that learning's id
+  const ruleOf = (f: unknown) => { const i = Number((f as { rule?: unknown } | null)?.rule); return Number.isInteger(i) && i >= 1 && i <= learnings.length ? ruleId(learnings[i - 1]) : ""; };
+  let findings: Finding[] = (Array.isArray(out.findings) ? (out.findings as unknown[]) : []).slice(0, 20).map((f) => { const d = deriveSuggestionFromDetail(f, diff); delete d.rule; const rule = ruleOf(f); return rule ? { ...d, rule } : d; });
   if (r.profile === "chill") findings = findings.filter((f) => f.severity === "high" || f.severity === "medium");
   // an analyzer tag only for a tool that reported on this file
   findings = findings.map(({ analyzer, ...f }) => (analyzer && analyzers.some((a) => a.analyzer === analyzer && a.file === f.file) ? { ...f, analyzer } : f));

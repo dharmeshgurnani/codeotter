@@ -7,10 +7,12 @@ import { store } from "./store.ts";
 import { createGitHubAppJwt, forgeId, forgeOf, forgetGithubRepos, ghEnv, isForgeRepo, nativeRepo, normalizeForgePr, openPrs, repos } from "./git.ts";
 import { effectiveRules, reviewConfig } from "./context.ts";
 import { skipReason } from "./repo-rules.ts";
-import { score, SHA_RE, syncPrComments, triageConfig, triagePr } from "./review.ts";
-import { answerReplies, commenterTrusted, commentPrNumber, oneLine, parseCommand, runCommand } from "./pr-tools.ts";
+import { score, syncPrComments, triageConfig, triagePr } from "./review.ts";
+import { SHA_RE } from "./merge-checks.ts";
+import { answerReplies, commandEnabled, commenterTrusted, commentPrNumber, oneLine, parseCommand, runCommand } from "./pr-tools.ts";
 import { repoOf } from "./views.ts";
 import { AUTO, withActor } from "./audit.ts";
+import { collectFeedback } from "./learned.ts";
 import type { ChildProcess } from "node:child_process";
 import type { HookHeaders } from "./forges.ts";
 import type { WebhookDelivery } from "./store.ts";
@@ -52,15 +54,30 @@ function enqueueReplies(repo: string, number: number, commentId = "") {
   drainPrQueue();
   return true;
 }
+// Learned rules (learned.ts) read a reviewed PR's inline threads lazily: after a re-review and when the PR closes
+// (`final`: findings still open count as ignored). One job per PR; a close replaces a pending re-review job.
+const FEEDBACK_QUEUE = new Map<string, { repo: string; final: boolean }>();
+function enqueueFeedback(repo: string, url: string, final = false) {
+  if (!url) return false;
+  FEEDBACK_QUEUE.set(url, { repo, final: final || !!FEEDBACK_QUEUE.get(url)?.final });
+  drainPrQueue();
+  return true;
+}
 async function drainPrQueue() {
   if (prDraining) return;
   prDraining = true;
   try {
-    while (PR_QUEUE.size || REPLY_QUEUE.size) {
+    while (PR_QUEUE.size || REPLY_QUEUE.size || FEEDBACK_QUEUE.size) {
       if (REPLY_QUEUE.size) {
         const [key, { repo, number, commentId }] = REPLY_QUEUE.entries().next().value!; // the map is not empty
         REPLY_QUEUE.delete(key);
         await answerReplies(repo, number, commentId).catch((e: Error) => console.warn(`[replies] ${repo}#${number}: ${e.message}`));
+        continue;
+      }
+      if (FEEDBACK_QUEUE.size) {
+        const [url, { repo, final }] = FEEDBACK_QUEUE.entries().next().value!; // the map is not empty
+        FEEDBACK_QUEUE.delete(url);
+        await withActor(AUTO, () => collectFeedback(repo, url, final)).catch((e: Error) => console.warn(`[learned] ${url}: ${e.message}`));
         continue;
       }
       const [url, { repo, p }] = PR_QUEUE.entries().next().value!; // the map is not empty
@@ -78,7 +95,7 @@ async function handlePr(repo: string, p: QueuedPr) {
   if (tc.auto && done[p.url]?.headSha !== p.headRefOid) await triagePr(p.url, repo).catch((e: Error) => console.warn(`[triage] ${p.url}: ${e.message}`));
   if (!rc.auto) return;
   // skip rules: Repository settings, overridden by .codeotter.json on the base branch (repo-rules.ts)
-  if (skipReason(p, await effectiveRules(repo, rc, p))) return;
+  if (skipReason(p, await effectiveRules(repo, { ...rc, rulesSource: "base" }, p))) return;
   const reviewed = (await store.getSetting("autoReviewed")) || {};
   if (reviewed[p.url] === p.headRefOid) return;
   const failed = (await store.getSetting("autoReviewFailed")) || {};
@@ -86,6 +103,8 @@ async function handlePr(repo: string, p: QueuedPr) {
   if (f && f.sha === p.headRefOid && (f.tries >= MAX_REVIEW_TRIES || Date.now() - f.at < RETRY_AFTER)) return;
   try {
     await syncPrComments(await score(p.url, true, repo), repo, { postScores: true, postReview: true });
+    // a re-review: reactions, replies and fixes on the earlier inline comments
+    if (reviewed[p.url]) enqueueFeedback(repo, p.url);
     // recorded on success only: a failed review (model down, rate limit) is retried, see above
     reviewed[p.url] = p.headRefOid;
     delete failed[p.url];
@@ -140,6 +159,8 @@ if (IS_SERVER) setInterval(async () => {
       for (const key of ["autoReviewed", "autoReviewFailed"] as const) {
         const rec = (await store.getSetting(key)) || {};
         const stale = Object.keys(rec).filter((u) => !open.has(u) && !PR_QUEUE.has(u) && !skipped.has(repoOf({ url: u })));
+        // closed since the last round: its findings' last signal (forges without a close webhook)
+        if (key === "autoReviewed") for (const u of stale) enqueueFeedback(repoOf({ url: u }), u, true);
         if (stale.length) { for (const u of stale) delete rec[u]; await store.setSetting(key, rec); }
       }
     }
@@ -242,6 +263,7 @@ async function routeWebhook(src: string, event: string, x: GitHubPayload | null)
   const repo = src === "github" ? full : `${src}~${full}`;
   if (!(await repos()).includes(repo)) return; // not onboarded here
   if (event === "pull_request") {
+    if (x?.action === "closed" && typeof x.pull_request?.html_url === "string") return void enqueueFeedback(repo, src === "github" ? x.pull_request.html_url : normalizeForgePr(x.pull_request, repo).url, true);
     if (!x?.pull_request || !PR_EVENT_ACTIONS.includes(x.action || "")) return;
     enqueuePr(repo, src === "github" ? normalizeGitHubPr(x.pull_request) : normalizeForgePr(x.pull_request, repo));
     return;
@@ -264,9 +286,8 @@ async function routeWebhook(src: string, event: string, x: GitHubPayload | null)
 }
 // A comment command from a webhook: once per comment, only when commands are on and the commenter may write.
 async function handleComment(repo: string, c: PrComment) {
-  if (!(await reviewConfig(repo)).commands) return;
   const command = parseCommand(c.body);
-  if (!command || !commentPrNumber(c)) return;
+  if (!command || !commentPrNumber(c) || !commandEnabled(command.cmd, await reviewConfig(repo))) return;
   if (!remember(HANDLED_COMMENTS, `${repo}#${c.id}`)) return;
   // move the command poll's bookmark past this comment so it is not listed again
   const seen = (await store.getSetting("commandsSeen")) || {};
@@ -275,7 +296,8 @@ async function handleComment(repo: string, c: PrComment) {
     seen[repo] = new Date(at).toISOString();
     await store.setSetting("commandsSeen", seen);
   }
-  if (!(await commenterTrusted(repo, c).catch(() => false))) return;
+  // /override is authorised when it runs (requested reviewers, never the author)
+  if (command.cmd !== "override" && !(await commenterTrusted(repo, c).catch(() => false))) return;
   await runCommand(repo, c, command);
 }
 // GitHub does not retry a failed delivery on its own. After a restart, the pull_request deliveries that failed while this

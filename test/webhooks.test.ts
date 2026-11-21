@@ -85,8 +85,10 @@ function load({ scoreFails = false, repos = ["acme/app", "gitea~acme/lib", "bitb
     normalizeForgePr: (p: { number: number; head?: { sha?: string }; draft?: boolean }, repo: string) => ({ url: `https://git.example/${repo.slice(6)}/pulls/${p.number}`, headRefOid: p.head?.sha, isDraft: !!p.draft, labels: [] }),
     parseCommand: (body: unknown) => { const m = String(body || "").match(/^\/(review|ask)(?:\s+(.*))?$/); return m ? { cmd: m[1], arg: m[2] || "" } : null; },
     commentPrNumber: (c: { prNumber?: unknown; html_url?: unknown } | undefined) => Number(c?.prNumber) || Number((String(c?.html_url || "").match(/\/pulls?\/(\d+)/) || [])[1]) || 0,
+    commandEnabled: (cmd: string, rc: { commands?: boolean; overrides?: boolean }) => (cmd === "override" ? !!rc.overrides : !!rc.commands),
     commenterTrusted: async () => trusted,
     runCommand: async (repo: string, c: { id: unknown }, cmd: { cmd: string }) => { calls.push(["command", repo, c.id, cmd.cmd]); },
+    collectFeedback: async (repo: string, url: string, final: boolean) => { calls.push(["feedback", repo, url, final]); },
   };
   const names = Object.keys(stubs);
   const api = new Function(...names, `${block}; return { verifySignature, handleWebhook, routeWebhook, enqueuePr, webhookHealthy, pollDue, noteDelivery, ensureForgeHook, removeForgeHook, reposChanged, forwarderStatus, PR_QUEUE, WEBHOOK_LAST, HANDLED_COMMENTS, lastCatchUp, pending: () => PR_QUEUE.size || prDraining };`)(...names.map((n) => stubs[n])) as Queue;
@@ -171,8 +173,9 @@ const settle = async (api: Queue) => { for (let i = 0; i < 100 && api.pending();
   await deliver(api, "github", { event: "ping", body: { zen: "x" }, secret: "gh-secret" });
   await deliver(api, "github", { event: "installation_repositories", body: { action: "added" }, secret: "gh-secret" });
   await settle(api);
-  assert.deepStrictEqual(api.calls, []);
-  console.log("✓ other repositories, closed/labeled, drafts, bad SHAs, ping and installation events run nothing");
+  // a close only queues the learned-rules read of the pull request's threads (final: open findings count as ignored)
+  assert.deepStrictEqual(api.calls, [["feedback", "acme/app", "https://github.com/acme/app/pull/1", true]]);
+  console.log("✓ other repositories, labeled, drafts, bad SHAs, ping and installation events run nothing; closed queues learned-rules feedback only");
 }
 
 // a failed review is retried, not marked done

@@ -4,13 +4,16 @@ import { store } from "./store.ts";
 import { createPrComment, forgeId, forgeOf, ghAsApp, ghAsync, isForgeRepo, parsePrUrl, prUrlFor, readPr, repos } from "./git.ts";
 import { askModel, llmConfig } from "./models.ts";
 import { compressDiff, dynamicContextFiles, extendDiffContext, parseDiff } from "./diff.ts";
-import { getRepoLearnings, guideFor, headFileTexts, reviewConfig, setRepoLearnings } from "./context.ts";
+import { getRepoLearnings, headFileTexts, prGuide, reviewConfig, setRepoLearnings } from "./context.ts";
 import { deriveSuggestionFromDetail, reflectFindings } from "./engines.ts";
 import { postInlineSuggestionsOnPr, resolvePr, score, syncPrComments } from "./review.ts";
 import { CATCH_UP_EVERY, HANDLED_COMMENTS, lastCatchUp, remember, webhookHealthy } from "./queue.ts";
 import { repoOf } from "./views.ts";
-import { fixFindings, hunkAt } from "./fix.ts";
+import { fixFindings, fixStacked, hunkAt } from "./fix.ts";
+import { overrideChecks } from "./merge-checks.ts";
+import { countReactions } from "./forges.ts";
 import type { ForgeComment, ThreadComment } from "./forges.ts";
+import { noteReply } from "./learned.ts";
 import { audit, orgOfRepo, withActor } from "./audit.ts";
 import type { Guide, PullRequest, ReviewSettings } from "./context.ts";
 import type { Finding } from "./engines.ts";
@@ -62,7 +65,7 @@ async function prToolContext(prUrl: string): Promise<PrToolContext> {
   let diff = rawDiff;
   if (rc.contextLines > 0) diff = extendDiffContext(rawDiff, await headFileTexts(pr, dynamicContextFiles(parseDiff(rawDiff))), { before: rc.contextLines, after: 1 }).diff;
   const repo = repoOf(pr);
-  const guide = await guideFor(repo, isForgeRepo(repo) ? pr.headRefOid : pr.headRefName, pr.headRepo || repo).catch(() => null);
+  const guide = await prGuide(repo, pr, rc.rulesSource).then((g) => g.guide, () => null);
   return { pr, repo, c, rc, guide, diff: compressDiff(diff, Math.min(rc.diffChars, c.contextChars || Infinity)).diff };
 }
 
@@ -237,9 +240,12 @@ export async function runPrTool(prUrl: string, id: string, { question = "", acti
 
 // <pr-commands>
 // PR comment commands: a comment whose first line is /review, /describe, /improve, /docs, /changelog, /ask <question> or
-// /fix [n] runs that action and replies on the pull request. Off unless enabled in Settings, and only the repository's owner,
+// /fix [n | stacked] runs that action and replies on the pull request. Off unless enabled in Settings, and only the repository's owner,
 // members and collaborators can trigger one: anyone can comment on a public repository and spend its model budget.
-const COMMANDS = ["review", "describe", "improve", "ask", "docs", "changelog", "fix"];
+// /override <check|all> <reason> has its own switch and rule (merge-checks.ts: requested reviewers, never the author),
+// checked when it runs; the queue neither requires comment commands nor write access for it.
+const COMMANDS = ["review", "describe", "improve", "ask", "docs", "changelog", "fix", "override"];
+export const commandEnabled = (cmd: string, rc: { commands?: boolean; overrides?: boolean }) => (cmd === "override" ? !!rc.overrides : !!rc.commands);
 export function parseCommand(body: unknown): PrCommand | null {
   const m = String(body || "").trimStart().split("\n")[0].trim().match(/^\/([a-z]+)(?:\s+(.*))?$/i);
   if (!m || !COMMANDS.includes(m[1].toLowerCase())) return null;
@@ -269,6 +275,10 @@ export async function runCommand(repo: string, c: PrComment, { cmd, arg }: PrCom
     await withActor(actor, async () => {
       if (cmd === "review") {
         await syncPrComments(await score(prUrl, true, repo), repo, { postScores: true, postReview: true });
+      } else if (cmd === "override") {
+        await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/override\`: ${await overrideChecks(repo, number, c.user || {}, arg)}`);
+      } else if (cmd === "fix" && arg.toLowerCase() === "stacked") {
+        await fixStacked(prUrl, repo); // a fix branch and pull request; it comments the link itself
       } else if (cmd === "fix") {
         // suggestions only: nothing is pushed to the branch
         await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/fix${arg ? ` ${oneLine(arg, 20)}` : ""}\`: ${await fixFindings(prUrl, repo, arg)}`);
@@ -278,7 +288,7 @@ export async function runCommand(repo: string, c: PrComment, { cmd, arg }: PrCom
       }
     });
   } catch (e) {
-    await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/${cmd}\` failed: ${oneLine((e as Error).message, 500)}`).catch(() => {});
+    await createPrComment(prUrl, repo, number, `🦦 CodeOtter \`/${cmd}${cmd === "fix" && arg.toLowerCase() === "stacked" ? " stacked" : ""}\` failed: ${oneLine((e as Error).message, 500)}`).catch(() => {});
     throw e;
   }
 }
@@ -305,14 +315,14 @@ function githubThreads(raw: unknown): ThreadComment[][] {
     const t: ThreadComment = {
       id: Number(c.id), body: String(c.body || ""), created_at: String(c.created_at || ""), user: { id: Number(user.id) || 0, login },
       bot: user.type === "Bot" || /\[bot\]$/.test(login), path: c.path, line: Number(c.line ?? c.original_line) || 0, hunk: String(c.diff_hunk || ""),
-      author_association: String(c.author_association || ""),
+      author_association: String(c.author_association || ""), reactions: countReactions(c.reactions),
     };
     const key = String(Number(c.in_reply_to_id) || t.id);
     threads.set(key, [...(threads.get(key) || []), t]);
   }
   return [...threads.values()].map((t) => t.sort((a, b) => a.created_at.localeCompare(b.created_at) || Number(a.id) - Number(b.id)));
 }
-async function reviewThreads(repo: string, number: number): Promise<ThreadComment[][]> {
+export async function reviewThreads(repo: string, number: number): Promise<ThreadComment[][]> {
   if (isForgeRepo(repo)) return forgeOf(repo).reviewThreads?.(repo, number) ?? [];
   return githubThreads(JSON.parse(await ghAsync("api", "--paginate", "--slurp", `repos/${repo}/pulls/${number}/comments?per_page=100`)));
 }
@@ -351,6 +361,7 @@ async function answerThread(repo: string, number: number, t: ThreadComment[]) {
   const rule = remembered ? oneLine(remembered[1], 300).replace(/`/g, "") : "";
   if (rule) {
     await setRepoLearnings(repo, [...(await getRepoLearnings(repo)), rule]);
+    await noteReply(repo, prUrlFor(repo, number), root.body);
     return replyInThread(repo, number, root, `🦦 Saved as a team learning for this repository: ${proseOf(rule, 300)}`);
   }
   const c = await llmConfig();
@@ -376,6 +387,8 @@ ${plain(last.body, 3000)}`, "a thread reply");
     const answer = proseOf(out.answer, 4000);
     if (!answer) throw new Error(`${c.provider}/${c.model} returned no reply`);
     const learning = out.dismissed === true ? oneLine(proseOf(out.learning, 300), 300).replace(/`/g, "'") : "";
+    // the model read the reply as pushback: signal for learned rules
+    if (out.dismissed === true) await noteReply(repo, prUrlFor(repo, number), root.body);
     await replyInThread(repo, number, root, learning ? `${answer}\n\nTo keep this as a team learning, reply \`@codeotter remember ${learning}\`` : answer);
   } catch (e) {
     await Promise.resolve(replyInThread(repo, number, root, `🦦 CodeOtter could not answer: ${oneLine((e as Error).message, 500)}`)).catch(() => {});
@@ -392,7 +405,8 @@ if (IS_SERVER) setInterval(async () => {
   try {
     const seen = (await store.getSetting("commandsSeen")) || {};
     for (const repo of await repos()) {
-      if (!(await reviewConfig(repo)).commands) {
+      const rc = await reviewConfig(repo);
+      if (!rc.commands && !rc.overrides) {
         // marked once while off; the first poll after turning commands on starts from that moment, so nothing posted
         // while they were off ever runs (and an off repository costs no writes)
         if (seen[repo] !== "off") { seen[repo] = "off"; await store.setSetting("commandsSeen", seen); }
@@ -415,9 +429,9 @@ if (IS_SERVER) setInterval(async () => {
         if (!at || Date.parse(at) <= Date.parse(since)) continue;
         if (Date.parse(at) > Date.parse(latest)) latest = new Date(Date.parse(at)).toISOString();
         const command = parseCommand(c.body);
-        if (!command || !commentPrNumber(c)) continue;
+        if (!command || !commentPrNumber(c) || !commandEnabled(command.cmd, rc)) continue;
         if (!remember(HANDLED_COMMENTS, `${repo}#${c.id}`)) continue; // a webhook already ran it
-        if (!(await commenterTrusted(repo, c).catch(() => false))) continue;
+        if (command.cmd !== "override" && !(await commenterTrusted(repo, c).catch(() => false))) continue;
         await runCommand(repo, c, command).catch((e) => console.warn(`[commands] ${repo} /${command.cmd}: ${e.message}`));
       }
       seen[repo] = latest;

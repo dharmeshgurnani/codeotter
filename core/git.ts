@@ -1,9 +1,13 @@
 // Repository ids, pull request URLs, the gh CLI and the GitHub App; other providers route to forges.ts.
 import { execFileSync, spawn } from "node:child_process";
 import { createSign } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { FORGE_API, FORGE_IDS, FORGES, OWNER_RE, REPO, REPO_RE } from "./config.ts";
 import { PB_URL, store } from "./store.ts";
-import type { ApiOptions, PullRequest } from "./forges.ts";
+import { FIX_BRANCH_RE } from "./forges.ts";
+import type { ApiOptions, GitFetch, PullRequest, StackedOps } from "./forges.ts";
 
 // A pull request URL's repository and number; selfHosted: a git server other than github.com.
 export interface ParsedPr { repo: string; number: number; selfHosted: boolean }
@@ -95,7 +99,7 @@ export const normalizeForgePr = (p: unknown, repo: string): PullRequest => forge
 export async function readPr(url: string, spec: string[], diff = false): Promise<string> {
   const parsed = parsePrUrl(url);
   if (!parsed) throw new Error("Invalid pull request URL");
-  if (!parsed.selfHosted) return ghAsync("pr", diff ? "diff" : "view", ...spec, ...(diff ? [] : ["--json", "number,title,body,author,url,baseRefName,headRefName,headRefOid,additions,deletions,changedFiles,files,commits,state"]));
+  if (!parsed.selfHosted) return ghAsync("pr", diff ? "diff" : "view", ...spec, ...(diff ? [] : ["--json", "number,title,body,author,url,baseRefName,headRefName,headRefOid,isCrossRepository,additions,deletions,changedFiles,files,commits,state"]));
   const { repo, number } = parsed;
   const forge = forgeOf(repo);
   return diff ? forge.diff(repo, number) : JSON.stringify(await forge.pr(repo, number));
@@ -192,6 +196,32 @@ export async function appInstallationToken(target: string): Promise<string> {
   const expires = (typeof expiresAt === "string" && Date.parse(expiresAt)) || now + 60 * 60_000;
   appTokens.set(installation, { token, expires });
   return token;
+}
+
+// GitHub REST as the App installation on `repo`, for the endpoints only an App may call (the Checks API). `path` is
+// from the API root; callers check appInstallationToken(repo) first and fall back when it is "".
+export async function appApi(repo: string, method: "GET" | "POST" | "PATCH", path: string, body?: unknown): Promise<unknown> {
+  if (isForgeRepo(repo) || !REPO_RE.test(repo)) throw new Error(`Not a GitHub repository: ${repo}`);
+  const token = await appInstallationToken(repo);
+  if (!token) throw new Error(`The GitHub App is not installed on ${repo}`);
+  const res = await fetch(`https://api.github.com/${path}`, {
+    method,
+    headers: { ...appHeaders(token), ...(body === undefined ? {} : { "content-type": "application/json" }) },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    redirect: "error",
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) {
+    const reply: unknown = await res.json().catch(() => null);
+    const message = reply && typeof reply === "object" && "message" in reply && typeof reply.message === "string" ? `: ${reply.message.slice(0, 200)}` : "";
+    throw Object.assign(new Error(`GitHub ${method} ${path.split("?")[0]} answered ${res.status}${message}`), { status: res.status });
+  }
+  return res.status === 204 ? null : res.json();
+}
+// A GitHub REST read about `repo`: as the App where it is installed there, else through gh (ghAsync's credential).
+export async function githubGet(repo: string, path: string): Promise<unknown> {
+  if (await appInstallationToken(repo).catch(() => "")) return appApi(repo, "GET", path);
+  return JSON.parse(await ghAsync("api", path));
 }
 
 async function getGitHubAppRepos(appConfig: GitHubAppConfig | null | undefined): Promise<string[]> {
@@ -482,9 +512,83 @@ export async function openPrs(repo: string, { strict = false } = {}): Promise<Pu
   // a git server's error (bad token, server down) reaches the page instead of looking like "no pull requests"
   if (isForgeRepo(repo)) return forgeOf(repo).openPrs(repo);
   try {
-    return JSON.parse(await ghAsync("pr", "list", "-R", repo, "--json", "number,title,author,url,updatedAt,additions,deletions,changedFiles,headRefOid,isDraft,labels,baseRefName", "--limit", "200"));
+    return JSON.parse(await ghAsync("pr", "list", "-R", repo, "--json", "number,title,body,author,url,createdAt,updatedAt,additions,deletions,changedFiles,headRefName,headRefOid,isDraft,labels,baseRefName", "--limit", "200"));
   } catch (e) {
     if (strict) throw e;
     return [];
   }
 }
+
+// Where a sandbox run fetches a pull request's head (core/sandbox.ts): the provider's adapter for forge repositories;
+// for GitHub refs/pull/<n>/head on github.com with the App's installation token, else the token gh uses.
+// No token at all: an unauthenticated fetch, which works for public repositories only.
+export async function prFetchSource(pr: { url: string; number: number; headRepo?: string; headRefName?: string }): Promise<GitFetch> {
+  const parsed = parsePrUrl(pr.url);
+  if (!parsed) throw new Error("Not a pull request URL");
+  const { repo, number } = parsed;
+  if (isForgeRepo(repo)) return forgeOf(repo).fetchSource(repo, number, { headRepo: pr.headRepo, headRefName: pr.headRefName });
+  if (!REPO_RE.test(repo)) throw new Error(`Not an owner/name: ${repo}`);
+  const token = (await appInstallationToken(repo).catch(() => ""))
+    || savedGithubToken || process.env.GH_TOKEN || process.env.GITHUB_TOKEN
+    || (await runGh(["auth", "token", "--hostname", "github.com"], process.env).then((t) => t.trim(), () => ""));
+  return { url: `https://github.com/${repo}.git`, header: token ? `Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}` : "", ref: `refs/pull/${number}/head` };
+}
+// gh api as the repository's writer (the GitHub App bot, else the configured credential), JSON in and out. The body goes
+// through a temp file (--input): file text can be larger than a command line.
+export async function ghApi<T = unknown>(repo: string, method: string, path: string, body?: unknown): Promise<T> {
+  if (!REPO_RE.test(repo) || isForgeRepo(repo) || !path.startsWith(`repos/${repo}/`) || path.split(/[/?]/).some((x) => x === "." || x === "..")) throw new Error("Invalid GitHub API path");
+  let dir = "";
+  try {
+    const args = ["api", "-X", method, path, "-H", "Accept: application/vnd.github+json"];
+    if (body !== undefined) {
+      dir = mkdtempSync(join(tmpdir(), "codeotter-gh-"));
+      writeFileSync(join(dir, "body.json"), JSON.stringify(body));
+      args.push("--input", join(dir, "body.json"));
+    }
+    const out = await ghAsApp(repo, args);
+    return (out.trim() ? JSON.parse(out) : null) as T;
+  } finally {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+}
+// <github-stacked>
+// /fix stacked on GitHub: the git data API builds one commit on the head commit's tree; the fix branch is created at it,
+// or force-moved there on a re-run. File modes come from the head tree (an executable stays executable).
+interface GhPull { number: number; html_url?: string; head?: { ref?: string; repo?: { full_name?: string } | null }; base?: { ref?: string; repo?: { full_name?: string } } }
+const ghEnc = (s: string) => s.split("/").map(encodeURIComponent).join("/");
+export const githubStacked: StackedOps = {
+  async fork(repo, n) {
+    const p = await ghApi<GhPull>(repo, "GET", `repos/${repo}/pulls/${n}`);
+    return !p.head?.repo?.full_name || p.head.repo.full_name.toLowerCase() !== repo.toLowerCase();
+  },
+  async findFixPr(repo, base, prefix) {
+    const rows = await ghApi<GhPull[]>(repo, "GET", `repos/${repo}/pulls?state=open&base=${encodeURIComponent(base)}&per_page=100`);
+    const p = (Array.isArray(rows) ? rows : []).find((x) => x.base?.ref === base && String(x.head?.ref || "").startsWith(prefix) && FIX_BRANCH_RE.test(String(x.head?.ref)) && x.head?.repo?.full_name?.toLowerCase() === repo.toLowerCase());
+    return p ? { number: p.number, url: p.html_url || `https://github.com/${repo}/pull/${p.number}`, branch: String(p.head?.ref) } : null;
+  },
+  async commit(repo, c) {
+    if (!/^[0-9a-f]{40}$/i.test(c.headSha) || !FIX_BRANCH_RE.test(c.branch)) throw new Error("Invalid head commit or branch");
+    const head = await ghApi<{ tree?: { sha?: string } }>(repo, "GET", `repos/${repo}/git/commits/${c.headSha}`);
+    const treeSha = String(head?.tree?.sha || "");
+    if (!/^[0-9a-f]{40}$/i.test(treeSha)) throw new Error("Could not read the head commit");
+    const full = await ghApi<{ tree?: { path?: string; mode?: string }[] }>(repo, "GET", `repos/${repo}/git/trees/${treeSha}?recursive=1`).catch(() => null);
+    const modes = new Map((full?.tree || []).map((x) => [String(x.path), String(x.mode)]));
+    const tree = await ghApi<{ sha?: string }>(repo, "POST", `repos/${repo}/git/trees`, {
+      base_tree: treeSha,
+      tree: c.files.map((x) => ({ path: x.path, mode: modes.get(x.path) === "100755" ? "100755" : "100644", type: "blob", content: x.content })),
+    });
+    const made = await ghApi<{ sha?: string }>(repo, "POST", `repos/${repo}/git/commits`, { message: c.message, tree: tree?.sha, parents: [c.headSha] });
+    if (!made?.sha) throw new Error("GitHub did not create the fix commit");
+    try {
+      await ghApi(repo, "PATCH", `repos/${repo}/git/refs/heads/${ghEnc(c.branch)}`, { sha: made.sha, force: true });
+    } catch {
+      await ghApi(repo, "POST", `repos/${repo}/git/refs`, { ref: `refs/heads/${c.branch}`, sha: made.sha });
+    }
+  },
+  async openPr(repo, o) {
+    const p = await ghApi<GhPull>(repo, "POST", `repos/${repo}/pulls`, { title: o.title, head: o.branch, base: o.base, body: o.body });
+    return { number: p.number, url: p.html_url || `https://github.com/${repo}/pull/${p.number}`, branch: o.branch };
+  },
+  editPr: (repo, n, o) => ghApi(repo, "PATCH", `repos/${repo}/pulls/${n}`, { title: o.title, body: o.body }),
+};
+// </github-stacked>
