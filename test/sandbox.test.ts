@@ -116,7 +116,7 @@ test("sandbox run", async (ctx) => {
     runReply = { code: 1, out: "ok 1 - adds\nnot ok 2 - subtracts\nFAIL src/math.test.ts\n" };
     const updates: string[] = [];
     const r = await S.runSandbox({ settings, sha: SHA, source, files: ["src/math.ts"], onUpdate: (x) => updates.push(x.status) });
-    assert.equal(r.status, "failed", r.error);
+    assert.equal(r.status, "failed", String(r.error));
     assert.equal(r.exitCode, 1);
     assert.deepEqual(r.failedTests, ["subtracts", "src/math.test.ts"]);
     const fetchCall = calls.find((c) => c.cmd === "git" && c.args.includes("fetch"))!;
