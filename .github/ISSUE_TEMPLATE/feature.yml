@@ -1,8 +1,30 @@
-name: Feature
-description: Something CodeOtter should do
-labels: [enhancement]
+name: Feature request
+description: Suggest an enhancement or new feature for CodeOtter
+labels: ["enhancement", "status:triage", "priority:low"]
 body:
   - type: textarea
     id: what
-    attributes: { label: What and why, description: "What you want, and the situation where you would use it." }
-    validations: { required: true }
+    attributes:
+      label: Feature Description
+      description: "What do you want, and why? How would it solve a problem for CodeOtter users?"
+    validations:
+      required: true
+  - type: textarea
+    id: implementation
+    attributes:
+      label: Implementation Ideas (Optional)
+      description: "Any technical thoughts on how this might fit into the existing architecture (Core, Web UI, Agents)?"
+    validations:
+      required: false
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      options:
+        - Review & AI Engines
+        - Web UI & User Experience
+        - Integrations & Forges
+        - Infrastructure & Performance
+        - Other
+    validations:
+      required: true

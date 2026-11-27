@@ -1,0 +1,34 @@
+name: Project Workflow & Triage
+
+on:
+  issues:
+    types: [opened, edited, transferred, milestoned, demilestoned, labeled, unlabeled, closed, reopened]
+  pull_request:
+    types: [opened, edited, closed, reopened, assigned, unassigned, review_requested, review_request_removed, labeled, unlabeled, synchronize]
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assign default project status and labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const context = github.context;
+            const issueOrPr = context.payload.issue || context.payload.pull_request;
+            if (!issueOrPr) return;
+            
+            const repo = context.repo;
+            const number = issueOrPr.number;
+            const labels = issueOrPr.labels.map(l => typeof l === 'string' ? l : l.name);
+            
+            // Ensure status label if none present
+            const statusLabels = labels.filter(l => l.startsWith('status:'));
+            if (statusLabels.length === 0 && context.eventName === 'issues' && context.payload.action === 'opened') {
+              await github.rest.issues.addLabels({
+                owner: repo.owner,
+                repo: repo.repo,
+                issue_number: number,
+                labels: ['status:triage']
+              });
+            }

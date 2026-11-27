@@ -1,16 +1,48 @@
-name: Bug
-description: Something broke
-labels: [bug]
+name: Bug report
+description: File a bug or unexpected behavior in CodeOtter
+labels: ["bug", "status:triage", "priority:medium"]
 body:
   - type: input
     id: version
-    attributes: { label: CodeOtter version, placeholder: "0.10.0, Docker :latest, or a commit" }
-    validations: { required: true }
+    attributes:
+      label: CodeOtter Version / Commit
+      placeholder: "0.10.0, Docker :latest, or git commit sha"
+    validations:
+      required: true
   - type: input
     id: models
-    attributes: { label: Provider and models, placeholder: "openrouter/cloudflare/clef + anthropic/claude-sonnet-5-5, or local Kev 0.8B" }
-    validations: { required: true }
+    attributes:
+      label: Review Engines & Models
+      placeholder: "Anthropic Claude 3.5 Sonnet / Local Qwen2.5 / System One"
+    validations:
+      required: true
   - type: textarea
-    id: what
-    attributes: { label: What happened, description: "Steps, expected result, actual result, and the error shown on screen or in server.log." }
-    validations: { required: true }
+    id: what-happened
+    attributes:
+      label: What Happened
+      description: "Steps to reproduce, expected behavior, and actual results."
+      placeholder: "1. Go to...\n2. Click on...\n3. See error..."
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Error Output
+      description: "Paste relevant output from server.log or browser console."
+      placeholder: "[server] error..."
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected Area
+      options:
+        - Core Backend & Routing
+        - Web UI & Settings
+        - AI Review Engine / System One
+        - Local Models & Sidecars
+        - Forges & Webhooks (GitHub/GitLab/Bitbucket/etc.)
+        - Sandbox & Tests
+        - Other
+    validations:
+      required: true
